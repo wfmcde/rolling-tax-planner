@@ -1,0 +1,53 @@
+﻿{
+  "setup": {
+    "filing_status": "married_filing_jointly",
+    "primary_birth_year": 1960,
+    "spouse_birth_year": 1962,
+    "has_scorp": true,
+    "has_dbp": true,
+    "has_401k_or_ira": true,
+    "has_annuity": false,
+    "has_pte": false,
+    "multi_state_active": true,
+    "residency_change_active": true,
+    "anchor_actuals_year": 2025,
+    "forecast_length": 6,
+    "forecast_years": [2025, 2026, 2027, 2028, 2029, 2030]
+  },
+  "years": [
+    {
+      "tax_year": 2025,
+      "record_mode": "actuals",
+      "is_locked_actuals": true,
+      "form_1040": {
+        "w2_wages_total": 180000,
+        "schedule_k1_ordinary_income": 95000,
+        "deduction_method": "standard",
+        "taxable_income": 225000
+      },
+      "scorp_1120s": {
+        "entity_name": "Operating Support Services, LLC",
+        "officer_w2_wages": 180000,
+        "scorp_distributions_total": 60000,
+        "stock_basis_ending": 140000
+      },
+      "dbp_and_retirement": {
+        "dbp_status": "active",
+        "dbp_actual_contribution": 45000,
+        "dbp_target_termination_year": 2027
+      },
+      "state_filings": [
+        {
+          "state_code": "AZ",
+          "residency_status": "part_year_resident",
+          "state_apportionment_factor": 0.65
+        },
+        {
+          "state_code": "CA",
+          "residency_status": "part_year_resident",
+          "state_apportionment_factor": 0.35
+        }
+      ]
+    }
+  ]
+}
