@@ -1,0 +1,8 @@
+{
+  "name": "Rolling Tax Planner",
+  "description": "A modular six-year rolling tax planning application built around 1 locked actuals year and 5 rolling projection years, supporting Form 1040, S-Corporation (1120-S), Defined Benefit Plans, multi-state residency splits, and AI-assisted intake and grounded narratives.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
