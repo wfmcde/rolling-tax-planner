@@ -31,7 +31,7 @@
   - `entity_id`, `entity_name`, `tax_year`
   - `gross_receipts_revenue`
   - `ordinary_business_income_1120s`
-  - `state_sourcing_breakdown` (state-level revenue or apportionment percentages, such as AZ and CA)
+  - `state_sourcing_breakdown` (state-level revenue or apportionment percentages)
   - `pte_election_active` and `pte_tax_paid_by_state`
 - **Compensation & Distribution Fields:**
   - `officer_w2_wages` (taxpayer and spouse W-2 salaries)
@@ -51,6 +51,24 @@
   - `rollover_amount` and `rollover_source_type`
   - `annuity_contract_value` and `annuity_payout_amount`
 
-## 5. Six-Year Time-Series Record Rules
+## 5. Multi-State Returns, Residency Splits & State Tax Credits
+- **State Filing & Residency Profile Fields:**
+  - `state_code` (two-letter jurisdiction identifier, such as `AZ`, `CA`, or `WA`)
+  - `residency_status` (`resident`, `part_year_resident`, or `non_resident`)
+  - `residency_start_date` and `residency_end_date`
+  - `residency_day_or_income_ratio` (allocation ratio for part-year moves)
+  - `state_return_type` (such as resident return, part-year/non-resident personal return, or state S-Corp return)
+- **State Sourcing, Apportionment & PTE Fields:**
+  - `state_apportioned_income` and `state_apportionment_factor`
+  - `state_taxable_income` and `state_income_tax_liability`
+  - `state_pte_elected` and `state_pte_payment_amount`
+  - `state_pte_credit_or_exclusion_amount`
+- **State Tax Credits & Withholding Fields:**
+  - `credit_for_taxes_paid_to_other_states` (other-state tax credit claimed)
+  - `other_state_tax_credit_limitation`
+  - `other_state_credits_claimed` (non-refundable or refundable state-specific credits)
+  - `state_tax_withholding_and_estimates` and `state_net_tax_due_or_refund`
+
+## 6. Six-Year Time-Series Record Rules
 - **Horizon & Record Tag:** `tax_year`, `record_mode` (`actuals` for Year 1 locked to filed return; `forecast` for Years 2–6), and `is_locked_actuals` (`true` for Year 1, `false` for Years 2–6).
 - **Annual Rollover Rule:** When advancing by one year, the oldest `actuals` year retires out of the six-year window, the prior Year 2 moves to Year 1 and reconciles to the filed return (`actuals`), Years 3–6 shift to Years 2–5, and a new Year 6 `forecast` slot opens at the end.
