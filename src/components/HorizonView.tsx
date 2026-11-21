@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Bar,
   CartesianGrid,
@@ -10,20 +10,41 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { AlertTriangle, CheckCircle2, Lock, ShieldAlert } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Eye,
+  Lock,
+  Pencil,
+  RotateCcw,
+  ShieldAlert,
+} from 'lucide-react';
 import type {
   ArchivedActualsRecord,
   ComputedTaxYear,
+  ScheduleViewConfig,
   SetupConfig,
+  SsYearMode,
+  TaxYearRecord,
   ValidationIssue,
   WorkspaceTab,
 } from '../types/tax';
+import {
+  ALL_SCHEDULE_ITEM_IDS,
+  MASTER_SCHEDULE_CATALOG,
+  SCHEDULE_SECTIONS,
+  getScheduleRowLabel,
+  type CellTone,
+  type ScheduleEditField,
+} from '../engine/scheduleCatalog';
 import {
   formatCompactCurrency,
   formatCurrency,
   formatFilingStatus,
   formatPercent,
 } from '../utils/format';
+import { ScheduleRowPickerDrawer } from './ScheduleRowPickerDrawer';
+import { VerificationCheckpointsCard } from './VerificationCheckpointsCard';
 
 interface HorizonViewProps {
   setup: SetupConfig;
@@ -31,8 +52,35 @@ interface HorizonViewProps {
   issues: ValidationIssue[];
   archivedYears: ArchivedActualsRecord[];
   selectedYear: number;
+  scheduleView: ScheduleViewConfig;
+  onUpdateScheduleView: (next: ScheduleViewConfig) => void;
+  onUpdateYear: (taxYear: number, updater: (yr: TaxYearRecord) => TaxYearRecord) => void;
   onSelectYear: (year: number, navigateTo?: WorkspaceTab) => void;
   onNavigate: (tab: WorkspaceTab) => void;
+}
+
+const SUB_TONE_CLASS: Record<CellTone, string> = {
+  neutral: 'text-slate-400',
+  positive: 'text-emerald-700',
+  warning: 'text-amber-700',
+  danger: 'text-red-700',
+  accent: 'text-teal-700',
+};
+
+const BADGE_TONE_CLASS: Record<CellTone, string> = {
+  neutral: 'bg-slate-100 text-slate-600 border-slate-200',
+  positive: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+  warning: 'bg-amber-50 text-amber-800 border-amber-200',
+  danger: 'bg-red-50 text-red-800 border-red-200',
+  accent: 'bg-teal-50 text-teal-800 border-teal-200',
+};
+
+function parseCurrencyDraft(raw: string): number | null {
+  const cleaned = raw.replace(/[^0-9.-]/g, '').trim();
+  if (cleaned === '') return null;
+  const num = Number(cleaned);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.round(num));
 }
 
 export const HorizonView: React.FC<HorizonViewProps> = ({
@@ -41,16 +89,44 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
   issues,
   archivedYears,
   selectedYear,
+  scheduleView,
+  onUpdateScheduleView,
+  onUpdateYear,
   onSelectYear,
   onNavigate,
 }) => {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [editingCell, setEditingCell] = useState<{
+    rowId: string;
+    taxYear: number;
+    draft: string;
+    initialValue: number;
+  } | null>(null);
+
   const year1 = computed[0];
   const cumulativeAllInTax = computed.reduce((s, c) => s + c.total_all_in_tax, 0);
   const cumulativeFederal = computed.reduce((s, c) => s + c.form_1040_out.federal_income_tax, 0);
   const cumulativeState = computed.reduce((s, c) => s + c.total_state_tax, 0);
-  const cumulativeAgi = computed.reduce((s, c) => s + c.form_1040_out.adjusted_gross_income, 0);
+  const cumulativeGrossCashIncome = computed.reduce(
+    (s, c) => s + c.total_gross_cash_income,
+    0
+  );
   const avgEffectiveRate =
-    cumulativeAgi > 0 ? (cumulativeAllInTax / cumulativeAgi) * 100 : 0;
+    cumulativeGrossCashIncome > 0
+      ? (cumulativeAllInTax / cumulativeGrossCashIncome) * 100
+      : 0;
+
+  const year1BillSs = year1?.form_1040_out.primary_ss_gross ?? 0;
+  const year1DebraSs = year1?.form_1040_out.spouse_ss_gross ?? 0;
+  const year1TotalSs = year1BillSs + year1DebraSs;
+  const year1CardTitle =
+    year1?.tax_year === 2025
+      ? year1TotalSs === 0
+        ? 'Year 1 (2025) Filed Anchor'
+        : year1BillSs === 39500 && year1DebraSs === 39500
+        ? 'Year 1 (2025) Baseline ($79k SS On)'
+        : `Year 1 (2025) Baseline (${formatCompactCurrency(year1TotalSs)} SS On)`
+      : `Year 1 (${year1?.tax_year}) Filed Anchor`;
 
   const errorCount = issues.filter((i) => i.severity === 'error').length;
   const warningCount = issues.filter((i) => i.severity === 'warning').length;
@@ -64,161 +140,287 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
     'All-In Eff. Rate': c.all_in_effective_rate,
   }));
 
-  const ledgerSections: {
-    heading: string;
-    rows: {
-      label: string;
-      code: string;
-      bold?: boolean;
-      highlight?: boolean;
-      format?: 'currency' | 'percent' | 'text';
-      getValue: (c: ComputedTaxYear) => number | string;
-    }[];
-  }[] = [
-    {
-      heading: 'Household Return (Form 1040)',
-      rows: [
-        {
-          label: 'W-2 Wages Total',
-          code: 'w2_wages_total',
-          getValue: (c) => c.form_1040_in.w2_wages_total,
-        },
-        {
-          label: 'Schedule K-1 Ordinary Income',
-          code: 'schedule_k1_ordinary_income',
-          getValue: (c) => c.form_1040_in.schedule_k1_ordinary_income,
-        },
-        {
-          label: 'Investment & Retirement Taxable Income',
-          code: 'interest_div_cap_ss_ira',
-          getValue: (c) =>
-            c.form_1040_in.taxable_interest +
-            c.form_1040_in.ordinary_dividends +
-            Math.max(-3000, c.form_1040_in.short_term_capital_gain_loss + c.form_1040_in.long_term_capital_gain_loss) +
-            c.form_1040_in.ira_distributions_taxable +
-            c.form_1040_in.pensions_and_annuities_taxable +
-            c.form_1040_out.social_security_taxable,
-        },
-        {
-          label: 'Adjusted Gross Income (AGI)',
-          code: 'adjusted_gross_income',
-          bold: true,
-          getValue: (c) => c.form_1040_out.adjusted_gross_income,
-        },
-        {
-          label: 'Standard / Itemized Deduction',
-          code: 'deduction_amount',
-          getValue: (c) => -c.form_1040_out.deduction_amount,
-        },
-        {
-          label: 'QBI Deduction (Section 199A)',
-          code: 'qualified_business_income_deduction',
-          getValue: (c) => -c.form_1040_out.qualified_business_income_deduction,
-        },
-        {
-          label: 'Taxable Income',
-          code: 'taxable_income',
-          bold: true,
-          getValue: (c) => c.form_1040_out.taxable_income,
-        },
-      ],
-    },
-    ...(setup.has_scorp || setup.has_dbp
-      ? [
-          {
-            heading: 'S-Corporation (1120-S) & Defined Benefit Plan',
-            rows: [
-              ...(setup.has_scorp
-                ? [
-                    {
-                      label: 'Entity Gross Receipts',
-                      code: 'gross_receipts_revenue',
-                      getValue: (c: ComputedTaxYear) => c.scorp_in.gross_receipts_revenue,
-                    },
-                    {
-                      label: 'Shareholder Distributions',
-                      code: 'scorp_distributions_total',
-                      getValue: (c: ComputedTaxYear) => c.scorp_in.scorp_distributions_total,
-                    },
-                    {
-                      label: 'Ending Stock Basis',
-                      code: 'stock_basis_ending',
-                      getValue: (c: ComputedTaxYear) => c.scorp_out.stock_basis_ending,
-                    },
-                  ]
-                : []),
-              ...(setup.has_dbp
-                ? [
-                    {
-                      label: 'DBP Deductible Contribution',
-                      code: 'dbp_actual_contribution',
-                      getValue: (c: ComputedTaxYear) => c.dbp_in.dbp_actual_contribution,
-                    },
-                    {
-                      label: 'DBP Plan Status',
-                      code: 'dbp_status',
-                      format: 'text' as const,
-                      getValue: (c: ComputedTaxYear) => c.dbp_in.dbp_status,
-                    },
-                  ]
-                : []),
-            ],
+  const hiddenRowIds = useMemo(
+    () => new Set(scheduleView.hidden_line_item_ids ?? []),
+    [scheduleView.hidden_line_item_ids]
+  );
+
+  const visibleRowCount = ALL_SCHEDULE_ITEM_IDS.length - hiddenRowIds.size;
+
+  const visibleSections = useMemo(() => {
+    return SCHEDULE_SECTIONS.map((section) => ({
+      section,
+      rows: MASTER_SCHEDULE_CATALOG.filter(
+        (item) => item.section === section.id && !hiddenRowIds.has(item.id)
+      ),
+    })).filter((g) => g.rows.length > 0);
+  }, [hiddenRowIds]);
+
+  const isCellEditable = (editField: ScheduleEditField | undefined, c: ComputedTaxYear): boolean => {
+    if (!editField || c.is_locked_actuals) return false;
+    if (
+      (editField === 'ca_scorp_revenue' ||
+        editField === 'az_scorp_revenue' ||
+        editField === 'member_draws' ||
+        editField === 'capital_contributions') &&
+      !setup.has_scorp
+    ) {
+      return false;
+    }
+    if (
+      editField === 'debra_w2' &&
+      (!setup.has_scorp || setup.filing_status !== 'married_filing_jointly')
+    ) {
+      return false;
+    }
+    if (editField === 'ss_debra' && setup.filing_status !== 'married_filing_jointly') {
+      return false;
+    }
+    if (editField === 'dbp_contribution' && !setup.has_dbp) {
+      return false;
+    }
+    return true;
+  };
+
+  const commitInlineEdit = (
+    editField: ScheduleEditField,
+    taxYear: number,
+    draft: string,
+    initialValue: number
+  ) => {
+    const trimmed = draft.trim();
+    const parsed = parseCurrencyDraft(draft);
+
+    // Avoid creating a spurious override when user clicks in and blurs without changing the value
+    if (
+      (editField === 'ss_bill' ||
+        editField === 'ss_debra' ||
+        editField === 'sehi_medicare_premiums') &&
+      trimmed !== '' &&
+      parsed === initialValue
+    ) {
+      setEditingCell(null);
+      return;
+    }
+
+    onUpdateYear(taxYear, (prev) => {
+      if (prev.is_locked_actuals) return prev;
+      switch (editField) {
+        case 'ca_scorp_revenue':
+        case 'az_scorp_revenue': {
+          if (parsed === null) return prev;
+          const nextCa =
+            editField === 'ca_scorp_revenue' ? parsed : prev.scorp_1120s.ca_revenue;
+          const nextAz =
+            editField === 'az_scorp_revenue' ? parsed : prev.scorp_1120s.az_revenue;
+          const nextTotal = nextCa + nextAz;
+          const nextCaApp = nextTotal > 0 ? nextCa / nextTotal : 0;
+          const nextAzApp = nextTotal > 0 ? nextAz / nextTotal : 0;
+          return {
+            ...prev,
+            scorp_1120s: {
+              ...prev.scorp_1120s,
+              ca_revenue: nextCa,
+              az_revenue: nextAz,
+              gross_receipts_revenue: nextTotal,
+              state_sourcing_breakdown: [
+                { state_code: 'CA', apportionment_percent: Number((nextCaApp * 100).toFixed(2)) },
+                { state_code: 'AZ', apportionment_percent: Number((nextAzApp * 100).toFixed(2)) },
+              ],
+            },
+            state_filings: prev.state_filings.map((sf) =>
+              sf.state_code === 'CA'
+                ? { ...sf, state_apportionment_factor: nextCaApp }
+                : sf.state_code === 'AZ'
+                ? { ...sf, state_apportionment_factor: nextAzApp }
+                : sf
+            ),
+          };
+        }
+        case 'bill_w2': {
+          if (parsed === null) return prev;
+          if (!setup.has_scorp) {
+            return {
+              ...prev,
+              form_1040: { ...prev.form_1040, w2_wages_total: parsed },
+            };
+          }
+          const nextOfficer = parsed + prev.scorp_1120s.debra_w2_wages;
+          return {
+            ...prev,
+            scorp_1120s: {
+              ...prev.scorp_1120s,
+              bill_w2_wages: parsed,
+              officer_w2_wages: nextOfficer,
+            },
+            form_1040: {
+              ...prev.form_1040,
+              w2_wages_total: nextOfficer,
+            },
+          };
+        }
+        case 'debra_w2': {
+          if (parsed === null) return prev;
+          const nextOfficer = prev.scorp_1120s.bill_w2_wages + parsed;
+          return {
+            ...prev,
+            scorp_1120s: {
+              ...prev.scorp_1120s,
+              debra_w2_wages: parsed,
+              officer_w2_wages: nextOfficer,
+            },
+            form_1040: {
+              ...prev.form_1040,
+              w2_wages_total: nextOfficer,
+            },
+          };
+        }
+        case 'ss_debra':
+          return {
+            ...prev,
+            form_1040: {
+              ...prev.form_1040,
+              ss_debra_mode: parsed === null ? prev.form_1040.ss_debra_mode : 'on',
+              ss_debra_override: parsed,
+            },
+          };
+        case 'ss_bill':
+          return {
+            ...prev,
+            form_1040: {
+              ...prev.form_1040,
+              ss_bill_mode: parsed === null ? prev.form_1040.ss_bill_mode : 'on',
+              ss_bill_override: parsed,
+            },
+          };
+        case 'member_draws':
+          return parsed === null
+            ? prev
+            : {
+                ...prev,
+                scorp_1120s: { ...prev.scorp_1120s, scorp_distributions_total: parsed },
+              };
+        case 'capital_contributions':
+          return parsed === null
+            ? prev
+            : {
+                ...prev,
+                scorp_1120s: { ...prev.scorp_1120s, capital_contributions: parsed },
+              };
+        case 'dbp_contribution': {
+          if (parsed === null) return prev;
+          const termYear = setup.dbp_planned_termination_year;
+          const nextStatus =
+            parsed === 0 && termYear !== null && taxYear > termYear
+              ? 'terminated'
+              : termYear !== null && taxYear === termYear
+              ? 'terminating'
+              : parsed > 0 && prev.dbp_and_retirement.dbp_status === 'terminated'
+              ? 'active'
+              : prev.dbp_and_retirement.dbp_status;
+          return {
+            ...prev,
+            dbp_and_retirement: {
+              ...prev.dbp_and_retirement,
+              dbp_actual_contribution: parsed,
+              dbp_status: nextStatus,
+              dbp_max_deductible_contribution:
+                parsed > prev.dbp_and_retirement.dbp_max_deductible_contribution
+                  ? parsed
+                  : prev.dbp_and_retirement.dbp_max_deductible_contribution,
+            },
+          };
+        }
+        case 'sehi_medicare_premiums':
+          return {
+            ...prev,
+            form_1040: {
+              ...prev.form_1040,
+              sehi_medicare_override: parsed,
+            },
+          };
+        default:
+          return prev;
+      }
+    });
+    setEditingCell(null);
+  };
+
+  const handleResetCellOverride = (editField: ScheduleEditField, taxYear: number) => {
+    onUpdateYear(taxYear, (prev) => {
+      if (prev.is_locked_actuals) return prev;
+      if (editField === 'ss_bill') {
+        return {
+          ...prev,
+          form_1040: { ...prev.form_1040, ss_bill_override: null },
+        };
+      }
+      if (editField === 'ss_debra') {
+        return {
+          ...prev,
+          form_1040: { ...prev.form_1040, ss_debra_override: null },
+        };
+      }
+      if (editField === 'sehi_medicare_premiums') {
+        return {
+          ...prev,
+          form_1040: { ...prev.form_1040, sehi_medicare_override: null },
+        };
+      }
+      return prev;
+    });
+  };
+
+  const handleSsModeChange = (
+    person: 'debra' | 'bill',
+    taxYear: number,
+    mode: SsYearMode
+  ) => {
+    onUpdateYear(taxYear, (prev) => {
+      if (prev.is_locked_actuals) return prev;
+      if (person === 'debra') {
+        return {
+          ...prev,
+          form_1040: {
+            ...prev.form_1040,
+            ss_debra_mode: mode,
+            ss_debra_override: mode === 'on' ? prev.form_1040.ss_debra_override : null,
           },
-        ]
-      : []),
-    {
-      heading: 'Tax Liability & Effective Rates',
-      rows: [
-        {
-          label: 'Federal Income Tax (incl. NIIT)',
-          code: 'federal_income_tax',
-          getValue: (c) => c.form_1040_out.federal_income_tax,
+        };
+      }
+      return {
+        ...prev,
+        form_1040: {
+          ...prev.form_1040,
+          ss_bill_mode: mode,
+          ss_bill_override: mode === 'on' ? prev.form_1040.ss_bill_override : null,
         },
-        {
-          label: 'Total State Tax Liability',
-          code: 'state_income_tax_liability',
-          getValue: (c) => c.total_state_tax,
+      };
+    });
+  };
+
+  const handleSet2025Ss = (person: 'debra' | 'bill', amount: number) => {
+    onUpdateYear(2025, (prev) => {
+      if (person === 'debra') {
+        return {
+          ...prev,
+          form_1040: {
+            ...prev.form_1040,
+            ss_debra_mode: amount > 0 ? 'on' : 'off',
+            ss_debra_override: amount > 0 ? amount : null,
+          },
+        };
+      }
+      return {
+        ...prev,
+        form_1040: {
+          ...prev.form_1040,
+          ss_bill_mode: amount > 0 ? 'on' : 'off',
+          ss_bill_override: amount > 0 ? amount : null,
         },
-        {
-          label: 'Employer Payroll & Entity PTE Tax',
-          code: 'employer_payroll_and_pte',
-          getValue: (c) => c.total_entity_and_payroll_tax,
-        },
-        {
-          label: 'Total All-In Tax Obligation',
-          code: 'total_all_in_tax',
-          bold: true,
-          highlight: true,
-          getValue: (c) => c.total_all_in_tax,
-        },
-        {
-          label: 'Federal Marginal Rate',
-          code: 'marginal_tax_rate',
-          format: 'percent',
-          getValue: (c) => c.form_1040_out.marginal_tax_rate,
-        },
-        {
-          label: 'Federal Effective Rate',
-          code: 'effective_tax_rate',
-          format: 'percent',
-          getValue: (c) => c.form_1040_out.effective_tax_rate,
-        },
-        {
-          label: 'All-In Effective Rate (% of AGI)',
-          code: 'all_in_effective_rate',
-          format: 'percent',
-          bold: true,
-          getValue: (c) => c.all_in_effective_rate,
-        },
-        {
-          label: 'Estimated Net Household Cash Flow',
-          code: 'estimated_net_cash_flow',
-          bold: true,
-          getValue: (c) => c.estimated_net_cash_flow,
-        },
-      ],
-    },
-  ];
+      };
+    });
+  };
 
   return (
     <div className="space-y-6">
@@ -234,8 +436,16 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
             Anchor Year {setup.anchor_actuals_year} ({year1?.is_locked_actuals ? 'Locked Actuals' : 'Unlocked Amendment Mode'})
           </span>
           <span aria-hidden="true">·</span>
+          <span>Setup Tax Year {setup.current_tax_year}</span>
+          <span aria-hidden="true">·</span>
           <span>
             Forecast Years {setup.forecast_years[1]}–{setup.forecast_years[5]}
+          </span>
+          <span aria-hidden="true">·</span>
+          <span>
+            {setup.deduction_method === 'itemized'
+              ? `Custom Itemized (${formatCompactCurrency(setup.custom_itemized_deduction)})`
+              : 'Standard Deduction (IRS Indexed + 65+)'}
           </span>
           {setup.has_scorp && (
             <>
@@ -271,7 +481,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
 
         <div className="bg-white border border-slate-200 rounded-lg p-4">
           <div className="text-xs font-medium text-slate-500">
-            Year 1 ({year1?.tax_year}) Filed Anchor
+            {year1CardTitle}
           </div>
           <div className="mt-1.5 text-2xl font-semibold font-mono tabular-nums text-slate-900">
             {formatCurrency(year1?.form_1040_out.taxable_income ?? 0)}
@@ -382,7 +592,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
             {setup.forecast_years[0]} Actuals → {setup.forecast_years[5]} Forecast
           </div>
         </div>
-        <div className="h-[280px] w-full">
+        <div className="h-[260px] w-full">
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={chartData} margin={{ top: 8, right: 16, left: 4, bottom: 4 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
@@ -440,122 +650,365 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         </div>
       </div>
 
-      {/* High-Density Six-Year Ledger Grid */}
-      <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-        <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+      {/* 2025 Deterministic Engine Verification Checkpoints */}
+      {year1 && year1.tax_year === 2025 && (
+        <VerificationCheckpointsCard
+          setup={setup}
+          year2025={year1}
+          onSet2025Ss={handleSet2025Ss}
+        />
+      )}
+
+      {/* Interactive Top-Down Cash & Tax Waterfall Schedule */}
+      <div className="bg-white border border-slate-200 rounded-lg">
+        <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-semibold text-slate-900">
               Six-Year Financial Schedule
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Click any year header to inspect and edit its Form 1040, 1120-S, DBP, or multi-state inputs.
+              Top-down cash-and-tax waterfall · {setup.forecast_years[0]} locked actuals · Click any underlined {setup.forecast_years[1]}–{setup.forecast_years[5]} input cell to edit inline.
             </p>
           </div>
-          <div className="text-xs text-slate-500">
-            All amounts in USD · Monospace tabular alignment
+
+          <div className="relative shrink-0 self-start sm:self-center">
+            <button
+              type="button"
+              onClick={() => setPickerOpen((o) => !o)}
+              aria-expanded={pickerOpen}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:border-teal-700 hover:text-teal-900 transition-colors whitespace-nowrap"
+            >
+              <Eye className="w-3.5 h-3.5 text-teal-700" />
+              <span>Show / Hide Rows</span>
+              <span className="font-mono text-[11px] text-slate-500">
+                ({visibleRowCount}/{ALL_SCHEDULE_ITEM_IDS.length})
+              </span>
+            </button>
+
+            <ScheduleRowPickerDrawer
+              open={pickerOpen}
+              setup={setup}
+              scheduleView={scheduleView}
+              hiddenRowIds={hiddenRowIds}
+              onChange={onUpdateScheduleView}
+              onClose={() => setPickerOpen(false)}
+            />
           </div>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse min-w-[820px]">
-            <thead>
-              <tr className="border-b border-slate-200 bg-slate-50/70">
-                <th className="py-3 px-4 text-xs font-semibold text-slate-600 w-[260px]">
-                  Line Item
-                </th>
-                {computed.map((c) => {
-                  const isSel = c.tax_year === selectedYear;
-                  return (
-                    <th key={c.tax_year} className="py-2.5 px-3 text-right">
-                      <button
-                        type="button"
-                        onClick={() => onSelectYear(c.tax_year, 'form1040')}
-                        className={`inline-flex flex-col items-end group transition-colors ${
-                          isSel ? 'text-teal-800' : 'text-slate-900 hover:text-teal-800'
-                        }`}
-                      >
-                        <span className="inline-flex items-center gap-1 text-sm font-mono font-semibold tabular-nums">
-                          {c.is_locked_actuals && (
-                            <Lock className="w-3 h-3 text-teal-700" aria-label="Locked actuals" />
-                          )}
-                          {c.tax_year}
-                        </span>
-                        <span className="text-[11px] font-normal text-slate-500 group-hover:text-teal-700">
-                          {c.record_mode === 'actuals' ? 'Actuals' : 'Forecast'} · Age {c.primary_age}
-                        </span>
-                      </button>
-                    </th>
-                  );
-                })}
-                <th className="py-2.5 px-4 text-right text-xs font-semibold text-slate-600">
-                  6-Yr Total
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {ledgerSections.map((section) => (
-                <React.Fragment key={section.heading}>
-                  <tr className="bg-slate-50/50 border-y border-slate-200">
-                    <td
-                      colSpan={computed.length + 2}
-                      className="py-2 px-4 text-xs font-semibold text-slate-700"
-                    >
-                      {section.heading}
-                    </td>
-                  </tr>
-                  {section.rows.map((row) => {
-                    const fmt = row.format ?? 'currency';
-                    const totalVal =
-                      fmt === 'currency'
-                        ? computed.reduce((s, c) => s + Number(row.getValue(c)), 0)
-                        : null;
+        {visibleSections.length === 0 ? (
+          <div className="px-6 py-12 text-center space-y-3">
+            <p className="text-sm font-medium text-slate-900">All schedule rows are currently hidden</p>
+            <p className="text-xs text-slate-500 max-w-md mx-auto">
+              All rows remain active in the deterministic tax engine. Restore visibility below.
+            </p>
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateScheduleView({
+                  ...scheduleView,
+                  preset: 'full',
+                  hidden_line_item_ids: [],
+                })
+              }
+              className="px-4 py-2 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900"
+            >
+              Show All Rows
+            </button>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[820px]">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/80">
+                  <th className="py-3 px-4 text-xs font-semibold text-slate-600 w-[250px]">
+                    Line Item
+                  </th>
+                  {computed.map((c) => {
+                    const isSel = c.tax_year === selectedYear;
                     return (
-                      <tr
-                        key={row.code}
-                        className={`border-b border-slate-100 hover:bg-slate-50/70 transition-colors ${
-                          row.highlight ? 'bg-teal-50/30' : ''
-                        }`}
+                      <th
+                        key={c.tax_year}
+                        className="py-2.5 px-3 last:pr-4 text-right min-w-[104px]"
                       >
-                        <td className="py-2.5 px-4">
-                          <div
-                            className={`text-xs ${
-                              row.bold ? 'font-semibold text-slate-900' : 'text-slate-700'
-                            }`}
-                          >
-                            {row.label}
-                          </div>
-                        </td>
-                        {computed.map((c) => {
-                          const raw = row.getValue(c);
-                          let display = String(raw);
-                          if (fmt === 'currency') display = formatCurrency(Number(raw));
-                          if (fmt === 'percent') display = formatPercent(Number(raw), 1);
-                          return (
-                            <td
-                              key={c.tax_year}
-                              className={`py-2.5 px-3 text-right font-mono text-xs tabular-nums ${
-                                row.bold ? 'font-semibold text-slate-900' : 'text-slate-700'
-                              } ${c.record_mode === 'actuals' ? 'bg-slate-50/40' : ''}`}
-                            >
-                              {display}
-                            </td>
-                          );
-                        })}
-                        <td
-                          className={`py-2.5 px-4 text-right font-mono text-xs tabular-nums ${
-                            row.bold ? 'font-semibold text-slate-900' : 'text-slate-600'
+                        <button
+                          type="button"
+                          onClick={() => onSelectYear(c.tax_year, 'form1040')}
+                          className={`inline-flex flex-col items-end group transition-colors ${
+                            isSel ? 'text-teal-800' : 'text-slate-900 hover:text-teal-800'
                           }`}
                         >
-                          {totalVal !== null ? formatCurrency(totalVal) : '—'}
-                        </td>
-                      </tr>
+                          <span className="inline-flex items-center gap-1 text-sm font-mono font-semibold tabular-nums">
+                            {c.is_locked_actuals && (
+                              <Lock className="w-3 h-3 text-teal-700" aria-label="Locked actuals" />
+                            )}
+                            {c.tax_year}
+                          </span>
+                          <span className="text-[10px] font-normal text-slate-500 group-hover:text-teal-700">
+                            {c.record_mode === 'actuals' ? 'Locked' : 'Editable'}
+                            {c.primary_age !== null ? ` · Age ${c.primary_age}` : ''}
+                          </span>
+                        </button>
+                      </th>
                     );
                   })}
-                </React.Fragment>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleSections.map(({ section, rows }) => (
+                  <React.Fragment key={section.id}>
+                    <tr className="bg-slate-100/80 border-y border-slate-200">
+                      <td
+                        colSpan={computed.length + 1}
+                        className="py-2 px-4 text-xs font-semibold text-slate-800"
+                      >
+                        {section.title}
+                      </td>
+                    </tr>
+                    {rows.map((row) => {
+                      const rowLabel = getScheduleRowLabel(row, setup);
+                      const cells = computed.map((c, idx) =>
+                        row.computeCell(c, idx, computed, setup)
+                      );
+
+                      const rowBg =
+                        row.highlight === 'primary'
+                          ? 'bg-slate-900 text-white hover:bg-slate-900'
+                          : row.highlight === 'secondary'
+                          ? 'bg-teal-50/70 hover:bg-teal-50'
+                          : 'hover:bg-slate-50/70';
+
+                      const isPrimaryHighlight = row.highlight === 'primary';
+                      const isSsRow = row.editField === 'ss_debra' || row.editField === 'ss_bill';
+                      const ssPerson: 'debra' | 'bill' =
+                        row.editField === 'ss_debra' ? 'debra' : 'bill';
+
+                      return (
+                        <tr
+                          key={row.id}
+                          className={`border-b ${
+                            isPrimaryHighlight ? 'border-slate-800' : 'border-slate-100'
+                          } transition-colors ${rowBg}`}
+                        >
+                          <td className="py-2 px-4 align-top">
+                            <div className="flex items-center gap-1.5">
+                              <span
+                                className={`text-xs leading-snug ${
+                                  isPrimaryHighlight
+                                    ? 'font-semibold text-white'
+                                    : row.bold
+                                    ? 'font-semibold text-slate-900'
+                                    : 'text-slate-700'
+                                }`}
+                              >
+                                {rowLabel}
+                              </span>
+                              {row.editField && (
+                                <Pencil
+                                  className="w-2.5 h-2.5 text-teal-600/70 shrink-0"
+                                  aria-label="Inline editable 2026–2030"
+                                />
+                              )}
+                            </div>
+                          </td>
+
+                          {computed.map((c, idx) => {
+                            const cell = cells[idx];
+                            const editable = isCellEditable(row.editField, c);
+                            const isEditing =
+                              editingCell?.rowId === row.id && editingCell?.taxYear === c.tax_year;
+                            const toneClass = isPrimaryHighlight
+                              ? 'text-slate-300'
+                              : SUB_TONE_CLASS[cell.subTone ?? 'neutral'];
+
+                            const activeSsMode: SsYearMode =
+                              ssPerson === 'bill'
+                                ? c.form_1040_out.primary_ss_mode
+                                : c.form_1040_out.spouse_ss_mode;
+
+                            return (
+                              <td
+                                key={c.tax_year}
+                                className={`py-2 px-3 last:pr-4 text-right align-top ${
+                                  !isPrimaryHighlight && c.record_mode === 'actuals'
+                                    ? 'bg-slate-50/50'
+                                    : ''
+                                }`}
+                              >
+                                {isEditing && row.editField ? (
+                                  <input
+                                    type="text"
+                                    inputMode="numeric"
+                                    autoFocus
+                                    value={editingCell.draft}
+                                    onChange={(e) =>
+                                      setEditingCell({
+                                        ...editingCell,
+                                        draft: e.target.value,
+                                      })
+                                    }
+                                    onFocus={(e) => e.currentTarget.select()}
+                                    onBlur={() =>
+                                      commitInlineEdit(
+                                        row.editField!,
+                                        c.tax_year,
+                                        editingCell.draft,
+                                        editingCell.initialValue
+                                      )
+                                    }
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.currentTarget.blur();
+                                      } else if (e.key === 'Escape') {
+                                        setEditingCell(null);
+                                      }
+                                    }}
+                                    aria-label={`${rowLabel} ${c.tax_year}`}
+                                    className="w-24 text-right font-mono text-xs tabular-nums bg-white text-slate-900 border border-teal-700 rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-teal-700"
+                                  />
+                                ) : editable && row.editField ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setEditingCell({
+                                        rowId: row.id,
+                                        taxYear: c.tax_year,
+                                        draft: String(cell.rawEditValue ?? 0),
+                                        initialValue: cell.rawEditValue ?? 0,
+                                      })
+                                    }
+                                    title={
+                                      isSsRow || row.editField === 'sehi_medicare_premiums'
+                                        ? 'Click to enter dollar override (leave blank to reset to Setup formula)'
+                                        : `Click to edit ${rowLabel} for ${c.tax_year}`
+                                    }
+                                    className="font-mono text-xs tabular-nums whitespace-nowrap text-slate-900 border-b border-dashed border-teal-600/60 hover:border-teal-800 hover:bg-teal-50/70 rounded-sm px-1 -mr-1 transition-colors"
+                                  >
+                                    {cell.display}
+                                  </button>
+                                ) : (
+                                  <div
+                                    className={`font-mono text-xs tabular-nums whitespace-nowrap ${
+                                      isPrimaryHighlight
+                                        ? 'font-semibold text-white'
+                                        : row.bold
+                                        ? 'font-semibold text-slate-900'
+                                        : 'text-slate-700'
+                                    }`}
+                                  >
+                                    {cell.display}
+                                  </div>
+                                )}
+
+                                {/* Subtle Override Indicator + One-Click Reset Back to Formula */}
+                                {editable && cell.isOverridden && row.editField && (
+                                  <div className="mt-0.5 flex items-center justify-end gap-1">
+                                    <span className="text-[9px] font-medium px-1 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 leading-none">
+                                      Override
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleResetCellOverride(row.editField!, c.tax_year)
+                                      }
+                                      title={`Reset ${rowLabel} (${c.tax_year}) back to Setup formula`}
+                                      aria-label={`Reset ${rowLabel} ${c.tax_year} override back to formula`}
+                                      className="inline-flex items-center gap-0.5 text-[9px] font-medium text-teal-800 hover:text-teal-950 hover:underline leading-none"
+                                    >
+                                      <RotateCcw className="w-2.5 h-2.5" />
+                                      Reset
+                                    </button>
+                                  </div>
+                                )}
+
+                                {/* Compact On / Suspended / Off Toggle for Primary & Spouse SS (2026–2030) */}
+                                {isSsRow && editable && (
+                                  <div
+                                    className="mt-1 inline-flex items-center rounded border border-slate-200 bg-slate-50 p-0.5 gap-0.5"
+                                    role="group"
+                                    aria-label={`${rowLabel} ${c.tax_year} status`}
+                                  >
+                                    {(
+                                      [
+                                        { id: 'on', label: 'On' },
+                                        { id: 'suspended', label: 'Susp' },
+                                        { id: 'off', label: 'Off' },
+                                      ] as const
+                                    ).map((opt) => {
+                                      const active = activeSsMode === opt.id;
+                                      return (
+                                        <button
+                                          key={opt.id}
+                                          type="button"
+                                          onClick={() =>
+                                            handleSsModeChange(ssPerson, c.tax_year, opt.id)
+                                          }
+                                          className={`px-1 py-0.5 text-[9px] font-medium rounded-sm leading-none transition-colors ${
+                                            active
+                                              ? opt.id === 'on'
+                                                ? 'bg-emerald-700 text-white'
+                                                : opt.id === 'suspended'
+                                                ? 'bg-teal-700 text-white'
+                                                : 'bg-slate-600 text-white'
+                                              : 'text-slate-500 hover:text-slate-800'
+                                          }`}
+                                        >
+                                          {opt.label}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+
+                                {/* Status / Alert Badge */}
+                                {cell.badge && (
+                                  <div className="mt-1 flex justify-end">
+                                    <span
+                                      className={`inline-block text-[10px] font-medium leading-tight px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                                        BADGE_TONE_CLASS[cell.badge.tone]
+                                      }`}
+                                    >
+                                      {cell.badge.text}
+                                    </span>
+                                  </div>
+                                )}
+
+                                {/* Sub-label (skip redundant "On"/"Off" on editable SS rows since toggle already shows it) */}
+                                {cell.subLabel &&
+                                  !(
+                                    isSsRow &&
+                                    editable &&
+                                    (cell.subLabel === 'On' || cell.subLabel === 'Off')
+                                  ) && (
+                                    <div
+                                      className={`text-[10px] leading-snug mt-0.5 whitespace-normal ${toneClass}`}
+                                    >
+                                      {cell.subLabel}
+                                    </div>
+                                  )}
+
+                                {/* Subtle Filed 2025 Return Reference Sub-Label */}
+                                {cell.filedRef && (
+                                  <div
+                                    className={`text-[10px] font-mono tabular-nums leading-tight mt-0.5 whitespace-nowrap ${
+                                      isPrimaryHighlight ? 'text-slate-300' : 'text-slate-400'
+                                    }`}
+                                  >
+                                    {cell.filedRef}
+                                  </div>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* Archived Actuals History (shown after performing an Annual Roll Forward) */}

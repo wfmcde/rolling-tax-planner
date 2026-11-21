@@ -334,7 +334,17 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
                   <div className="text-right font-mono tabular-nums text-slate-800">
                     {formatCurrency(out.state_pte_payment_amount)} / -{formatCurrency(out.state_pte_credit_or_exclusion_amount)}
                   </div>
-                  <div className="font-semibold text-slate-900">State Tax Liability</div>
+                  <div className="text-slate-500">
+                    Business Entity Tax ({sf.state_code === 'CA' ? 'Form 100S' : sf.state_code === 'AZ' ? 'Form 120S' : 'Entity'})
+                  </div>
+                  <div className="text-right font-mono tabular-nums text-slate-900">
+                    {formatCurrency(out.state_entity_tax_liability)}
+                  </div>
+                  <div className="text-slate-500">Personal State Tax</div>
+                  <div className="text-right font-mono tabular-nums text-slate-900">
+                    {formatCurrency(out.state_personal_tax_liability)}
+                  </div>
+                  <div className="font-semibold text-slate-900">Total State Tax Liability</div>
                   <div className="text-right font-mono tabular-nums font-semibold text-teal-800">
                     {formatCurrency(out.state_income_tax_liability)}
                   </div>

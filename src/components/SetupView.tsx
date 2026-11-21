@@ -1,12 +1,16 @@
-import React, { useState } from 'react';
-import { Check, Loader2, RefreshCw, Sparkles } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Check, HelpCircle, Loader2, RefreshCw, Sparkles, X } from 'lucide-react';
 import type {
+  DeductionMethod,
   EntityType,
   FilingStatus,
+  PersonProfile,
   ProvenanceField,
   SetupConfig,
 } from '../types/tax';
+import { parseBirthDate } from '../utils/personTax';
 import { NumericField } from './NumericField';
+import { PersonProfileCard } from './PersonProfileCard';
 
 interface SetupViewProps {
   setup: SetupConfig;
@@ -36,6 +40,16 @@ export const SetupView: React.FC<SetupViewProps> = ({
   const [intakeError, setIntakeError] = useState<string | null>(null);
   const [intakeResult, setIntakeResult] = useState<AiIntakeResponse | null>(null);
   const [appliedBanner, setAppliedBanner] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+
+  useEffect(() => {
+    if (!showHelp) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowHelp(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showHelp]);
 
   const handleToggle = (key: keyof SetupConfig, val: boolean) => {
     const next: SetupConfig = { ...setup, [key]: val };
@@ -50,6 +64,24 @@ export const SetupView: React.FC<SetupViewProps> = ({
       ...setup,
       entity_type: entityType,
       has_scorp: entityType === 'scorp_llc',
+    });
+  };
+
+  const handlePrimaryProfileChange = (nextProfile: PersonProfile) => {
+    const parsed = parseBirthDate(nextProfile.birth_date);
+    onUpdateSetup({
+      ...setup,
+      primary_profile: nextProfile,
+      primary_birth_year: parsed ? parsed.year : setup.primary_birth_year,
+    });
+  };
+
+  const handleSpouseProfileChange = (nextProfile: PersonProfile) => {
+    const parsed = parseBirthDate(nextProfile.birth_date);
+    onUpdateSetup({
+      ...setup,
+      spouse_profile: nextProfile,
+      spouse_birth_year: parsed ? parsed.year : null,
     });
   };
 
@@ -80,17 +112,20 @@ export const SetupView: React.FC<SetupViewProps> = ({
   const handleApplyProposed = () => {
     if (!intakeResult?.proposed_setup) return;
     const p = intakeResult.proposed_setup;
+    const nextPrimaryBirthYear =
+      typeof p.primary_birth_year === 'number' && p.primary_birth_year > 1920
+        ? p.primary_birth_year
+        : setup.primary_birth_year;
+    const nextSpouseBirthYear =
+      typeof p.spouse_birth_year === 'number' && p.spouse_birth_year > 1920
+        ? p.spouse_birth_year
+        : setup.spouse_birth_year;
+
     const next: SetupConfig = {
       ...setup,
       filing_status: (p.filing_status as FilingStatus) || setup.filing_status,
-      primary_birth_year:
-        typeof p.primary_birth_year === 'number' && p.primary_birth_year > 1920
-          ? p.primary_birth_year
-          : setup.primary_birth_year,
-      spouse_birth_year:
-        typeof p.spouse_birth_year === 'number' && p.spouse_birth_year > 1920
-          ? p.spouse_birth_year
-          : setup.spouse_birth_year,
+      primary_birth_year: nextPrimaryBirthYear,
+      spouse_birth_year: nextSpouseBirthYear,
       entity_type: (p.entity_type as EntityType) || (p.has_scorp ? 'scorp_llc' : setup.entity_type),
       has_scorp: typeof p.has_scorp === 'boolean' ? p.has_scorp : setup.has_scorp,
       has_dbp: typeof p.has_dbp === 'boolean' ? p.has_dbp : setup.has_dbp,
@@ -111,20 +146,31 @@ export const SetupView: React.FC<SetupViewProps> = ({
     setAppliedBanner(true);
   };
 
-  const primaryYear1Age = setup.anchor_actuals_year - setup.primary_birth_year;
-  const primaryYear6Age = setup.forecast_years[5] - setup.primary_birth_year;
-  const spouseYear1Age =
-    setup.spouse_birth_year ? setup.anchor_actuals_year - setup.spouse_birth_year : null;
+  const isJoint = setup.filing_status === 'married_filing_jointly';
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-          Setup &amp; Module Decision Tree
-        </h1>
-        <p className="text-xs text-slate-500 mt-1">
-          Module 1 configuration · Active selections dynamically govern sidebar workflows, deterministic calculation layers, and required IRS &amp; state forms.
-        </p>
+      {/* Header + Contextual Help Button (?) */}
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+              Setup &amp; Module Decision Tree
+            </h1>
+            <button
+              type="button"
+              onClick={() => setShowHelp(true)}
+              aria-label="About Setup and Module Decision Tree"
+              title="What this screen shows and why it matters"
+              className="inline-flex items-center justify-center w-6 h-6 rounded-full text-slate-400 hover:text-teal-800 hover:bg-teal-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+            >
+              <HelpCircle className="w-4 h-4" />
+            </button>
+          </div>
+          <p className="text-xs text-slate-500 mt-1">
+            Module 1 configuration · Active selections dynamically govern sidebar workflows, deterministic calculation layers, and required IRS &amp; state forms.
+          </p>
+        </div>
       </div>
 
       {/* Guided Natural-Language AI Intake (Module 4 §2) */}
@@ -257,75 +303,171 @@ export const SetupView: React.FC<SetupViewProps> = ({
         )}
       </div>
 
-      {/* Main Configuration Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* 1. Core Filing & Household Profile */}
-        <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
-          <div>
-            <h2 className="text-sm font-semibold text-slate-900">
-              1. Core Filing &amp; Household Profile (Form 1040)
-            </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Drives federal brackets, age 65+ standard deduction add-ons, Social Security timing, and Medicare IRMAA thresholds.
-            </p>
+      {/* 1. Core Filing & Household Profile (Form 1040) — Per-Person Cards */}
+      <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-5">
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900">
+                1. Core Filing &amp; Household Profile (Form 1040)
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Monthly Social Security and Medicare baselines apply as exact figures for{' '}
+                <span className="font-mono font-medium text-slate-700">{setup.current_tax_year}</span>{' '}
+                (0% COLA/inflation markup); {setup.anchor_actuals_year} stays locked as Prior-Year Actuals.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full lg:w-auto shrink-0">
+              <div className="w-full sm:w-52">
+                <label
+                  htmlFor="current_tax_year_select"
+                  className="block text-xs font-medium text-slate-700 mb-1"
+                >
+                  Current / Setup Tax Year
+                </label>
+                <select
+                  id="current_tax_year_select"
+                  value={setup.current_tax_year}
+                  onChange={(e) =>
+                    onUpdateSetup({
+                      ...setup,
+                      current_tax_year: Number(e.target.value),
+                    })
+                  }
+                  className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-mono text-slate-900 focus:border-teal-700 focus:outline-none"
+                >
+                  {setup.forecast_years.map((yr) => (
+                    <option key={yr} value={yr}>
+                      {yr === setup.anchor_actuals_year
+                        ? `${yr} (Prior-Yr Actuals)`
+                        : yr === setup.current_tax_year
+                        ? `${yr} (Active Setup Year)`
+                        : `${yr}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="w-full sm:w-56">
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Filing Status
+                </label>
+                <select
+                  value={setup.filing_status}
+                  onChange={(e) =>
+                    onUpdateSetup({
+                      ...setup,
+                      filing_status: e.target.value as FilingStatus,
+                    })
+                  }
+                  className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus:border-teal-700 focus:outline-none"
+                >
+                  <option value="married_filing_jointly">Married Filing Jointly</option>
+                  <option value="single">Single</option>
+                  <option value="head_of_household">Head of Household</option>
+                  <option value="married_filing_separately">Married Filing Separately</option>
+                </select>
+              </div>
+            </div>
           </div>
 
-          <div className="space-y-3">
-            <div>
+          {/* Standard vs. Custom Itemized Deduction Selector */}
+          <div className="pt-3 border-t border-slate-100 grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
+            <div className={setup.deduction_method === 'itemized' ? 'md:col-span-7' : 'md:col-span-12'}>
               <label className="block text-xs font-medium text-slate-700 mb-1">
-                Filing Status
+                Deduction Method (Applied to Forecast Years {setup.forecast_years[1]}–{setup.forecast_years[5]})
               </label>
               <select
-                value={setup.filing_status}
+                value={setup.deduction_method}
                 onChange={(e) =>
                   onUpdateSetup({
                     ...setup,
-                    filing_status: e.target.value as FilingStatus,
+                    deduction_method: e.target.value as DeductionMethod,
                   })
                 }
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-teal-700 focus:outline-none"
+                className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus:border-teal-700 focus:outline-none"
               >
-                <option value="married_filing_jointly">Married Filing Jointly</option>
-                <option value="single">Single</option>
-                <option value="head_of_household">Head of Household</option>
-                <option value="married_filing_separately">Married Filing Separately</option>
+                <option value="standard">Standard Deduction (IRS Indexed + Age 65+)</option>
+                <option value="itemized">Custom Itemized Deduction</option>
               </select>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Governed here rather than as a separate row in the Six-Year Financial Schedule.
+              </p>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <NumericField
-                label="Primary Birth Year"
-                fieldCode="primary_birth_year"
-                value={setup.primary_birth_year}
-                step={1}
-                min={1925}
-                max={2008}
-                onChange={(v) => onUpdateSetup({ ...setup, primary_birth_year: Math.round(v) })}
-                helperText={`Age ${primaryYear1Age} in ${setup.anchor_actuals_year} → Age ${primaryYear6Age} in ${setup.forecast_years[5]}`}
-              />
-              {setup.filing_status === 'married_filing_jointly' && (
+            {setup.deduction_method === 'itemized' && (
+              <div className="md:col-span-5">
                 <NumericField
-                  label="Spouse Birth Year"
-                  fieldCode="spouse_birth_year"
-                  value={setup.spouse_birth_year ?? 1962}
-                  step={1}
-                  min={1925}
-                  max={2008}
-                  onChange={(v) => onUpdateSetup({ ...setup, spouse_birth_year: Math.round(v) })}
-                  helperText={
-                    spouseYear1Age !== null
-                      ? `Age ${spouseYear1Age} in ${setup.anchor_actuals_year} (65+ add-on triggers at 65)`
-                      : undefined
+                  label="Annual Custom Itemized Deduction"
+                  fieldCode="custom_itemized_deduction"
+                  prefix="$"
+                  step={1000}
+                  min={0}
+                  value={setup.custom_itemized_deduction}
+                  onChange={(v) =>
+                    onUpdateSetup({
+                      ...setup,
+                      custom_itemized_deduction: Math.max(0, v),
+                    })
                   }
+                  helperText="Applied annually across forecast years 2–6"
                 />
-              )}
-            </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Side-by-Side Per-Person Cards */}
+        <div className={`grid grid-cols-1 ${isJoint ? 'lg:grid-cols-2' : ''} gap-4 items-start`}>
+          <PersonProfileCard
+            roleLabel="Primary Taxpayer"
+            name={setup.primary_name}
+            profile={setup.primary_profile}
+            forecastYears={setup.forecast_years}
+            currentTaxYear={setup.current_tax_year}
+            onNameChange={(nextName) =>
+              onUpdateSetup({
+                ...setup,
+                primary_name: nextName,
+              })
+            }
+            onChange={handlePrimaryProfileChange}
+          />
+          {isJoint && (
+            <PersonProfileCard
+              roleLabel="Spouse"
+              name={setup.spouse_name}
+              profile={setup.spouse_profile}
+              forecastYears={setup.forecast_years}
+              currentTaxYear={setup.current_tax_year}
+              onNameChange={(nextName) =>
+                onUpdateSetup({
+                  ...setup,
+                  spouse_name: nextName,
+                })
+              }
+              onChange={handleSpouseProfileChange}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Entity Ownership & Conditional Sub-Modules */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+        {/* 2. Business & Entity Ownership Branch */}
+        <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900">
+              2. Business &amp; Entity Ownership Branch
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Select the operating entity structure to activate Form 1120-S / Schedule K-1, reasonable compensation, and stock basis tracking.
+            </p>
           </div>
 
-          <div className="pt-3 border-t border-slate-200 space-y-3">
-            <h3 className="text-xs font-semibold text-slate-800">
-              2. Business &amp; Entity Ownership Branch
-            </h3>
+          <div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">Entity Type</label>
             <select
               value={setup.entity_type}
               onChange={(e) => handleEntityTypeChange(e.target.value as EntityType)}
@@ -340,7 +482,7 @@ export const SetupView: React.FC<SetupViewProps> = ({
           </div>
         </div>
 
-        {/* 2. Conditional Sub-Modules & Multi-State Branch */}
+        {/* 3. Conditional Sub-Modules & Multi-State Branch */}
         <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
           <div>
             <h2 className="text-sm font-semibold text-slate-900">
@@ -391,28 +533,98 @@ export const SetupView: React.FC<SetupViewProps> = ({
             ].map((item) => {
               const checked = Boolean(setup[item.key]);
               return (
-                <label
-                  key={item.key}
-                  className="py-2.5 flex items-start justify-between gap-4 cursor-pointer"
-                >
-                  <div>
-                    <div className="text-xs font-semibold text-slate-900">{item.title}</div>
-                    <div className="text-[11px] text-slate-500 mt-0.5">{item.desc}</div>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={(e) => handleToggle(item.key, e.target.checked)}
-                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-teal-700 focus:ring-teal-700 shrink-0"
-                  />
-                </label>
+                <div key={item.key} className="py-2.5">
+                  <label className="flex items-start justify-between gap-4 cursor-pointer">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-900">{item.title}</div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">{item.desc}</div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(e) => handleToggle(item.key, e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-slate-300 text-teal-700 focus:ring-teal-700 shrink-0"
+                    />
+                  </label>
+
+                  {/* DBP Planned Termination Year & Post-DBP 401(k) Profit-Sharing Controls */}
+                  {item.key === 'has_dbp' && checked && (
+                    <div className="mt-3 ml-1 pl-3 border-l border-slate-200 bg-slate-50/70 rounded-r-md p-3 space-y-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1">
+                            Planned Termination Year
+                          </label>
+                          <select
+                            value={
+                              setup.dbp_planned_termination_year === null
+                                ? 'none'
+                                : String(setup.dbp_planned_termination_year)
+                            }
+                            onChange={(e) => {
+                              const val =
+                                e.target.value === 'none' ? null : Number(e.target.value);
+                              onUpdateSetup({
+                                ...setup,
+                                dbp_planned_termination_year: val,
+                              });
+                            }}
+                            className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-mono text-slate-900 focus:border-teal-700 focus:outline-none"
+                          >
+                            <option value="none">None (Keep Active)</option>
+                            {[2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032].map((y) => (
+                              <option key={y} value={y}>
+                                {y}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <NumericField
+                          label="Post-DBP 401(k) Profit-Sharing Rate"
+                          fieldCode="post_dbp_profit_sharing_rate"
+                          value={Number((setup.post_dbp_profit_sharing_rate * 100).toFixed(1))}
+                          suffix="%"
+                          step={1}
+                          min={0}
+                          max={25}
+                          onChange={(v) =>
+                            onUpdateSetup({
+                              ...setup,
+                              post_dbp_profit_sharing_rate: Math.min(25, Math.max(0, v)) / 100,
+                            })
+                          }
+                        />
+                      </div>
+                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                        Employer 401(k) Profit Sharing stays capped at <span className="font-mono text-slate-700">6%</span> of total W-2 through{' '}
+                        <span className="font-mono text-slate-700">
+                          {setup.dbp_planned_termination_year ?? 'active DBP years'}
+                        </span>
+                        {setup.dbp_planned_termination_year !== null && (
+                          <>
+                            , then steps up to{' '}
+                            <span className="font-mono text-slate-700">
+                              {Number((setup.post_dbp_profit_sharing_rate * 100).toFixed(1))}%
+                            </span>{' '}
+                            starting in{' '}
+                            <span className="font-mono text-slate-700">
+                              {setup.dbp_planned_termination_year + 1}
+                            </span>{' '}
+                            (subject to IRS §415(c) limits) while DBP contributions default to $0.
+                          </>
+                        )}
+                      </p>
+                    </div>
+                  )}
+                </div>
               );
             })}
           </div>
         </div>
       </div>
 
-      {/* 5-Year Forward Projection Assumptions */}
+      {/* 4. Forward Forecast Assumptions (Years 2–6) */}
       <div className="bg-white border border-slate-200 rounded-lg p-5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
           <div>
@@ -433,7 +645,42 @@ export const SetupView: React.FC<SetupViewProps> = ({
           </button>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <NumericField
+            label="Social Security Annual COLA (%)"
+            fieldCode="ss_cola_rate"
+            value={Number(((setup.assumptions.ss_cola_rate ?? 0.026) * 100).toFixed(2))}
+            suffix="%"
+            step={0.1}
+            min={0}
+            max={12}
+            onChange={(v) =>
+              onUpdateSetup({
+                ...setup,
+                assumptions: { ...setup.assumptions, ss_cola_rate: Math.max(0, v) / 100 },
+              })
+            }
+            helperText={`Applied automatically starting in Current Tax Year + 1 (${setup.current_tax_year + 1}+); inline cell overrides in the schedule take precedence.`}
+          />
+          <NumericField
+            label="Medicare Premium Annual Inflation (%)"
+            fieldCode="medicare_inflation_rate"
+            value={Number(((setup.assumptions.medicare_inflation_rate ?? 0.055) * 100).toFixed(2))}
+            suffix="%"
+            step={0.1}
+            min={0}
+            max={20}
+            onChange={(v) =>
+              onUpdateSetup({
+                ...setup,
+                assumptions: {
+                  ...setup.assumptions,
+                  medicare_inflation_rate: Math.max(0, v) / 100,
+                },
+              })
+            }
+            helperText={`Applied automatically starting in Current Tax Year + 1 (${setup.current_tax_year + 1}+) unless overridden inline in the schedule.`}
+          />
           <NumericField
             label="Bracket Inflation Rate"
             fieldCode="inflation_rate"
@@ -445,9 +692,10 @@ export const SetupView: React.FC<SetupViewProps> = ({
             onChange={(v) =>
               onUpdateSetup({
                 ...setup,
-                assumptions: { ...setup.assumptions, inflation_rate: v / 100 },
+                assumptions: { ...setup.assumptions, inflation_rate: Math.max(0, v) / 100 },
               })
             }
+            helperText="Indexes IRS tax brackets, standard deduction, and retirement caps."
           />
           <NumericField
             label="Entity Revenue Growth"
@@ -496,6 +744,70 @@ export const SetupView: React.FC<SetupViewProps> = ({
           />
         </div>
       </div>
+
+      {/* Contextual Help Modal (?) */}
+      {showHelp && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="setup-help-title"
+          onClick={() => setShowHelp(false)}
+        >
+          <div
+            className="bg-white border border-slate-200 rounded-lg max-w-lg w-full p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4 pb-3 border-b border-slate-200">
+              <div>
+                <h2 id="setup-help-title" className="text-base font-semibold text-slate-900">
+                  Setup &amp; Module Decision Tree
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Plain-English Guide
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowHelp(false)}
+                aria-label="Close help popup"
+                className="p-1 text-slate-400 hover:text-slate-700 rounded-md"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs text-slate-700 leading-relaxed">
+              <div>
+                <h3 className="font-semibold text-slate-900 mb-1">What This Screen Shows</h3>
+                <p>
+                  This screen sets the structural rules for your six-year tax plan: filing status, individual dates of birth for Primary Taxpayer and Spouse, per-person Social Security claiming and suspension choices, individual Medicare enrollments, business entity branches (such as an S-Corporation or Defined Benefit Plan), multi-state residency toggles, and forward growth assumptions.
+                </p>
+              </div>
+
+              <div>
+                <h3 className="font-semibold text-slate-900 mb-1">Why It Matters</h3>
+                <p>
+                  Couples rarely retire, claim Social Security, or enroll in Medicare on the exact same date. Configuring each spouse independently supports staggered timelines—such as one spouse enrolling in Medicare while the other stays on employer/S-Corp coverage, or suspending one spouse&apos;s Social Security benefit between Full Retirement Age (FRA) and age 70 to earn +8%/year Delayed Retirement Credits.
+                </p>
+                <p className="mt-2">
+                  The deterministic tax engine automatically sums active individual Social Security benefits for joint Form 1040 taxability (0%–85%), applies age-65+ standard deductions only where birth dates qualify, and computes income-based Medicare IRMAA surcharges strictly per enrolled individual using two-year lookback Modified Adjusted Gross Income (MAGI).
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-slate-200 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowHelp(false)}
+                className="px-4 py-1.5 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900"
+              >
+                Got It
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

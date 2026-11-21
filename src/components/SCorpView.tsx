@@ -1,6 +1,7 @@
 import React from 'react';
 import { Lock } from 'lucide-react';
 import type { ComputedTaxYear, SetupConfig, TaxYearRecord } from '../types/tax';
+import { getPersonNames } from '../engine/scheduleCatalog';
 import { formatCurrency, formatPercent } from '../utils/format';
 import { NumericField } from './NumericField';
 
@@ -24,6 +25,7 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
   const yr = years.find((y) => y.tax_year === selectedYear) ?? years[0];
   const comp = computed.find((c) => c.tax_year === yr.tax_year) ?? computed[0];
   const isLocked = yr.is_locked_actuals;
+  const { primaryName, spouseName } = getPersonNames(setup);
 
   const updateScorp = (patch: Partial<TaxYearRecord['scorp_1120s']>) => {
     if (isLocked) return;
@@ -125,13 +127,78 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <NumericField
-              label="Gross Receipts / Revenue"
-              fieldCode="gross_receipts_revenue"
+              label="California S-Corp Revenue"
+              fieldCode="ca_revenue"
               prefix="$"
               step={5000}
-              value={yr.scorp_1120s.gross_receipts_revenue}
+              value={yr.scorp_1120s.ca_revenue}
               disabled={isLocked}
-              onChange={(v) => updateScorp({ gross_receipts_revenue: v })}
+              onChange={(v) => {
+                const nextCa = Math.max(0, v);
+                const nextAz = yr.scorp_1120s.az_revenue;
+                const nextTotal = nextCa + nextAz;
+                const nextCaApp = nextTotal > 0 ? nextCa / nextTotal : 0;
+                const nextAzApp = nextTotal > 0 ? nextAz / nextTotal : 0;
+                onUpdateYear(yr.tax_year, (prev) => ({
+                  ...prev,
+                  scorp_1120s: {
+                    ...prev.scorp_1120s,
+                    ca_revenue: nextCa,
+                    gross_receipts_revenue: nextTotal,
+                    state_sourcing_breakdown: [
+                      { state_code: 'CA', apportionment_percent: Number((nextCaApp * 100).toFixed(2)) },
+                      { state_code: 'AZ', apportionment_percent: Number((nextAzApp * 100).toFixed(2)) },
+                    ],
+                  },
+                  state_filings: prev.state_filings.map((sf) =>
+                    sf.state_code === 'CA'
+                      ? { ...sf, state_apportionment_factor: nextCaApp }
+                      : sf.state_code === 'AZ'
+                      ? { ...sf, state_apportionment_factor: nextAzApp }
+                      : sf
+                  ),
+                }));
+              }}
+              helperText={`Total S-Corp Gross Revenue: ${formatCurrency(comp.scorp_in.gross_receipts_revenue)}`}
+            />
+            <NumericField
+              label="Arizona S-Corp Revenue"
+              fieldCode="az_revenue"
+              prefix="$"
+              step={5000}
+              value={yr.scorp_1120s.az_revenue}
+              disabled={isLocked}
+              onChange={(v) => {
+                const nextCa = yr.scorp_1120s.ca_revenue;
+                const nextAz = Math.max(0, v);
+                const nextTotal = nextCa + nextAz;
+                const nextCaApp = nextTotal > 0 ? nextCa / nextTotal : 0;
+                const nextAzApp = nextTotal > 0 ? nextAz / nextTotal : 0;
+                onUpdateYear(yr.tax_year, (prev) => ({
+                  ...prev,
+                  scorp_1120s: {
+                    ...prev.scorp_1120s,
+                    az_revenue: nextAz,
+                    gross_receipts_revenue: nextTotal,
+                    state_sourcing_breakdown: [
+                      { state_code: 'CA', apportionment_percent: Number((nextCaApp * 100).toFixed(2)) },
+                      { state_code: 'AZ', apportionment_percent: Number((nextAzApp * 100).toFixed(2)) },
+                    ],
+                  },
+                  state_filings: prev.state_filings.map((sf) =>
+                    sf.state_code === 'CA'
+                      ? { ...sf, state_apportionment_factor: nextCaApp }
+                      : sf.state_code === 'AZ'
+                      ? { ...sf, state_apportionment_factor: nextAzApp }
+                      : sf
+                  ),
+                }));
+              }}
+              helperText={
+                comp.scorp_in.gross_receipts_revenue > 0
+                  ? `Split: CA ${((comp.scorp_in.ca_revenue / comp.scorp_in.gross_receipts_revenue) * 100).toFixed(1)}% / AZ ${((comp.scorp_in.az_revenue / comp.scorp_in.gross_receipts_revenue) * 100).toFixed(1)}%`
+                  : 'Split: 0% / 0%'
+              }
             />
             <NumericField
               label="Operating Expenses (excl. W-2 & DBP)"
@@ -143,23 +210,69 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
               onChange={(v) => updateScorp({ operating_expenses: v })}
             />
             <NumericField
-              label="Officer W-2 Wages"
-              fieldCode="officer_w2_wages"
+              label={`${primaryName} W-2 Compensation`}
+              fieldCode="bill_w2_wages"
               prefix="$"
               step={5000}
-              value={yr.scorp_1120s.officer_w2_wages}
+              value={yr.scorp_1120s.bill_w2_wages}
               disabled={isLocked}
-              onChange={(v) => updateScorp({ officer_w2_wages: v })}
-              helperText={`Reasonable comp ratio: ${formatPercent(comp.scorp_out.reasonable_comp_ratio * 100, 1)}`}
+              onChange={(v) => {
+                const nextTotal = Math.max(0, v) + yr.scorp_1120s.debra_w2_wages;
+                onUpdateYear(yr.tax_year, (prev) => ({
+                  ...prev,
+                  scorp_1120s: {
+                    ...prev.scorp_1120s,
+                    bill_w2_wages: Math.max(0, v),
+                    officer_w2_wages: nextTotal,
+                  },
+                  form_1040: {
+                    ...prev.form_1040,
+                    w2_wages_total: nextTotal,
+                  },
+                }));
+              }}
+              helperText={`Combined W-2: ${formatCurrency(comp.scorp_in.officer_w2_wages)} · Ratio ${formatPercent(comp.scorp_out.reasonable_comp_ratio * 100, 1)}`}
             />
             <NumericField
-              label="Shareholder Distributions Total"
+              label={`${spouseName} W-2 Compensation`}
+              fieldCode="debra_w2_wages"
+              prefix="$"
+              step={5000}
+              value={yr.scorp_1120s.debra_w2_wages}
+              disabled={isLocked || setup.filing_status !== 'married_filing_jointly'}
+              onChange={(v) => {
+                const nextTotal = yr.scorp_1120s.bill_w2_wages + Math.max(0, v);
+                onUpdateYear(yr.tax_year, (prev) => ({
+                  ...prev,
+                  scorp_1120s: {
+                    ...prev.scorp_1120s,
+                    debra_w2_wages: Math.max(0, v),
+                    officer_w2_wages: nextTotal,
+                  },
+                  form_1040: {
+                    ...prev.form_1040,
+                    w2_wages_total: nextTotal,
+                  },
+                }));
+              }}
+            />
+            <NumericField
+              label="Member Draws / Distributions"
               fieldCode="scorp_distributions_total"
               prefix="$"
               step={5000}
               value={yr.scorp_1120s.scorp_distributions_total}
               disabled={isLocked}
               onChange={(v) => updateScorp({ scorp_distributions_total: v })}
+            />
+            <NumericField
+              label="Capital Contributions (Basis Added)"
+              fieldCode="capital_contributions"
+              prefix="$"
+              step={5000}
+              value={yr.scorp_1120s.capital_contributions}
+              disabled={isLocked}
+              onChange={(v) => updateScorp({ capital_contributions: Math.max(0, v) })}
             />
             <NumericField
               label="Beginning Stock Basis"

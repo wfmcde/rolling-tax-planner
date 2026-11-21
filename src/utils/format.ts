@@ -6,6 +6,18 @@ export function formatCurrency(value: number, showSign = false): string {
   return formatted;
 }
 
+export function formatCurrencyExact(value: number, showSign = false): string {
+  const rounded = Math.round(value * 100) / 100;
+  const abs = Math.abs(rounded);
+  const formatted = `$${abs.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+  if (rounded < 0) return `-${formatted}`;
+  if (showSign && rounded > 0) return `+${formatted}`;
+  return formatted;
+}
+
 export function formatCompactCurrency(value: number): string {
   const abs = Math.abs(value);
   const sign = value < 0 ? '-' : '';

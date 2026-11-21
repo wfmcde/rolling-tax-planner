@@ -54,6 +54,12 @@ export const SCENARIO_PRESETS: ScenarioPresetMeta[] = [
         if (idx === 0) return yr;
         const reducedW2 = Math.max(120000, yr.scorp_1120s.officer_w2_wages - 30000);
         const delta = yr.scorp_1120s.officer_w2_wages - reducedW2;
+        const ratio =
+          yr.scorp_1120s.officer_w2_wages > 0
+            ? reducedW2 / yr.scorp_1120s.officer_w2_wages
+            : 1;
+        const nextDebraW2 = Math.round(yr.scorp_1120s.debra_w2_wages * ratio);
+        const nextBillW2 = Math.max(0, reducedW2 - nextDebraW2);
         return {
           ...yr,
           form_1040: {
@@ -62,6 +68,8 @@ export const SCENARIO_PRESETS: ScenarioPresetMeta[] = [
           },
           scorp_1120s: {
             ...yr.scorp_1120s,
+            debra_w2_wages: nextDebraW2,
+            bill_w2_wages: nextBillW2,
             officer_w2_wages: reducedW2,
             scorp_distributions_total: yr.scorp_1120s.scorp_distributions_total + delta,
           },
@@ -83,7 +91,7 @@ export const SCENARIO_PRESETS: ScenarioPresetMeta[] = [
     description:
       'Defers Defined Benefit Plan (DBP) termination from 2027 to 2029, capturing two additional years of maximum tax-deductible actuarial funding ($55k–$60k/yr) during peak pre-Social Security income years.',
     build: (state) => {
-      const setup = { ...state.setup, has_dbp: true };
+      const setup = { ...state.setup, has_dbp: true, dbp_planned_termination_year: 2029 };
       const years: TaxYearRecord[] = cloneYears(state.years).map((yr, idx): TaxYearRecord => {
         if (idx === 0) return yr;
         const targetYear = 2029;

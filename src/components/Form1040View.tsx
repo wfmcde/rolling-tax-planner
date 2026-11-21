@@ -205,7 +205,8 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
             Form 1040 Household Return
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Year {yr.tax_year} · {yr.record_mode === 'actuals' ? 'Actuals Baseline Anchor' : 'Rolling Forecast'} · Primary Age {comp.primary_age}
+            Year {yr.tax_year} · {yr.record_mode === 'actuals' ? 'Actuals Baseline Anchor' : 'Rolling Forecast'} ·{' '}
+            {comp.primary_age !== null ? `Primary Age ${comp.primary_age}` : 'Primary DOB blank'}
             {comp.spouse_age !== null ? ` / Spouse Age ${comp.spouse_age}` : ''}
           </p>
         </div>
@@ -505,10 +506,25 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
               fieldCode="social_security_gross"
               prefix="$"
               step={1000}
-              value={yr.form_1040.social_security_gross}
-              disabled={isLocked}
+              value={comp.form_1040_out.social_security_gross_effective}
+              disabled={
+                isLocked ||
+                Boolean(setup.primary_profile?.social_security.receiving) ||
+                (setup.filing_status === 'married_filing_jointly' &&
+                  Boolean(setup.spouse_profile?.social_security.receiving))
+              }
               onChange={(v) => update1040({ social_security_gross: v })}
-              helperText={`Taxable portion computed: ${formatCurrency(comp.form_1040_out.social_security_taxable)}`}
+              helperText={
+                setup.primary_profile?.social_security.receiving ||
+                (setup.filing_status === 'married_filing_jointly' &&
+                  setup.spouse_profile?.social_security.receiving)
+                  ? `Primary ${formatCurrency(comp.form_1040_out.primary_ss_gross)} (${comp.form_1040_out.primary_ss_status})${
+                      setup.filing_status === 'married_filing_jointly'
+                        ? ` · Spouse ${formatCurrency(comp.form_1040_out.spouse_ss_gross)} (${comp.form_1040_out.spouse_ss_status})`
+                        : ''
+                    } · Taxable: ${formatCurrency(comp.form_1040_out.social_security_taxable)}`
+                  : `Taxable portion computed: ${formatCurrency(comp.form_1040_out.social_security_taxable)}`
+              }
             />
             <NumericField
               label="Taxable IRA Distributions"
@@ -698,16 +714,46 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
             ))}
           </dl>
 
-          <div className="pt-3 border-t border-slate-200 flex items-center justify-between text-xs">
-            <div>
-              <div className="font-semibold text-slate-800">Medicare IRMAA Check</div>
-              <div className="text-slate-500 mt-0.5">{comp.form_1040_out.irmaa_tier}</div>
+          <div className="pt-3 border-t border-slate-200 space-y-2 text-xs">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="font-semibold text-slate-800">
+                  Medicare &amp; IRMAA (2-Yr Lookback MAGI: {formatCurrency(comp.form_1040_out.irmaa_lookback_magi)})
+                </div>
+                <div className="text-slate-500 mt-0.5">{comp.form_1040_out.irmaa_tier}</div>
+              </div>
+              <div className="font-mono tabular-nums font-semibold text-slate-900">
+                {comp.form_1040_out.irmaa_annual_surcharge > 0
+                  ? `+${formatCurrency(comp.form_1040_out.irmaa_annual_surcharge)}/yr`
+                  : '$0/yr'}
+              </div>
             </div>
-            <div className="font-mono tabular-nums font-semibold text-slate-900">
-              {comp.form_1040_out.irmaa_annual_surcharge > 0
-                ? `+${formatCurrency(comp.form_1040_out.irmaa_annual_surcharge)}/yr`
-                : '$0/yr'}
-            </div>
+
+            {(setup.primary_profile?.medicare.enrolled ||
+              (setup.filing_status === 'married_filing_jointly' &&
+                setup.spouse_profile?.medicare.enrolled)) && (
+              <div className="grid grid-cols-1 gap-1 pt-1 text-[11px] font-mono tabular-nums text-slate-600">
+                {setup.primary_profile?.medicare.enrolled && (
+                  <div className="flex justify-between">
+                    <span>Primary Enrolled (Base / IRMAA)</span>
+                    <span>
+                      {formatCurrency(comp.form_1040_out.primary_medicare_base_annual)} / +
+                      {formatCurrency(comp.form_1040_out.primary_irmaa_surcharge)}
+                    </span>
+                  </div>
+                )}
+                {setup.filing_status === 'married_filing_jointly' &&
+                  setup.spouse_profile?.medicare.enrolled && (
+                    <div className="flex justify-between">
+                      <span>Spouse Enrolled (Base / IRMAA)</span>
+                      <span>
+                        {formatCurrency(comp.form_1040_out.spouse_medicare_base_annual)} / +
+                        {formatCurrency(comp.form_1040_out.spouse_irmaa_surcharge)}
+                      </span>
+                    </div>
+                  )}
+              </div>
+            )}
           </div>
         </div>
       </div>

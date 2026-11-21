@@ -20,3 +20,64 @@
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+.print-footer-spacer {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: letter portrait;
+    margin: 0.45in 0.45in 0.65in 0.45in;
+  }
+
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    print-color-adjust: exact !important;
+    -webkit-print-color-adjust: exact !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only-container {
+    position: static !important;
+    inset: auto !important;
+    background: #ffffff !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    max-width: none !important;
+    max-height: none !important;
+    overflow: visible !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  .print-doc-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .print-footer-spacer {
+    display: table-footer-group !important;
+  }
+
+  .print-page-footer {
+    position: fixed !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    background: #ffffff !important;
+    border-top: 1px solid #cbd5e1 !important;
+    padding: 6px 0 2px 0 !important;
+    margin: 0 !important;
+    z-index: 50;
+  }
+
+  .print-avoid-break {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+}

@@ -115,9 +115,9 @@ export function runGuardrailValidation(
           id: `scorp-sourcing-sum-${yr.tax_year}`,
           tax_year: yr.tax_year,
           category: 'scorp_comp',
-          severity: 'error',
-          title: `State sourcing breakdown does not total 100% (${yr.tax_year})`,
-          message: `state_sourcing_breakdown sums to ${sourcingSum.toFixed(1)}%. Adjust state percentages to total exactly 100%.`,
+          severity: 'warning',
+          title: `Multi-state apportionment ratios sum to ${sourcingSum.toFixed(2)}% (${yr.tax_year})`,
+          message: `state_sourcing_breakdown sums to ${sourcingSum.toFixed(2)}% across active states. This is expected when states use different statutory apportionment formulas (e.g., CA Schedule R vs. AZ Schedule A).`,
           field_reference: 'scorp_1120s.state_sourcing_breakdown',
           target_tab: 'scorp',
         });

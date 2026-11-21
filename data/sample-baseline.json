@@ -1,8 +1,8 @@
-﻿{
+{
   "setup": {
     "filing_status": "married_filing_jointly",
     "primary_birth_year": 1960,
-    "spouse_birth_year": 1962,
+    "spouse_birth_year": 1960,
     "has_scorp": true,
     "has_dbp": true,
     "has_401k_or_ira": true,
@@ -20,32 +20,70 @@
       "record_mode": "actuals",
       "is_locked_actuals": true,
       "form_1040": {
-        "w2_wages_total": 180000,
-        "schedule_k1_ordinary_income": 95000,
-        "deduction_method": "standard",
-        "taxable_income": 225000
+        "w2_wages_total": 14050,
+        "bill_w2_box1": 11000,
+        "debra_w2_box1": 3050,
+        "taxable_interest": 782,
+        "ordinary_dividends": 505,
+        "qualified_dividends": 67,
+        "ira_distributions_taxable": 12935,
+        "pensions_and_annuities_taxable": 250,
+        "social_security_gross": 79000,
+        "ss_bill_mode": "on",
+        "ss_bill_override": 39500,
+        "ss_debra_mode": "on",
+        "ss_debra_override": 39500,
+        "long_term_capital_gain_loss": -60,
+        "schedule_1_adjustments_input": 1631,
+        "deduction_method": "standard"
       },
       "scorp_1120s": {
-        "entity_name": "Operating Support Services, LLC",
-        "officer_w2_wages": 180000,
-        "scorp_distributions_total": 60000,
-        "stock_basis_ending": 140000
+        "entity_name": "Operating Support Services LLC",
+        "entity_ein": "83-1706286",
+        "bill_ownership_pct": 51,
+        "debra_ownership_pct": 49,
+        "ca_revenue": 136770,
+        "az_revenue": 242815,
+        "gross_receipts_revenue": 379585,
+        "compensation_of_officers": 42000,
+        "salaries_and_wages": 33550,
+        "rents": 35447,
+        "payroll_taxes_input": 6130,
+        "ftb_state_taxes_input": 2891,
+        "advertising": 0,
+        "pension_profit_sharing_input": 144540,
+        "other_deductions": 23529,
+        "schedule_k_interest_income": 619,
+        "schedule_k_interest_bill": 316,
+        "schedule_k_interest_debra": 303,
+        "schedule_k_nondeductible_expenses": 1910,
+        "schedule_k_nondeductible_bill": 975,
+        "schedule_k_nondeductible_debra": 935,
+        "officer_w2_wages": 75550,
+        "scorp_distributions_total": 135315,
+        "bill_distributions": 69011,
+        "debra_distributions": 66304,
+        "capital_contributions": 0,
+        "bill_stock_basis_beginning": 5615,
+        "debra_stock_basis_beginning": 5401,
+        "ca_franchise_tax_input": 800
       },
       "dbp_and_retirement": {
         "dbp_status": "active",
-        "dbp_actual_contribution": 45000,
+        "dbp_actual_contribution": 140000,
         "dbp_target_termination_year": 2027
       },
       "state_filings": [
         {
-          "state_code": "AZ",
-          "residency_status": "part_year_resident",
-          "state_apportionment_factor": 0.65
+          "state_code": "CA",
+          "residency_status": "resident",
+          "state_apportionment_factor": 0.360315,
+          "state_conformity_adjustment": 969
         },
         {
-          "state_code": "CA",
-          "residency_status": "part_year_resident",
-          "state_apportionment_factor": 0.35
+          "state_code": "AZ",
+          "residency_status": "non_resident",
+          "state_apportionment_factor": 0.639685
         }
       ]
     }
