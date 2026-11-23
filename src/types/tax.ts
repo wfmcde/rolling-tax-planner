@@ -17,14 +17,18 @@ export type DbpStatus = 'active' | 'frozen' | 'terminating' | 'terminated';
 export type ResidencyStatus = 'resident' | 'part_year_resident' | 'non_resident';
 export type ConfidenceLevel = 'high' | 'medium' | 'low';
 
+export type OpexScalingMode = 'revenue_proportional' | 'fixed_inflation';
+
 export interface ForecastAssumptions {
   inflation_rate: number; // e.g., 0.025 (2.5%)
   ss_cola_rate: number; // e.g., 0.026 (2.6% historical average SS COLA, applied Current Year + 1)
   medicare_inflation_rate: number; // e.g., 0.055 (5.5% historical average Medicare inflation, applied Current Year + 1)
+  irmaa_threshold_growth_rate?: number; // e.g., 0.03 (3.0%/yr applied to 2027+ from $218k 2026 MFJ baseline, rounded to $1,000)
   revenue_growth_rate: number; // e.g., 0.04 (4%)
   wage_growth_rate: number; // e.g., 0.03 (3%)
   investment_growth_rate: number; // e.g., 0.035 (3.5%)
-  expense_ratio: number; // e.g., 0.22 of gross receipts
+  expense_ratio: number; // e.g., 0.164 of gross receipts (applied to unlocked future forecast years)
+  opex_scaling_mode?: OpexScalingMode; // 'revenue_proportional' (default) or 'fixed_inflation'
 }
 
 export interface PersonMedicareConfig {
@@ -45,11 +49,43 @@ export interface PersonSocialSecurityConfig {
 
 export interface PersonProfile {
   birth_date: string; // YYYY-MM-DD or '' when left blank
+  /** Configurable birth month (1 = Jan .. 12 = Dec) used for SS FRA suspension & age-70 proration */
+  birth_month?: number;
   social_security: PersonSocialSecurityConfig;
   medicare: PersonMedicareConfig;
 }
 
 export type SsYearMode = 'on' | 'suspended' | 'off';
+
+export type WorkspaceProfileMode = 'my_profile' | 'test_persona' | 'blank_user';
+
+/**
+ * Per-state business revenue apportionment percentages (summing to 100) keyed by 2-letter state code.
+ * Example: { CA: 37, AZ: 63 }
+ */
+export type StateApportionmentSplit = Record<string, number>;
+
+export interface StateRevenueApportionmentConfig {
+  /** Ordered list of selected US state codes tracked in Setup apportionment (supports 1..N states, including 0% states) */
+  states?: string[];
+  /** Default forecast split across selected apportionment states (sums to 100%) */
+  default_split: StateApportionmentSplit;
+  /** Optional per-year overrides keyed by tax year (each sums to 100%) */
+  year_overrides?: Record<number, StateApportionmentSplit>;
+}
+
+export interface DbpActuarialConfig {
+  /** Historical High-3 W-2 average from prior Schedule SB before the forecast window */
+  historical_high_3_w2: number;
+  /** Beginning-of-Year (BOY) DBP trust assets for the anchor year (first year in window) */
+  boy_assets_anchor: number;
+  /** Plan Year number (1..10+) for the anchor year (first year in window) */
+  plan_year_anchor: number;
+  /** Assumed annual DBP trust investment growth rate (decimal, e.g. 0, 0.05) */
+  trust_growth_rate: number;
+  /** IRC §417(e) / §415(b)(2)(E) lump-sum valuation interest rate (decimal, e.g. 0.0475, 0.05) */
+  valuation_interest_rate: number;
+}
 
 export interface SetupConfig {
   filing_status: FilingStatus;
@@ -59,13 +95,29 @@ export interface SetupConfig {
   spouse_birth_year: number | null;
   primary_profile: PersonProfile;
   spouse_profile: PersonProfile;
+  /** Dynamic business / entity metadata used in UI headers and CPA report footers */
+  business_name?: string;
+  business_website?: string;
+  business_ein?: string;
+  /** Primary domicile / resident state 2-letter code (e.g., 'CA', 'TX', 'WA', or '' when unset) */
+  home_state?: string;
+  /** Optional secondary sourcing state 2-letter code when multi_state_active is enabled */
+  secondary_state?: string;
+  /** Dynamic Setup-driven state revenue apportionment splits for forecast years */
+  state_revenue_apportionment?: StateRevenueApportionmentConfig;
+  /** Internal profile archetype tag for isolated reference-only features */
+  workspace_profile_kind?: 'default' | 'test_persona' | 'blank' | 'custom';
   deduction_method: DeductionMethod;
   custom_itemized_deduction: number;
   entity_type: EntityType;
   has_scorp: boolean;
+  has_ss_medicare?: boolean;
+  has_stock_basis?: boolean;
   has_dbp: boolean;
   dbp_planned_termination_year: number | null; // null means "None"
   post_dbp_profit_sharing_rate: number; // decimal e.g. 0.06 up to 0.25
+  /** Editable Schedule SB / actuarial waterfall baselines for the DBP engine */
+  dbp_actuarial?: DbpActuarialConfig;
   has_401k_or_ira: boolean;
   has_annuity: boolean;
   has_pte: boolean;
@@ -76,6 +128,8 @@ export interface SetupConfig {
   forecast_length: number;
   forecast_years: number[];
   assumptions: ForecastAssumptions;
+  /** Optional per-coverage-year manual overrides for IRMAA Tier 1 starting threshold (e.g. { 2027: 224000 }) */
+  irmaa_threshold_overrides?: Record<number, number>;
 }
 
 export interface Form1040Inputs {
@@ -151,7 +205,14 @@ export interface Form1040Outputs {
   niit_tax: number;
   marginal_tax_rate: number;
   effective_tax_rate: number;
+  irmaa_coverage_year: number;
+  irmaa_lookback_year: number;
   irmaa_lookback_magi: number;
+  irmaa_tier1_threshold: number;
+  irmaa_formula_tier1_threshold: number;
+  irmaa_is_overridden: boolean;
+  irmaa_future_coverage_year: number;
+  irmaa_future_tier1_threshold: number;
   irmaa_current_magi_exceeds_cliff: boolean;
   irmaa_tier: string;
   primary_irmaa_surcharge: number;
@@ -176,6 +237,8 @@ export interface SCorp1120SInputs {
   az_revenue: number;
   gross_receipts_revenue: number;
   operating_expenses: number;
+  /** Optional per-year manual override for Operating Expenses in unlocked future forecast years (null = follow scaling formula) */
+  operating_expenses_override?: number | null;
   /** Detailed Form 1120-S line-item deductions (when use_detailed_1120s_deductions is true) */
   use_detailed_1120s_deductions?: boolean;
   compensation_of_officers?: number;
@@ -215,6 +278,9 @@ export interface SCorp1120SInputs {
 }
 
 export interface SCorp1120SOutputs {
+  effective_operating_expenses: number;
+  operating_expenses_is_scaled: boolean;
+  operating_expenses_is_overridden: boolean;
   employer_payroll_taxes: number;
   pte_tax_paid_by_state: Record<string, number>;
   pte_tax_paid_total: number;
@@ -338,8 +404,34 @@ export interface ComputedTaxYear {
 
 export type ValidationSeverity = 'error' | 'warning' | 'info';
 
+export type GuardrailAckStatus =
+  | 'prior_year_historical'
+  | 'intentional_cpa_reviewed'
+  | 'mitigation_planned';
+
+export interface GuardrailAcknowledgment {
+  /** Stable per-rule, per-year key (e.g., "scorp_basis_excess:2025", "low_reasonable_comp:2026") */
+  key: string;
+  rule_id: string;
+  tax_year: number | null;
+  status: GuardrailAckStatus;
+  note: string;
+  /** ISO date string (YYYY-MM-DD) when first acknowledged */
+  acknowledged_at: string;
+  /** Optional ISO date string (YYYY-MM-DD) when note/status was last updated */
+  updated_at?: string;
+  /** Snapshot of the finding text when acknowledged (for CPA review & audit log) */
+  finding_title: string;
+  finding_message: string;
+  finding_severity: ValidationSeverity;
+}
+
 export interface ValidationIssue {
   id: string;
+  /** Stable deterministic rule identifier (e.g., "scorp_basis_excess", "low_reasonable_comp") */
+  rule_id: string;
+  /** Stable per-rule, per-year acknowledgment key: `${rule_id}:${tax_year ?? 'global'}` */
+  ack_key: string;
   tax_year: number | null;
   category:
     | 'lock_integrity'
@@ -352,6 +444,13 @@ export interface ValidationIssue {
   message: string;
   field_reference: string;
   target_tab: WorkspaceTab;
+  /** Live numeric breakdown attached to low_reasonable_comp findings so UI & CPA print views stay 100% synced */
+  reasonable_comp_meta?: {
+    officer_w2: number;
+    ordinary_business_income: number;
+    ratio: number;
+    ratio_percent: string;
+  };
 }
 
 export interface ProvenanceField {
@@ -434,10 +533,39 @@ export interface PnlBalanceSheetState {
   projection_year: number;
   pnl: Record<PnlLineId, PnlLineAmounts>;
   balance_sheet: BalanceSheetProjectionInputs;
+  /** Tracks whether the user explicitly overrode Line 17 Remaining/Projected in the P&L table */
+  retirement_line17_manual_overrides?: {
+    dbp_contribution?: boolean;
+    employer_401k?: boolean;
+  };
   last_pushed_at?: string;
 }
 
+export interface PushToHorizonImpact {
+  taxYear: number;
+  prevK1: number;
+  newK1: number;
+  k1Delta: number;
+  prevAllInTax: number;
+  newAllInTax: number;
+  taxDelta: number;
+}
+
 export type CadenceForecastMode = 'cadence' | 'exp_smooth' | 'run_rate' | 'one_time' | 'manual';
+
+export type CadenceGroupingMode = 'category' | 'stream';
+
+export type PayeeAliasMatchType = 'contains' | 'exact';
+
+export interface PayeeAliasRule {
+  id: string;
+  /** Raw import text/pattern to match (case-insensitive) against vendor/payee or memo/description */
+  pattern: string;
+  /** Match mode: case-insensitive substring ('contains') or exact match ('exact') */
+  match_type: PayeeAliasMatchType;
+  /** Canonical payee / stream display name to merge matched transactions into */
+  canonical_name: string;
+}
 
 export interface CadenceTransactionRow {
   id: string;
@@ -464,10 +592,14 @@ export interface CadenceForecasterState {
   source_label: string;
   ledger_format?: 'general_ledger' | 'transaction_list';
   as_of_date: string; // YYYY-MM-DD
+  /** Grouping mode for the forecast table: rolled up by P&L Category (~28 rows) or granular vendor streams */
+  grouping_mode?: CadenceGroupingMode;
   /** Simple Exponential Smoothing factor alpha (0.10 to 0.90, default 0.50) */
   exp_smooth_alpha?: number;
   /** When true, scale S_T by remainingDays / 30.4375; default false uses S_T directly when <= 45d remain */
   exp_smooth_day_fraction?: boolean;
+  /** User-defined payee/description alias rules applied before stream grouping & forecasting */
+  payee_aliases?: PayeeAliasRule[];
   transactions: CadenceTransactionRow[];
   stream_overrides: Record<string, CadenceStreamOverride>;
   /** Direct two-way inline overrides on aggregated P&L table lines */
@@ -486,6 +618,57 @@ export interface CadenceForecasterState {
   last_pushed_at?: string;
 }
 
+export type PlanningGuardrailKind =
+  | 'income_ceiling'
+  | 'stock_basis_floor'
+  | 'member_draw_cushion'
+  | 'retirement_cap'
+  | 'multistate_apportionment'
+  | 'custom';
+
+export type PlanningGuardrailComparator = 'max' | 'min' | 'info';
+
+export type PlanningGuardrailUnit = 'currency' | 'percent' | 'text';
+
+export type PlanningGuardrailStatus = 'within' | 'watch' | 'over';
+
+export type CustomGoalMetricKey =
+  | 'manual'
+  | 'ordinary_business_income'
+  | 'gross_receipts'
+  | 'member_draws'
+  | 'ending_stock_basis'
+  | 'operating_cash_ye'
+  | 'net_cash_ye'
+  | 'total_retirement'
+  | 'ca_revenue_pct';
+
+export interface PlanningGoalGuardrail {
+  id: string;
+  kind: PlanningGuardrailKind;
+  title: string;
+  enabled: boolean;
+  /** Numeric threshold (dollars for currency, % for percent) or null for qualitative targets */
+  target_value: number | null;
+  /** True when user explicitly overrides a formula-linked default target (e.g., 2-yr lookback IRMAA ceiling) */
+  target_overridden?: boolean;
+  /** Optional text target when unit === 'text' */
+  target_label?: string;
+  unit: PlanningGuardrailUnit;
+  comparator: PlanningGuardrailComparator;
+  /** Optional live projection metric binding for custom goals */
+  metric_binding?: CustomGoalMetricKey;
+  /** Optional manual projected value when metric_binding === 'manual' */
+  custom_current_value?: number | null;
+  /** Optional manual projected text label when unit === 'text' */
+  custom_current_label?: string;
+  /** Plain-English "Why this matters" explanation shown in UI and CPA report/CSV */
+  why_it_matters: string;
+  /** True when user manually edited why_it_matters so dynamic lookback updates do not overwrite it */
+  why_it_matters_custom?: boolean;
+  is_custom?: boolean;
+}
+
 export interface PlannerState {
   setup: SetupConfig;
   years: TaxYearRecord[];
@@ -493,6 +676,9 @@ export interface PlannerState {
   schedule_view: ScheduleViewConfig;
   pnl_balance_sheet?: PnlBalanceSheetState;
   cadence_forecaster?: CadenceForecasterState;
+  planning_goals?: PlanningGoalGuardrail[];
+  /** Profile-isolated map of acknowledged guardrail findings keyed by `${rule_id}:${tax_year ?? 'global'}` */
+  guardrail_acknowledgments?: Record<string, GuardrailAcknowledgment>;
 }
 
 export type WorkspaceTab =
@@ -525,3 +711,43 @@ export interface ScenarioDefinition {
   setup: SetupConfig;
   years: TaxYearRecord[];
 }
+
+export interface ProfileModuleFlags {
+  has_scorp: boolean;
+  has_ss_medicare: boolean;
+  has_dbp: boolean;
+  multi_state_active: boolean;
+  has_stock_basis: boolean;
+}
+
+export interface NewProfileOptions {
+  name: string;
+  filing_status: FilingStatus;
+  primary_name: string;
+  spouse_name: string;
+  tax_year: number;
+  entity_type: EntityType;
+  entity_name: string;
+  entity_ein: string;
+  notes?: string;
+  template: 'blank' | 'sample_oss';
+  modules: ProfileModuleFlags;
+}
+
+export interface TaxProfileRecord {
+  id: string;
+  name: string;
+  entity_name: string;
+  entity_ein: string;
+  notes?: string;
+  created_at: string;
+  updated_at: string;
+  state: PlannerState;
+}
+
+export interface MultiProfileStore {
+  version: 1;
+  active_profile_id: string;
+  profiles: TaxProfileRecord[];
+}
+

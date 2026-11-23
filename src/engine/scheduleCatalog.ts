@@ -1,5 +1,17 @@
 import type { ComputedTaxYear, SetupConfig } from '../types/tax';
 import { formatCompactCurrency, formatCurrency, formatPercent } from '../utils/format';
+import { getSetupPersonNames, getSetupStates } from '../utils/setupHelpers';
+import { resolveIrmaaThresholdForYear } from './irmaa';
+import { DEFAULT_PROFILE_SEED, isDefaultSeedSetup } from '../data/profiles';
+
+function getDefaultFiledRef(
+  taxYear: number,
+  setup: SetupConfig,
+  amount: number
+): string | undefined {
+  if (taxYear !== 2025 || !isDefaultSeedSetup(setup)) return undefined;
+  return `Filed: ${formatCurrency(amount)}`;
+}
 
 export type ScheduleSectionId =
   | 'income_comp'
@@ -20,6 +32,7 @@ export type CellTone = 'neutral' | 'positive' | 'warning' | 'danger' | 'accent';
 export type ScheduleEditField =
   | 'ca_scorp_revenue'
   | 'az_scorp_revenue'
+  | 'operating_expenses'
   | 'debra_w2'
   | 'bill_w2'
   | 'ss_debra'
@@ -27,7 +40,8 @@ export type ScheduleEditField =
   | 'member_draws'
   | 'capital_contributions'
   | 'dbp_contribution'
-  | 'sehi_medicare_premiums';
+  | 'sehi_medicare_premiums'
+  | 'irmaa_threshold';
 
 export interface ScheduleCellResult {
   /** Primary formatted value displayed right-aligned in monospace tabular numerals */
@@ -75,9 +89,7 @@ export function getPersonNames(setup: SetupConfig): {
   primaryName: string;
   spouseName: string;
 } {
-  const primaryName = setup.primary_name?.trim() || 'Primary';
-  const spouseName = setup.spouse_name?.trim() || 'Spouse';
-  return { primaryName, spouseName };
+  return getSetupPersonNames(setup);
 }
 
 export function getScheduleRowLabel(row: ScheduleLineItem, setup: SetupConfig): string {
@@ -87,7 +99,7 @@ export function getScheduleRowLabel(row: ScheduleLineItem, setup: SetupConfig): 
 export const SCHEDULE_SECTIONS: ScheduleSectionMeta[] = [
   {
     id: 'income_comp',
-    title: 'Group 1 — Income & Compensation Inputs (2025 Locked · 2026–2030 Inline Editable)',
+    title: 'Group 1 — Income & Compensation Inputs (Prior-Year Locked · Forecast Editable)',
     shortTitle: 'Group 1 · Income & Compensation',
     description: 'S-Corp gross revenue, per-spouse W-2 compensation, and individual Social Security schedules.',
   },
@@ -113,13 +125,9 @@ export const SCHEDULE_SECTIONS: ScheduleSectionMeta[] = [
     id: 'tax_cashflow',
     title: 'Group 5 — Tax Liability, Rates & Cash Flow',
     shortTitle: 'Group 5 · Taxes, Rates & Cash Flow',
-    description: 'Federal, employee/employer FICA, CA & AZ state taxes, combined totals, rates, safe harbor estimates, and net household cash flow.',
+    description: 'Federal, employee/employer FICA, state taxes, combined totals, rates, safe harbor estimates, and net household cash flow.',
   },
 ];
-
-function inflationScale(taxYear: number, rate: number): number {
-  return Math.pow(1 + rate, Math.max(0, taxYear - 2025));
-}
 
 function getSafeHarborInfo(
   c: ComputedTaxYear,
@@ -144,41 +152,57 @@ function getSafeHarborInfo(
   return { amount: cy90, basisLabel: '90% CY Safe', tone: 'positive' };
 }
 
-function getIrmaaCliffInfo(
-  currentMagi: number,
-  lookbackMagi: number,
+function computeDynamicStateCell(
+  c: ComputedTaxYear,
   setup: SetupConfig,
-  taxYear: number
-): { tier1Threshold: number; currentExceeds: boolean; lookbackExceeds: boolean } {
-  const scale = inflationScale(taxYear, setup.assumptions.inflation_rate);
-  const mfj = setup.filing_status === 'married_filing_jointly';
-  const tier1Threshold = Math.round((mfj ? 212000 : 106000) * scale);
-  return {
-    tier1Threshold,
-    currentExceeds: currentMagi > tier1Threshold,
-    lookbackExceeds: lookbackMagi > tier1Threshold,
-  };
-}
+  slot: 'primary' | 'secondary'
+): ScheduleCellResult {
+  const states = getSetupStates(setup);
+  const targetCode =
+    slot === 'primary' ? states.primaryStateCode : states.secondaryStateCode;
 
-function computeStateCell(c: ComputedTaxYear, stateCode: 'CA' | 'AZ'): ScheduleCellResult {
-  const filing = c.state_filings_out.find((sf) => sf.state_code === stateCode);
-  const waFiling = c.state_filings_out.find((sf) => sf.state_code === 'WA');
+  const filing = targetCode
+    ? c.state_filings_out.find((sf) => sf.state_code === targetCode)
+    : slot === 'primary'
+    ? c.state_filings_out[0]
+    : c.state_filings_out[1];
 
   if (!filing) {
     return {
       display: '$0',
       numericValue: 0,
-      badge: { text: 'Not active', tone: 'neutral' },
+      badge: { text: targetCode ? `${targetCode} Inactive` : 'Not active', tone: 'neutral' },
     };
   }
 
+  const stateCode = filing.state_code;
   const appPct = Number((filing.state_apportionment_factor * 100).toFixed(1));
   const persTax = filing.state_personal_tax_liability;
   const entityTax = filing.state_entity_tax_liability;
   const pteTax = filing.state_pte_payment_amount;
   const totalTax = filing.state_income_tax_liability;
 
+  // No-income-tax states (TX, WA, NV, FL, TN, etc.)
+  if (totalTax === 0 && persTax === 0 && entityTax === 0 && pteTax === 0 && filing.credit_for_taxes_paid_to_other_states === 0) {
+    const resLabel =
+      filing.residency_status === 'resident'
+        ? `${stateCode} Res`
+        : filing.residency_status === 'part_year_resident'
+        ? `${stateCode} Part-Yr`
+        : `${stateCode} Non-Res`;
+    return {
+      display: '$0',
+      numericValue: 0,
+      badge: { text: resLabel, tone: 'positive' },
+      subLabel: '0% state tax',
+      subTone: 'neutral',
+    };
+  }
+
   if (stateCode === 'CA') {
+    const otherRes = c.state_filings_out.find(
+      (sf) => sf.state_code !== 'CA' && sf.residency_status !== 'non_resident'
+    );
     let badgeText: string;
     let badgeTone: CellTone;
     let formCode: string;
@@ -188,12 +212,12 @@ function computeStateCell(c: ComputedTaxYear, stateCode: 'CA' | 'AZ'): ScheduleC
       badgeTone = 'accent';
       formCode = '540';
     } else if (filing.residency_status === 'part_year_resident') {
-      badgeText = waFiling ? 'Part-Yr CA/WA' : 'Part-Yr CA';
+      badgeText = otherRes ? `Part-Yr CA/${otherRes.state_code}` : 'Part-Yr CA';
       badgeTone = 'warning';
       formCode = '540NR';
     } else {
       badgeText = 'CA Non-Res';
-      badgeTone = waFiling?.residency_status === 'resident' ? 'positive' : 'neutral';
+      badgeTone = otherRes?.residency_status === 'resident' ? 'positive' : 'neutral';
       formCode = '540NR';
     }
 
@@ -207,66 +231,71 @@ function computeStateCell(c: ComputedTaxYear, stateCode: 'CA' | 'AZ'): ScheduleC
       badge: { text: badgeText, tone: badgeTone },
       subLabel,
       subTone: 'neutral',
-      filedRef: c.tax_year === 2025 ? 'Filed: $5,362 540' : undefined,
     };
   }
 
-  // Arizona State Tax (AZ Form 120S entity/PTE + AZ Form 140NR nonresident personal)
-  const azBadgeText =
+  const badgeText =
     filing.residency_status === 'resident'
-      ? 'AZ Res'
+      ? `${stateCode} Res`
       : filing.residency_status === 'part_year_resident'
-      ? `AZ Part-Yr · ${appPct}%`
-      : `AZ Non-Res · ${appPct}%`;
-  const azBadgeTone: CellTone =
+      ? `${stateCode} Part-Yr · ${appPct}%`
+      : `${stateCode} Non-Res · ${appPct}%`;
+  const badgeTone: CellTone =
     filing.residency_status === 'resident'
       ? 'accent'
       : filing.residency_status === 'part_year_resident'
       ? 'warning'
       : 'neutral';
 
-  let azSubLabel: string;
+  let subLabel: string;
   if (pteTax > 0) {
-    azSubLabel = `PTE ${formatCurrency(pteTax)} · 140NR ${formatCurrency(persTax)}`;
+    subLabel = `PTE ${formatCurrency(pteTax)} · Pers ${formatCurrency(persTax)}`;
   } else if (filing.credit_for_taxes_paid_to_other_states > 0) {
-    azSubLabel = `140NR ${formatCurrency(persTax)} (OSTC -${formatCurrency(
+    subLabel = `Pers ${formatCurrency(persTax)} (OSTC -${formatCurrency(
       filing.credit_for_taxes_paid_to_other_states
     )})`;
+  } else if (entityTax > 0) {
+    subLabel = `Entity ${formatCurrency(entityTax)} · Pers ${formatCurrency(persTax)}`;
   } else {
-    azSubLabel = `140NR ${formatCurrency(persTax)}`;
+    subLabel = `Pers ${formatCurrency(persTax)}`;
   }
 
   return {
     display: formatCurrency(totalTax),
     numericValue: totalTax,
-    badge: { text: azBadgeText, tone: azBadgeTone },
-    subLabel: azSubLabel,
+    badge: { text: badgeText, tone: badgeTone },
+    subLabel,
     subTone: filing.credit_for_taxes_paid_to_other_states > 0 ? 'positive' : 'neutral',
-    filedRef: c.tax_year === 2025 ? 'Filed: $0 140NR' : undefined,
   };
 }
 
 export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   // =========================================================================
-  // Group 1 — Income & Compensation Inputs (2025 Locked · 2026–2030 Inline Editable)
+  // Group 1 — Income & Compensation Inputs
   // =========================================================================
   {
     id: 'ca_scorp_revenue',
     section: 'income_comp',
-    label: 'California S-Corp Revenue',
+    label: 'Primary State S-Corp Revenue',
+    getLabel: (s) => {
+      const { primaryStateName, hasPrimaryState } = getSetupStates(s);
+      return hasPrimaryState ? `${primaryStateName} S-Corp Revenue` : 'Primary S-Corp Revenue';
+    },
     code: 'ca_revenue',
-    description: 'California-sourced S-Corp gross receipts (2025 locked at $136,770; inline editable 2026–2030). Drives CA apportionment %.',
+    description: 'Primary-state S-Corp gross receipts (inline editable in forecast years). Drives primary state apportionment %.',
     summable: true,
     editField: 'ca_scorp_revenue',
     computeCell: (c, _i, _all, setup) => {
       const val = setup.has_scorp ? c.scorp_in.ca_revenue : 0;
       const total = setup.has_scorp ? c.scorp_in.gross_receipts_revenue : 0;
       const pct = total > 0 ? (val / total) * 100 : 0;
+      const { primaryStateCode } = getSetupStates(setup);
+      const stateTag = primaryStateCode || 'Primary';
       return {
         display: formatCurrency(val),
         numericValue: val,
         rawEditValue: val,
-        subLabel: setup.has_scorp ? `${pct.toFixed(1)}% CA share` : 'S-Corp off',
+        subLabel: setup.has_scorp ? `${pct.toFixed(1)}% ${stateTag} share` : 'S-Corp off',
         subTone: 'neutral',
       };
     },
@@ -274,20 +303,28 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'az_scorp_revenue',
     section: 'income_comp',
-    label: 'Arizona S-Corp Revenue',
+    label: 'Secondary State S-Corp Revenue',
+    getLabel: (s) => {
+      const { secondaryStateName, hasSecondaryState } = getSetupStates(s);
+      return hasSecondaryState
+        ? `${secondaryStateName} S-Corp Revenue`
+        : 'Secondary State S-Corp Revenue';
+    },
     code: 'az_revenue',
-    description: 'Arizona-sourced S-Corp gross receipts (2025 locked at $242,815; inline editable 2026–2030). Drives AZ apportionment %.',
+    description: 'Secondary-state S-Corp gross receipts when multi-state apportionment is active.',
     summable: true,
     editField: 'az_scorp_revenue',
     computeCell: (c, _i, _all, setup) => {
       const val = setup.has_scorp ? c.scorp_in.az_revenue : 0;
       const total = setup.has_scorp ? c.scorp_in.gross_receipts_revenue : 0;
       const pct = total > 0 ? (val / total) * 100 : 0;
+      const { secondaryStateCode } = getSetupStates(setup);
+      const stateTag = secondaryStateCode || 'Secondary';
       return {
         display: formatCurrency(val),
         numericValue: val,
         rawEditValue: val,
-        subLabel: setup.has_scorp ? `${pct.toFixed(1)}% AZ share` : 'S-Corp off',
+        subLabel: setup.has_scorp ? `${pct.toFixed(1)}% ${stateTag} share` : 'S-Corp off',
         subTone: 'neutral',
       };
     },
@@ -297,31 +334,40 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     section: 'income_comp',
     label: 'Total S-Corp Gross Revenue',
     code: 'gross_receipts_revenue',
-    description: 'Auto-calculated sum of California S-Corp Revenue + Arizona S-Corp Revenue with live CA% / AZ% apportionment split.',
+    description: 'Auto-calculated sum of S-Corp gross receipts with live state apportionment split.',
     bold: true,
     summable: true,
     computeCell: (c, _i, _all, setup) => {
-      const ca = setup.has_scorp ? c.scorp_in.ca_revenue : 0;
-      const az = setup.has_scorp ? c.scorp_in.az_revenue : 0;
-      const total = setup.has_scorp ? ca + az : 0;
-      const caPct = total > 0 ? ((ca / total) * 100).toFixed(1) : '0.0';
-      const azPct = total > 0 ? ((az / total) * 100).toFixed(1) : '0.0';
+      const s1 = setup.has_scorp ? c.scorp_in.ca_revenue : 0;
+      const s2 = setup.has_scorp ? c.scorp_in.az_revenue : 0;
+      const total = setup.has_scorp ? s1 + s2 : 0;
+      const pct1 = total > 0 ? ((s1 / total) * 100).toFixed(1) : '0.0';
+      const pct2 = total > 0 ? ((s2 / total) * 100).toFixed(1) : '0.0';
+      const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+      const badgeText = !setup.has_scorp
+        ? 'S-Corp off'
+        : setup.multi_state_active && secondaryStateCode
+        ? `${primaryStateCode || 'S1'} ${pct1}% / ${secondaryStateCode} ${pct2}%`
+        : primaryStateCode
+        ? `100% ${primaryStateCode}`
+        : 'Single State';
       return {
         display: formatCurrency(total),
         numericValue: total,
-        badge: setup.has_scorp
-          ? { text: `CA ${caPct}% / AZ ${azPct}%`, tone: 'accent' }
-          : { text: 'S-Corp off', tone: 'neutral' },
+        badge: {
+          text: badgeText,
+          tone: setup.has_scorp ? 'accent' : 'neutral',
+        },
       };
     },
   },
   {
     id: 'bill_w2_comp',
     section: 'income_comp',
-    label: 'Bill W-2 Compensation',
+    label: 'Primary W-2 Compensation',
     getLabel: (s) => `${getPersonNames(s).primaryName} W-2 Compensation`,
     code: 'bill_w2_wages',
-    description: 'Primary Taxpayer gross W-2 compensation (inline editable 2026–2030).',
+    description: 'Primary Taxpayer cash W-2 compensation (Box 3/5 FICA & 401(k) wage base, excluding S-Corp >2% SEHI add-back; inline editable in forecast years).',
     summable: true,
     editField: 'bill_w2',
     computeCell: (c, _i, _all, setup) => {
@@ -339,10 +385,10 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'debra_w2_comp',
     section: 'income_comp',
-    label: 'Debra W-2 Compensation',
+    label: 'Spouse W-2 Compensation',
     getLabel: (s) => `${getPersonNames(s).spouseName} W-2 Compensation`,
     code: 'debra_w2_wages',
-    description: 'Spouse officer W-2 compensation (inline editable 2026–2030).',
+    description: 'Spouse officer cash W-2 compensation (Box 3/5 FICA & 401(k) wage base, excluding S-Corp >2% SEHI add-back; inline editable in forecast years).',
     summable: true,
     editField: 'debra_w2',
     computeCell: (c, _i, _all, setup) => {
@@ -368,7 +414,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'ss_bill',
     section: 'income_comp',
-    label: 'SS Bill',
+    label: 'SS Primary',
     getLabel: (s) => `SS ${getPersonNames(s).primaryName}`,
     code: 'primary_ss_gross',
     description: 'Primary Taxpayer annual gross Social Security benefit with On / Suspended / Off toggle and inline dollar override.',
@@ -406,7 +452,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'ss_debra',
     section: 'income_comp',
-    label: 'SS Debra',
+    label: 'SS Spouse',
     getLabel: (s) => `SS ${getPersonNames(s).spouseName}`,
     code: 'spouse_ss_gross',
     description: 'Spouse annual gross Social Security benefit with On / Suspended / Off toggle and inline dollar override.',
@@ -448,11 +494,54 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   // Group 2 — S-Corp Profit, Draws & Stock Basis
   // =========================================================================
   {
+    id: 'scorp_operating_expenses',
+    section: 'scorp_basis',
+    label: 'S-Corp Operating Expenses (Excl. Payroll & Ret.)',
+    code: 'effective_operating_expenses',
+    description:
+      'Non-payroll, non-retirement S-Corp operating expenses (excludes W-2 wages, employer payroll taxes, >2% SEHI, DBP, and employer 401(k)). Unlocked future forecast years auto-scale proportionally with Gross Revenue unless switched to Fixed mode or manually overridden per year.',
+    summable: true,
+    editField: 'operating_expenses',
+    computeCell: (c, _i, _all, setup) => {
+      const val = setup.has_scorp ? c.scorp_out.effective_operating_expenses : 0;
+      const rev = setup.has_scorp ? c.scorp_in.gross_receipts_revenue : 0;
+      const pctOfRev = rev > 0 ? ((val / rev) * 100).toFixed(1) : '0.0';
+      const setupBaseYear = setup.current_tax_year ?? 2026;
+      const ratioPct = Number(((setup.assumptions.expense_ratio ?? 0.2) * 100).toFixed(1));
+      const isOverridden = setup.has_scorp && c.scorp_out.operating_expenses_is_overridden;
+      const isScaled = setup.has_scorp && c.scorp_out.operating_expenses_is_scaled;
+
+      let subLabel: string | undefined;
+      if (!setup.has_scorp) {
+        subLabel = 'S-Corp off';
+      } else if (c.is_locked_actuals) {
+        subLabel = `${pctOfRev}% of rev · ${c.tax_year} Actuals`;
+      } else if (isOverridden) {
+        subLabel = `${pctOfRev}% of rev`;
+      } else if (isScaled) {
+        subLabel = `${ratioPct}% of rev (auto)`;
+      } else if (c.tax_year <= setupBaseYear) {
+        subLabel = `${pctOfRev}% of rev (${setupBaseYear} Base)`;
+      } else {
+        subLabel = `${pctOfRev}% of rev (fixed)`;
+      }
+
+      return {
+        display: formatCurrency(val),
+        numericValue: val,
+        rawEditValue: val,
+        isOverridden,
+        subLabel,
+        subTone: isScaled ? 'accent' : 'neutral',
+      };
+    },
+  },
+  {
     id: 'scorp_k1_profit',
     section: 'scorp_basis',
     label: 'S-Corp K-1 Pass-Through Profit (Flows to 1040)',
     code: 'schedule_k1_ordinary_income',
-    description: 'Form 1120-S ordinary business income passing through via Schedule K-1 Box 1.',
+    description: 'Form 1120-S ordinary business income passing through via Schedule K-1 Box 1 (net of operating expenses, cash W-2, S-Corp >2% SEHI, employer payroll taxes, DBP, employer 401(k), and PTE).',
     bold: true,
     summable: true,
     computeCell: (c, _i, _all, setup) => {
@@ -467,7 +556,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
             ? 'Auto calc · K-1 Box 1'
             : 'S-Corp off',
         subTone: 'neutral',
-        filedRef: c.tax_year === 2025 ? 'Filed: $91,498' : undefined,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          DEFAULT_PROFILE_SEED.verification_benchmarks_2025.k1_ordinary_income
+        ),
       };
     },
   },
@@ -521,7 +614,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
           ? `Beg ${formatCompactCurrency(c.scorp_in.stock_basis_beginning)}`
           : undefined,
         subTone: setup.has_scorp && val <= 0 ? 'warning' : 'neutral',
-        filedRef: c.tax_year === 2025 ? 'Filed: $0' : undefined,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          DEFAULT_PROFILE_SEED.verification_benchmarks_2025.ending_stock_basis
+        ),
       };
     },
   },
@@ -532,7 +629,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     code: 'excess_distribution_capital_gain',
     description: 'Taxable capital gain triggered whenever Member Draws exceed available stock basis.',
     summable: true,
-    computeCell: (c) => {
+    computeCell: (c, _i, _all, setup) => {
       const excess = c.scorp_out.excess_distribution_capital_gain;
       return {
         display: formatCurrency(excess),
@@ -541,7 +638,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
           excess > 0
             ? { text: 'Basis Exceeded', tone: 'danger' }
             : { text: 'Basis OK', tone: 'positive' },
-        filedRef: c.tax_year === 2025 ? 'Filed: $32,182' : undefined,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          DEFAULT_PROFILE_SEED.verification_benchmarks_2025.excess_dist_gain
+        ),
       };
     },
   },
@@ -590,23 +691,26 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     section: 'retirement_health',
     label: 'Employer 401(k) Profit Sharing / Match',
     code: 'employer_401k_total',
-    description: 'Employer profit sharing: 6% cap through DBP Termination Year, stepping up to Post-DBP rate in Termination Year + 1 (capped by IRS §415(c)).',
+    description: 'Employer profit sharing: 6% IRC §404(a)(7) combined-plan cap while DBP is active; rises to 25% of cash W-2 wages once DBP is terminated (subject to IRS §415(c)).',
     summable: true,
     computeCell: (c, _i, _all, setup) => {
       const val = c.form_1040_out.employer_401k_total;
       const pct = Math.round(c.form_1040_out.employer_401k_rate_applied * 1000) / 10;
       const termYear = setup.has_dbp ? setup.dbp_planned_termination_year : null;
-      const isPostTerm = setup.has_dbp && termYear !== null && c.tax_year > termYear;
+      const isDbpTerminatedOrInactive =
+        !setup.has_dbp ||
+        c.dbp_in.dbp_status === 'terminated' ||
+        (termYear !== null && c.tax_year > termYear && c.dbp_in.dbp_status !== 'active');
       return {
         display: formatCurrency(val),
         numericValue: val,
         subLabel:
           !setup.has_401k_or_ira || !setup.has_scorp
             ? 'Inactive'
-            : isPostTerm
-            ? `${pct}% post-DBP`
+            : isDbpTerminatedOrInactive
+            ? `${pct}% elected · 25% max`
             : `${pct}% DBP cap`,
-        subTone: isPostTerm && pct > 6 ? 'accent' : 'neutral',
+        subTone: isDbpTerminatedOrInactive && pct > 6 ? 'accent' : 'neutral',
       };
     },
   },
@@ -648,11 +752,15 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     summable: true,
     computeCell: (c) => {
       const shield = c.form_1040_out.dbp_and_ps_tax_reduction;
+      const isZeroFedTax =
+        c.form_1040_out.taxable_income <= 0 && c.form_1040_out.federal_income_tax <= 0;
       return {
         display: formatCurrency(shield),
         numericValue: shield,
         subLabel:
-          shield > 0
+          isZeroFedTax
+            ? '$0 · 0% marginal'
+            : shield > 0
             ? `@ ${formatPercent(c.form_1040_out.marginal_tax_rate, 0)} marginal`
             : 'No active shield',
         subTone: shield > 0 ? 'positive' : 'neutral',
@@ -710,16 +818,22 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     section: 'retirement_health',
     label: 'SEHI Medicare Deduction (Sched 1 Line 17)',
     code: 'sehi_medicare_deduction',
-    description: 'Above-the-line >2% S-Corp shareholder health & Medicare deduction, capped at each shareholder’s available W-2 Box 1 wages (W-2 minus 401(k) deferrals).',
+    description:
+      'Above-the-line >2% S-Corp shareholder health & Medicare deduction (IRS Form 7206 Line 11 / IRC § 162(l)(5)), capped at combined W-2 Box 5 Medicare wages (gross W-2 before 401(k) deferrals, excluding the S-Corp 2% health insurance add-back).',
     summable: true,
-    computeCell: (c) => {
+    computeCell: (c, _i, _all, setup) => {
       const ded = c.form_1040_out.sehi_medicare_deduction;
       const prem = c.form_1040_out.sehi_medicare_premiums_effective;
-      const capped = prem > ded && prem > 0;
+      const combinedBox5Wages =
+        Math.max(0, c.scorp_in.bill_w2_wages) +
+        (setup.filing_status === 'married_filing_jointly'
+          ? Math.max(0, c.scorp_in.debra_w2_wages)
+          : 0);
+      const capped = setup.has_scorp && prem > 0 && prem > combinedBox5Wages && prem > ded;
       return {
         display: ded > 0 ? formatCurrency(-ded) : '$0',
         numericValue: -ded,
-        subLabel: capped ? 'Box 1 wage-capped' : ded > 0 ? 'Sch 1 Ln 17' : 'None',
+        subLabel: capped ? 'Box 5 wage-capped' : ded > 0 ? 'Sch 1 Ln 17' : 'None',
         subTone: capped ? 'warning' : ded > 0 ? 'positive' : 'neutral',
       };
     },
@@ -733,9 +847,18 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     section: 'personal_taxable',
     label: 'Enhanced Senior Deduction',
     code: 'enhanced_senior_deduction_allowed',
-    description: 'Schedule 1-A age 65+ enhanced senior deduction ($6,000 per eligible spouse) with MAGI phaseout tracking.',
+    description:
+      'Schedule 1-A age 65+ enhanced senior deduction ($6,000 per eligible spouse, $12,000 MFJ max; 2025–2028 statutory window, sunsets after 2028) with MAGI phaseout tracking.',
     summable: true,
-    computeCell: (c) => {
+    computeCell: (c, _idx, _all, setup) => {
+      if (c.tax_year > 2028) {
+        return {
+          display: '$0',
+          numericValue: 0,
+          subLabel: 'Sunset after 2028',
+          subTone: 'neutral',
+        };
+      }
       const allowed = c.form_1040_out.enhanced_senior_deduction_allowed;
       const max = c.form_1040_out.enhanced_senior_deduction_max;
       const lost = c.form_1040_out.enhanced_senior_deduction_lost;
@@ -755,7 +878,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         numericValue: -allowed,
         subLabel,
         subTone,
-        filedRef: c.tax_year === 2025 ? 'Filed: -$11,938' : undefined,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          -DEFAULT_PROFILE_SEED.verification_benchmarks_2025.enhanced_senior_deduction
+        ),
       };
     },
   },
@@ -764,21 +891,25 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     section: 'personal_taxable',
     label: 'Section 199A QBI Deduction',
     code: 'qualified_business_income_deduction',
-    description: 'Form 8995 Qualified Business Income deduction (up to 20% of QBI, capped by 20% of taxable income less net capital gain & qualified dividends).',
+    description: 'Form 8995 Qualified Business Income deduction (up to 20% of QBI net of S-Corp >2% SEHI, capped by 20% of taxable income less net capital gain & qualified dividends).',
     summable: true,
-    computeCell: (c) => {
+    computeCell: (c, _i, _all, setup) => {
       const val = c.form_1040_out.qualified_business_income_deduction;
       return {
         display: val > 0 ? formatCurrency(-val) : '$0',
         numericValue: -val,
         subLabel:
-          c.tax_year === 2025
+          c.tax_year === 2025 && isDefaultSeedSetup(setup)
             ? undefined
             : val > 0
             ? 'Form 8995 (20%)'
             : 'Not applicable',
         subTone: val > 0 ? 'positive' : 'neutral',
-        filedRef: c.tax_year === 2025 ? 'Filed: -$14,337' : undefined,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          -DEFAULT_PROFILE_SEED.verification_benchmarks_2025.qbi_deduction
+        ),
       };
     },
   },
@@ -789,7 +920,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     code: 'social_security_taxable',
     description: 'Federally taxable portion (0%–85%) of combined active individual Social Security benefits.',
     summable: true,
-    computeCell: (c) => {
+    computeCell: (c, _i, _all, setup) => {
       const taxable = c.form_1040_out.social_security_taxable;
       const gross = c.form_1040_out.social_security_gross_effective;
       const pct = gross > 0 ? Math.round((taxable / gross) * 100) : 0;
@@ -797,13 +928,47 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         display: formatCurrency(taxable),
         numericValue: taxable,
         subLabel:
-          c.tax_year === 2025 && gross === 0
+          c.tax_year === 2025 && gross === 0 && isDefaultSeedSetup(setup)
             ? undefined
             : gross > 0
             ? `${pct}% of ${formatCompactCurrency(gross)}`
             : 'No active SS',
         subTone: 'neutral',
-        filedRef: c.tax_year === 2025 ? 'Filed: $0' : undefined,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          DEFAULT_PROFILE_SEED.verification_benchmarks_2025.taxable_social_security
+        ),
+      };
+    },
+  },
+  {
+    id: 'irmaa_starting_threshold',
+    section: 'personal_taxable',
+    label: 'IRMAA Starting Threshold (MFJ)',
+    getLabel: (setup) =>
+      setup.filing_status === 'married_filing_jointly'
+        ? 'IRMAA Starting Threshold (MFJ)'
+        : 'IRMAA Starting Threshold (Single)',
+    code: 'irmaa_tier1_threshold',
+    description:
+      'Medicare IRMAA Tier 1 starting threshold by coverage year (2025: $212k, 2026: $218k, 2027+: configurable step-up rounded to $1,000). Click any year to override individually without altering other years.',
+    editField: 'irmaa_threshold',
+    computeCell: (c, _i, _all, setup) => {
+      const resolved = resolveIrmaaThresholdForYear(c.tax_year, setup);
+      const lookbackNote = `${resolved.coverageYear} Cov · Tests ${resolved.lookbackMagiYear} MAGI`;
+      const formulaHint = resolved.isOverridden
+        ? `Formula: ${formatCompactCurrency(resolved.formulaThreshold)}`
+        : resolved.sourceLabel;
+
+      return {
+        display: formatCurrency(resolved.effectiveThreshold),
+        numericValue: resolved.effectiveThreshold,
+        rawEditValue: resolved.effectiveThreshold,
+        isOverridden: resolved.isOverridden,
+        subLabel: lookbackNote,
+        subTone: resolved.isOverridden ? 'warning' : 'neutral',
+        filedRef: formulaHint,
       };
     },
   },
@@ -812,43 +977,68 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     section: 'personal_taxable',
     label: 'Total Joint AGI (Form 1040)',
     code: 'adjusted_gross_income',
-    description: 'Form 1040 Line 11 AGI with inline IRMAA Cliff Watchdog flag when exceeding Medicare MAGI thresholds.',
+    description:
+      'Form 1040 Line 11 AGI with inline IRMAA Cliff Watchdog showing active coverage-year surcharge (2-yr lookback MAGI) and forward coverage-year (+2 yr) cliff test.',
     bold: true,
     summable: true,
     computeCell: (c, _i, _all, setup) => {
       const agi = c.form_1040_out.adjusted_gross_income;
-      const currentMagi = agi + c.form_1040_in.tax_exempt_interest;
       const surcharge = c.form_1040_out.irmaa_annual_surcharge;
-      const cliff = getIrmaaCliffInfo(
-        currentMagi,
-        c.form_1040_out.irmaa_lookback_magi,
-        setup,
-        c.tax_year
-      );
+      const lookbackYear = c.form_1040_out.irmaa_lookback_year;
+      const lookbackMagi = c.form_1040_out.irmaa_lookback_magi;
+      const covThreshold = c.form_1040_out.irmaa_tier1_threshold;
+      const lookbackExceeds = lookbackMagi > covThreshold;
+      const futureCovYear = c.form_1040_out.irmaa_future_coverage_year;
+      const futureThreshold = c.form_1040_out.irmaa_future_tier1_threshold;
+      const currentExceedsFuture = c.form_1040_out.irmaa_current_magi_exceeds_cliff;
 
       let badge: ScheduleCellResult['badge'];
-      if (surcharge > 0) {
-        badge = {
-          text: `IRMAA +${formatCompactCurrency(surcharge)}`,
-          tone: 'danger',
-        };
-      } else if (cliff.currentExceeds) {
-        badge = {
-          text: `IRMAA Cliff >${formatCompactCurrency(cliff.tier1Threshold)}`,
-          tone: 'warning',
-        };
-      } else {
-        badge = {
-          text: 'IRMAA: Shielded',
-          tone: 'positive',
-        };
+      let subLabel: string | undefined;
+      let subTone: CellTone = 'neutral';
+
+      if (setup.has_ss_medicare !== false) {
+        if (surcharge > 0) {
+          badge = {
+            text: `IRMAA +${formatCompactCurrency(surcharge)}`,
+            tone: 'danger',
+          };
+          subLabel = `${c.tax_year} Cov (${lookbackYear} MAGI)`;
+          subTone = 'danger';
+        } else if (lookbackExceeds) {
+          badge = {
+            text: `${c.tax_year} IRMAA >${formatCompactCurrency(covThreshold)}`,
+            tone: 'warning',
+          };
+          subLabel = `${lookbackYear} MAGI > ${c.tax_year} Cov`;
+          subTone = 'warning';
+        } else if (currentExceedsFuture) {
+          badge = {
+            text: `${futureCovYear} Cliff >${formatCompactCurrency(futureThreshold)}`,
+            tone: 'warning',
+          };
+          subLabel = `${c.tax_year} MAGI → ${futureCovYear} Cov`;
+          subTone = 'warning';
+        } else {
+          badge = {
+            text: 'IRMAA: Shielded',
+            tone: 'positive',
+          };
+          subLabel = `≤${formatCompactCurrency(futureThreshold)} (${futureCovYear} Cov)`;
+          subTone = 'neutral';
+        }
       }
 
       return {
         display: formatCurrency(agi),
         numericValue: agi,
         badge,
-        filedRef: c.tax_year === 2025 ? 'Filed: $150,511' : undefined,
+        subLabel,
+        subTone,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          DEFAULT_PROFILE_SEED.verification_benchmarks_2025.agi
+        ),
       };
     },
   },
@@ -860,7 +1050,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     description: 'Form 1040 Line 15 taxable income with inline marginal bracket headroom indicator.',
     bold: true,
     summable: true,
-    computeCell: (c) => {
+    computeCell: (c, _i, _all, setup) => {
       const headroom = c.form_1040_out.next_bracket_headroom;
       const nextRate = c.form_1040_out.next_bracket_rate;
       let badge: ScheduleCellResult['badge'];
@@ -879,7 +1069,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         display: formatCurrency(c.form_1040_out.taxable_income),
         numericValue: c.form_1040_out.taxable_income,
         badge,
-        filedRef: c.tax_year === 2025 ? 'Filed: $89,536' : undefined,
+        filedRef: getDefaultFiledRef(
+          c.tax_year,
+          setup,
+          DEFAULT_PROFILE_SEED.verification_benchmarks_2025.taxable_income
+        ),
       };
     },
   },
@@ -895,7 +1089,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     description: 'Total federal ordinary, preferential capital gains, and Net Investment Income Tax (NIIT).',
     bold: true,
     summable: true,
-    computeCell: (c) => ({
+    computeCell: (c, _i, _all, setup) => ({
       display: formatCurrency(c.form_1040_out.federal_income_tax),
       numericValue: c.form_1040_out.federal_income_tax,
       subLabel:
@@ -903,7 +1097,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
           ? `Incl. ${formatCompactCurrency(c.form_1040_out.niit_tax)} NIIT`
           : undefined,
       subTone: c.form_1040_out.niit_tax > 0 ? 'warning' : 'neutral',
-      filedRef: c.tax_year === 2025 ? 'Filed: $6,402' : undefined,
+      filedRef: getDefaultFiledRef(
+        c.tax_year,
+        setup,
+        DEFAULT_PROFILE_SEED.verification_benchmarks_2025.federal_tax
+      ),
     }),
   },
   {
@@ -937,27 +1135,35 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'ca_state_tax',
     section: 'tax_cashflow',
-    label: 'California State Tax',
+    label: 'Primary State Tax',
+    getLabel: (s) => {
+      const { primaryStateName, hasPrimaryState } = getSetupStates(s);
+      return hasPrimaryState ? `${primaryStateName} State Tax` : 'Primary State Tax';
+    },
     code: 'ca_state_tax_liability',
-    description: 'Total California tax: Form 100S business tax (max $800 or 1.5% CA-apportioned net income) + Form 540/540NR personal tax.',
+    description: 'Total primary state tax (entity/franchise + personal income tax).',
     summable: true,
-    computeCell: (c) => computeStateCell(c, 'CA'),
+    computeCell: (c, _i, _all, setup) => computeDynamicStateCell(c, setup, 'primary'),
   },
   {
     id: 'az_state_tax',
     section: 'tax_cashflow',
-    label: 'Arizona State Tax',
+    label: 'Secondary State Tax',
+    getLabel: (s) => {
+      const { secondaryStateName, hasSecondaryState } = getSetupStates(s);
+      return hasSecondaryState ? `${secondaryStateName} State Tax` : 'Secondary State Tax';
+    },
     code: 'az_state_tax_liability',
-    description: 'Total Arizona tax: Form 120S entity tax ($0 unless PTE elected) + Form 140NR nonresident personal tax (2.5% on AZ-sourced K-1).',
+    description: 'Total secondary state tax when multi-state filing or sourcing is active.',
     summable: true,
-    computeCell: (c) => computeStateCell(c, 'AZ'),
+    computeCell: (c, _i, _all, setup) => computeDynamicStateCell(c, setup, 'secondary'),
   },
   {
     id: 'total_fed_state_tax',
     section: 'tax_cashflow',
     label: 'Total Federal and State Taxes',
     code: 'total_federal_and_state_tax',
-    description: 'Combined federal income tax plus total California and Arizona state taxes (business + personal).',
+    description: 'Combined federal income tax plus total state taxes (business + personal).',
     bold: true,
     highlight: 'primary',
     summable: true,

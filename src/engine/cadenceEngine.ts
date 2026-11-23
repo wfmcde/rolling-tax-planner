@@ -3,17 +3,29 @@ import type {
   BalanceSheetProjectionInputs,
   CadenceForecastMode,
   CadenceForecasterState,
+  CadenceGroupingMode,
   CadenceTransactionRow,
   ComputedTaxYear,
+  PayeeAliasRule,
   PnlBalanceSheetState,
   PnlLineAmounts,
   PnlLineId,
+  SetupConfig,
 } from '../types/tax';
 import {
   PNL_LINE_ITEMS,
   calculatePnlBalanceSheet,
+  computeRemainingRetirementFromHorizon,
+  resolveHorizonRetirementTargets,
   type ComputedPnlBalanceSheet,
 } from './pnlBalanceSheet';
+import {
+  buildTestPersonaCadence,
+  createDefaultSeedCadenceTransactions,
+  DEFAULT_PROFILE_SEED,
+  isDefaultSeedSetup,
+} from '../data/profiles';
+import { getStateFullName } from '../utils/setupHelpers';
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -104,6 +116,20 @@ export interface CadenceStreamSummary {
   hasTransferFlag: boolean;
   flaggedTransferCount: number;
   flaggedTransferNote?: string;
+  /** Distinct original raw vendor/payee names grouped into this stream */
+  mergedRawVendors: string[];
+  /** Number of transactions in this stream rewritten by a Payee / Description Alias rule */
+  appliedAliasCount: number;
+  /** True when one or more alias rules contributed to this stream */
+  isAliased: boolean;
+  /** True when this row represents a rolled-up P&L Category instead of a single granular vendor stream */
+  isCategoryRow?: boolean;
+  /** Clean operational QBO P&L category name when in Category Rollup mode */
+  categoryName?: string;
+  /** Count of distinct payee/vendor sub-streams aggregated into this P&L category */
+  subStreamCount?: number;
+  /** True when a category has irregular/variable multi-tx activity (prime candidate for 1-click Exp. Smooth) */
+  isVariableCategory?: boolean;
 }
 
 export interface QboReconciliationItem {
@@ -119,12 +145,20 @@ export interface ComputedCadenceForecast {
   asOfDate: string;
   projectionYear: number;
   ledgerFormat: 'general_ledger' | 'transaction_list';
+  groupingMode: CadenceGroupingMode;
   expSmoothAlpha: number;
   expSmoothDayFraction: boolean;
   elapsedDays: number;
   remainingDays: number;
   totalDaysInYear: number;
+  /** Active forecast rows (categoryStreams in 'category' mode, granularStreams in 'stream' mode) */
   streams: CadenceStreamSummary[];
+  /** Always-available P&L Category rolled-up rows */
+  categoryStreams: CadenceStreamSummary[];
+  /** Always-available granular vendor/payee stream rows */
+  granularStreams: CadenceStreamSummary[];
+  categoryCount: number;
+  granularStreamCount: number;
   auditRows: CadenceAuditRow[];
   parsedTransactionCount: number;
   pnlTransactionCount: number;
@@ -132,6 +166,10 @@ export interface ComputedCadenceForecast {
   transferExcludedCount: number;
   unmappedCount: number;
   flaggedTransferStreamCount: number;
+  activeAliasCount: number;
+  aliasedTransactionCount: number;
+  aliasedStreamCount: number;
+  aliasMatchCounts: Record<string, number>;
   /** Synthesized PnlBalanceSheetState ready for calculatePnlBalanceSheet, CSV, Print & Push */
   synthesizedPnlState: PnlBalanceSheetState;
   /** Full Form 1120-S, Schedule L, and Form 7203 computed projection */
@@ -269,14 +307,21 @@ function parseNumericToken(raw: unknown): number | null {
 }
 
 // ============================================================================
-// Operating Support Services, LLC Exact QBO Account Classifier (All 50+ Headers)
+// Accounting / QBO Account Classifier (Dynamic per Active Household Setup)
 // ============================================================================
 
-export function classifyTransactionAccount(rawAccount: string): AccountRole {
+function escapeRegexToken(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function classifyTransactionAccount(
+  rawAccount: string,
+  setup?: SetupConfig | null
+): AccountRole {
   const cleaned = rawAccount.trim();
   if (!cleaned || /^-split-$/i.test(cleaned)) return { kind: 'unmapped' };
 
-  // Split hierarchical QBO path (e.g. "Salary : Bill", "Travel Expense:Business Meals (100%)")
+  // Split hierarchical QBO path (e.g. "Salary : Primary", "Travel Expense:Business Meals (100%)")
   const segments = cleaned
     .split(/\s*(?::|->|→)\s*/)
     .map((s) => s.trim())
@@ -287,14 +332,26 @@ export function classifyTransactionAccount(rawAccount: string): AccountRole {
   const parentLower = parent.toLowerCase();
   const fullLower = cleaned.toLowerCase();
 
+  const primaryFirst = (setup?.primary_name ?? '').trim().split(/\s+/)[0] ?? '';
+  const spouseFirst = (setup?.spouse_name ?? '').trim().split(/\s+/)[0] ?? '';
+  const primaryStateCode = (setup?.home_state ?? '').trim().toUpperCase();
+  const primaryStateName = primaryStateCode ? getStateFullName(primaryStateCode) : '';
+  const secondaryStateCode = (setup?.secondary_state ?? '').trim().toUpperCase();
+  const secondaryStateName = secondaryStateCode ? getStateFullName(secondaryStateCode) : '';
+
+  const matchesState = (text: string, code: string, name: string): boolean => {
+    if (!code) return false;
+    const parts = [escapeRegexToken(code)];
+    if (name && name.toLowerCase() !== code.toLowerCase()) parts.push(escapeRegexToken(name));
+    return new RegExp(`\\b(${parts.join('|')})\\b`, 'i').test(text);
+  };
+
   // ---- 1. Balance Sheet Accounts (Explicitly mapped; NEVER treated as P&L) ----
 
-  // Operating Cash: BlueVine Checking
+  // Operating Cash: Checking / Savings / Operating Cash accounts
   if (
-    /^bluevine\s*checking$/i.test(leafLower) ||
-    /bluevine\s*checking/i.test(leafLower) ||
-    (/(checking|savings|operating\s*cash|business\s*bank)/i.test(leafLower) &&
-      !/credit card|\bcc\b/i.test(leafLower))
+    /(checking|savings|operating\s*cash|business\s*bank|money\s*market)/i.test(leafLower) &&
+    !/credit card|\bcc\b/i.test(leafLower)
   ) {
     return { kind: 'bs', bsRole: 'operating_cash', subAccount: leaf };
   }
@@ -309,19 +366,22 @@ export function classifyTransactionAccount(rawAccount: string): AccountRole {
     return { kind: 'bs', bsRole: 'bs_other', subAccount: leaf };
   }
 
-  // Credit Cards & Accounts Payable (including deleted cards in OSS General Ledger)
+  // Credit Cards & Accounts Payable
+  const extraCardNames = isDefaultSeedSetup(setup)
+    ? DEFAULT_PROFILE_SEED.default_cadence_2026.extra_card_account_names
+    : [];
+  const matchesExtraCard = extraCardNames.some((token) => leafLower.includes(token));
   if (
-    /amazon\s*cc|cap\s*one\s*cc|capital\s*one|amx\s*cc|amex|amtrak|onekey/i.test(leafLower) ||
-    /(credit card|accounts payable|\ba\/p\b|\bsavor\b)/i.test(leafLower)
+    matchesExtraCard ||
+    /(\bcc\b|credit card|accounts payable|\ba\/p\b|\bsavor\b|capital\s*one|amex|visa|mastercard|chase\s*ink)/i.test(
+      leafLower
+    )
   ) {
     return { kind: 'bs', bsRole: 'cc_ap', subAccount: leaf };
   }
 
   // Retirement / Pension Payables (Balance Sheet Liabilities)
-  if (
-    /defined benefit plan payable|oss 401k plan payable/i.test(leafLower) ||
-    /(pension.*payable|dbp.*payable|401\(?k\)?.*payable)/i.test(leafLower)
-  ) {
+  if (/(defined benefit.*payable|pension.*payable|dbp.*payable|401\(?k\)?.*payable)/i.test(leafLower)) {
     return { kind: 'bs', bsRole: 'pension_payable', subAccount: leaf };
   }
 
@@ -350,24 +410,21 @@ export function classifyTransactionAccount(rawAccount: string): AccountRole {
     return { kind: 'bs', bsRole: 'opening_equity', subAccount: leaf };
   }
 
-  // ---- 2. P&L Revenue Accounts ----
-  if (
-    /consulting\s*[-–—:]?\s*debra\s*\(?ca\)?/i.test(leafLower) ||
-    /consulting\s*[-–—:]?\s*debra\s*\(?ca\)?/i.test(fullLower) ||
-    /(california|\bca\b).*(rev|sales|income|consult)/i.test(leafLower)
-  ) {
+  // ---- 2. P&L Revenue Accounts (dynamically matched by active profile states) ----
+  const isRevAccount =
+    /(rev|sales|income|consult|services?|retainer|advisory|billing|fee)/i.test(fullLower) &&
+    !/tax|expense|interest|payroll|bank|legal|professional/i.test(fullLower);
+
+  if (isRevAccount && primaryStateCode && matchesState(fullLower, primaryStateCode, primaryStateName)) {
     return { kind: 'pnl', lineId: 'ca_revenue' };
   }
-
   if (
-    /consulting\s*[-–—:]?\s*bill\s*\(?az\)?/i.test(leafLower) ||
-    /services\s*[-–—:]?\s*bill\s*\(?az\)?/i.test(leafLower) ||
-    /^services\s*income$/i.test(leafLower) ||
-    /consulting\s*[-–—:]?\s*bill\s*\(?az\)?/i.test(fullLower) ||
-    /services\s*[-–—:]?\s*bill\s*\(?az\)?/i.test(fullLower) ||
-    /(arizona|\baz\b).*(rev|sales|income|consult)/i.test(leafLower)
+    (isRevAccount &&
+      secondaryStateCode &&
+      matchesState(fullLower, secondaryStateCode, secondaryStateName)) ||
+    /^services\s*income$/i.test(leafLower)
   ) {
-    return { kind: 'pnl', lineId: 'az_revenue' };
+    return { kind: 'pnl', lineId: secondaryStateCode ? 'az_revenue' : 'ca_revenue' };
   }
 
   // ---- 3. Schedule K Line 4 Interest Income (BEFORE generic income / interest expense) ----
@@ -375,7 +432,7 @@ export function classifyTransactionAccount(rawAccount: string): AccountRole {
     return { kind: 'pnl', lineId: 'schedule_k_interest' };
   }
 
-  // ---- 4. SEHI Medicare Premiums (BEFORE Compensation so "Shareholder Health - Bill/Debra" never hits Salary) ----
+  // ---- 4. SEHI Medicare Premiums (BEFORE Compensation so Shareholder Health never hits Salary) ----
   if (
     /shareholder\s*health/i.test(leafLower) ||
     /shareholder\s*health/i.test(parentLower) ||
@@ -384,20 +441,20 @@ export function classifyTransactionAccount(rawAccount: string): AccountRole {
     return { kind: 'pnl', lineId: 'sehi_medicare' };
   }
 
-  // ---- 5. Compensation: "Bill" / "Debra" under Salary (or "Salary -> Bill", "Salary:Bill", bare "Bill"/"Debra") ----
+  // ---- 5. Compensation (dynamically matched by active household names + generic officer/wages) ----
+  const primaryRe = primaryFirst.length >= 2 ? new RegExp(`\\b${escapeRegexToken(primaryFirst)}\\b`, 'i') : null;
+  const spouseRe = spouseFirst.length >= 2 ? new RegExp(`\\b${escapeRegexToken(spouseFirst)}\\b`, 'i') : null;
+  const isPayrollPath = /(salary|wages|payroll|comp|officer)/i.test(fullLower);
+
   if (
-    /^bill$/i.test(leafLower) ||
-    /salary\s*(?:->|→|:|-|\/)\s*bill/i.test(fullLower) ||
-    (/(salary|wages|payroll)/i.test(fullLower) && /\bbill\b/i.test(leafLower)) ||
+    (primaryRe && (new RegExp(`^${escapeRegexToken(primaryFirst)}$`, 'i').test(leafLower) || (isPayrollPath && primaryRe.test(leafLower)))) ||
     /officer\s*(comp|w-?2)/i.test(leafLower)
   ) {
     return { kind: 'pnl', lineId: 'bill_officer_w2' };
   }
 
   if (
-    /^debra$/i.test(leafLower) ||
-    /salary\s*(?:->|→|:|-|\/)\s*debra/i.test(fullLower) ||
-    (/(salary|wages|payroll)/i.test(fullLower) && /\bdebra\b/i.test(leafLower)) ||
+    (spouseRe && (new RegExp(`^${escapeRegexToken(spouseFirst)}$`, 'i').test(leafLower) || (isPayrollPath && spouseRe.test(leafLower)))) ||
     /salaries\s*(&|and)\s*wages/i.test(leafLower)
   ) {
     return { kind: 'pnl', lineId: 'debra_salaries_wages' };
@@ -441,11 +498,8 @@ export function classifyTransactionAccount(rawAccount: string): AccountRole {
     return { kind: 'pnl', lineId: 'travel' };
   }
 
-  // ---- 9. Taxes & Licenses: Payroll Taxes vs CA FTB / State Tax ----
+  // ---- 9. Taxes & Licenses: Payroll Taxes vs State Entity / Franchise Tax ----
   if (
-    /^ca sdi$/i.test(leafLower) ||
-    /^ca sui[- ]?er$/i.test(leafLower) ||
-    /^az sui[- ]?er$/i.test(leafLower) ||
     /^fed$/i.test(leafLower) ||
     /^medcare$/i.test(leafLower) ||
     /(payroll tax|fica|futa|suta|edd|\bsdi\b|sui-?er)/i.test(leafLower)
@@ -455,7 +509,7 @@ export function classifyTransactionAccount(rawAccount: string): AccountRole {
 
   if (
     /^state$/i.test(leafLower) ||
-    /(\bftb\b|franchise tax|ca\s*ftb|state\s*tax|100s)/i.test(leafLower)
+    /(\bftb\b|franchise tax|state\s*tax|100s)/i.test(leafLower)
   ) {
     return { kind: 'pnl', lineId: 'ca_ftb_tax' };
   }
@@ -650,7 +704,7 @@ function detectColumnMap(headerRow: string[]): ColumnMap | null {
 }
 
 const QBO_NON_ACCOUNT_BANNER_RE =
-  /^(operating support|general ledger|transaction list|accrual basis|cash basis|all dates|monday,|tuesday,|wednesday,|thursday,|friday,|saturday,|sunday,|(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d)/i;
+  /^(general ledger|transaction list|accrual basis|cash basis|all dates|monday,|tuesday,|wednesday,|thursday,|friday,|saturday,|sunday,|(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d)|,\s*(llc|inc\.?|corp\.?|pllc|llp)\s*$/i;
 
 const QBO_GENERIC_CONTAINER_RE =
   /^(assets?|bank accounts?|current assets?|other current assets?|fixed assets?|liabilities?|credit cards?|current liabilities?|other current liabilities?|long[- ]term liabilities?|equity|income|ordinary income|cost of goods sold|expenses?|other income|other expenses?)$/i;
@@ -977,6 +1031,97 @@ const ONE_TIME_DEFAULT_LINES = new Set<PnlLineId>([
   'ca_ftb_tax',
 ]);
 
+export const PAYEE_ALIASES_STORAGE_KEY = 'rolling-tax-planner-payee-aliases-v1';
+
+export function loadSavedPayeeAliases(): PayeeAliasRule[] {
+  if (typeof window === 'undefined' || !window.localStorage) return [];
+  try {
+    const raw = window.localStorage.getItem(PAYEE_ALIASES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is PayeeAliasRule =>
+          item &&
+          typeof item === 'object' &&
+          typeof item.id === 'string' &&
+          typeof item.pattern === 'string' &&
+          typeof item.canonical_name === 'string' &&
+          item.pattern.trim().length > 0 &&
+          item.canonical_name.trim().length > 0
+      )
+      .map((item) => ({
+        id: item.id,
+        pattern: item.pattern.trim(),
+        match_type: item.match_type === 'exact' ? 'exact' : 'contains',
+        canonical_name: item.canonical_name.trim(),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+export function savePayeeAliases(aliases: PayeeAliasRule[]): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(PAYEE_ALIASES_STORAGE_KEY, JSON.stringify(aliases));
+  } catch {
+    // Ignore storage quota or sandbox restrictions
+  }
+}
+
+export interface ResolvedPayeeResult {
+  canonicalVendor: string;
+  matchedRule: PayeeAliasRule | null;
+  rawVendor: string;
+}
+
+/**
+ * Resolves a transaction's raw payee/vendor and description/memo against user-defined
+ * Payee / Description Alias rules BEFORE stream grouping, cadence, run-rate, or
+ * exponential smoothing calculations run.
+ * Exact matches are evaluated first, followed by case-insensitive substring ('contains') rules.
+ */
+export function resolveCanonicalPayee(
+  rawVendor: string,
+  rawMemo: string,
+  aliases?: PayeeAliasRule[]
+): ResolvedPayeeResult {
+  const trimmedVendor = rawVendor.trim();
+  const trimmedMemo = rawMemo.trim();
+  if (!aliases || aliases.length === 0) {
+    return { canonicalVendor: trimmedVendor, matchedRule: null, rawVendor: trimmedVendor };
+  }
+
+  const vendorLower = trimmedVendor.toLowerCase();
+  const memoLower = trimmedMemo.toLowerCase();
+
+  // Pass 1: Exact matches (case-insensitive)
+  for (const rule of aliases) {
+    if (rule.match_type !== 'exact') continue;
+    const pattern = rule.pattern.trim().toLowerCase();
+    const canonical = rule.canonical_name.trim();
+    if (!pattern || !canonical) continue;
+    if (vendorLower === pattern || (memoLower !== '' && memoLower === pattern)) {
+      return { canonicalVendor: canonical, matchedRule: rule, rawVendor: trimmedVendor };
+    }
+  }
+
+  // Pass 2: Substring / contains matches (case-insensitive)
+  for (const rule of aliases) {
+    if (rule.match_type === 'exact') continue;
+    const pattern = rule.pattern.trim().toLowerCase();
+    const canonical = rule.canonical_name.trim();
+    if (!pattern || !canonical) continue;
+    if (vendorLower.includes(pattern) || (memoLower !== '' && memoLower.includes(pattern))) {
+      return { canonicalVendor: canonical, matchedRule: rule, rawVendor: trimmedVendor };
+    }
+  }
+
+  return { canonicalVendor: trimmedVendor, matchedRule: null, rawVendor: trimmedVendor };
+}
+
 function normalizeVendorKey(vendor: string): string {
   return vendor
     .toLowerCase()
@@ -1258,6 +1403,79 @@ const PNL_TRANSFER_DESC_RE = /transfer\s+to\s+|credit\s+card\s+payment/i;
 export const DEFAULT_EXP_SMOOTH_ALPHA = 0.5;
 const AVG_DAYS_PER_MONTH = 30.4375;
 
+const PNL_LINE_LABEL_BY_ID = new Map<PnlLineId, string>(
+  PNL_LINE_ITEMS.map((item) => [item.id, item.label])
+);
+
+/**
+ * Extracts a clean, human-readable operational QuickBooks P&L category name from a raw QBO account/section string.
+ * Preserves authentic QBO category distinctions (e.g., "Consulting", "Rent Expense",
+ * "Internet", "Subscriptions", "Office Supplies", "Insurance Expense", etc.)
+ * while disambiguating terse leaf names like member first names, "Fed", or "State".
+ */
+export function extractPnlCategoryLabel(
+  rawAccount: string,
+  targetLineId: PnlLineId,
+  setup?: SetupConfig | null
+): string {
+  const cleaned = (rawAccount || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) {
+    return PNL_LINE_LABEL_BY_ID.get(targetLineId) ?? targetLineId;
+  }
+
+  // Split QBO hierarchical separators (":" or "->") to obtain parent & leaf account
+  const segments = cleaned
+    .split(/\s*(?::|->)\s*/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  let leaf = segments[segments.length - 1] ?? cleaned;
+  const parent = segments.length >= 2 ? segments[segments.length - 2] : '';
+
+  // Gently title-case all-lowercase leaves (e.g. "legal fees" -> "Legal Fees")
+  if (leaf === leaf.toLowerCase() && /[a-z]/.test(leaf)) {
+    leaf = leaf.replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
+  }
+
+  const primaryFirst = (setup?.primary_name ?? '').trim().split(/\s+/)[0] ?? '';
+  const spouseFirst = (setup?.spouse_name ?? '').trim().split(/\s+/)[0] ?? '';
+  const primaryStateCode = (setup?.home_state ?? '').trim().toUpperCase();
+
+  // Disambiguate terse leaf names so category rows read clearly at a glance
+  if (
+    targetLineId === 'bill_officer_w2' &&
+    primaryFirst.length >= 2 &&
+    new RegExp(`^${escapeRegexToken(primaryFirst)}$`, 'i').test(leaf)
+  ) {
+    return `Salary - ${primaryFirst}`;
+  }
+  if (
+    targetLineId === 'debra_salaries_wages' &&
+    spouseFirst.length >= 2 &&
+    new RegExp(`^${escapeRegexToken(spouseFirst)}$`, 'i').test(leaf)
+  ) {
+    return `Salary - ${spouseFirst}`;
+  }
+  if (/^fed$/i.test(leaf) && targetLineId === 'payroll_taxes') {
+    return 'Payroll Tax - Fed';
+  }
+  if (/^state$/i.test(leaf) && targetLineId === 'ca_ftb_tax') {
+    return primaryStateCode ? `State Tax (${primaryStateCode})` : 'State Entity Tax';
+  }
+  if (/^(other|general|misc|miscellaneous)$/i.test(leaf) && parent) {
+    return `${parent}: ${leaf}`;
+  }
+
+  return leaf;
+}
+
+function normalizeCategoryKey(categoryLabel: string): string {
+  return categoryLabel
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
 export function clampExpSmoothAlpha(raw: number | undefined): number {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return DEFAULT_EXP_SMOOTH_ALPHA;
   return Math.round(Math.min(0.9, Math.max(0.1, raw)) * 100) / 100;
@@ -1360,7 +1578,9 @@ function isFlaggedTransferDescription(tx: CadenceTransactionRow): boolean {
 
 export function computeCadenceForecast(
   state: CadenceForecasterState,
-  year2025Computed?: ComputedTaxYear
+  year2025Computed?: ComputedTaxYear,
+  yearProjectedComputed?: ComputedTaxYear,
+  setup?: SetupConfig
 ): ComputedCadenceForecast {
   const year = state.projection_year || 2026;
   const asOfDate = state.as_of_date || `${year}-11-21`;
@@ -1433,8 +1653,19 @@ export function computeCadenceForecast(
     vendor: string;
     targetLineId: PnlLineId;
     sourceAccounts: Set<string>;
+    rawVendors: Set<string>;
+    appliedAliasCount: number;
     txs: GroupedTx[];
   }
+
+  const activeAliases = (state.payee_aliases ?? []).filter(
+    (r) => r.pattern.trim().length > 0 && r.canonical_name.trim().length > 0
+  );
+  const aliasMatchCounts: Record<string, number> = {};
+  for (const rule of activeAliases) {
+    aliasMatchCounts[rule.id] = 0;
+  }
+  let aliasedTransactionCount = 0;
 
   const streamMap = new Map<string, StreamAccumulator>();
   let pnlTransactionCount = 0;
@@ -1519,8 +1750,8 @@ export function computeCadenceForecast(
     seenSignatures.add(sig);
 
     const primaryAccount = isGlMode ? tx.gl_section || tx.account : tx.account;
-    const acctRole = classifyTransactionAccount(primaryAccount);
-    const splitRole = classifyTransactionAccount(tx.split_account);
+    const acctRole = classifyTransactionAccount(primaryAccount, setup);
+    const splitRole = classifyTransactionAccount(tx.split_account, setup);
 
     // =========================================================================
     // PATH A: QUICKBOOKS GENERAL LEDGER MODE (Double-Entry Section-Grouped)
@@ -1603,19 +1834,31 @@ export function computeCadenceForecast(
         const pnlSignedAmount = tx.amount;
         const flaggedTransfer = isFlaggedTransferDescription(tx);
 
-        const normVendor = normalizeVendorKey(tx.vendor);
+        const resolved = resolveCanonicalPayee(tx.vendor, tx.memo, activeAliases);
+        const effectiveVendor = resolved.canonicalVendor || tx.vendor.trim();
+        const normVendor = normalizeVendorKey(effectiveVendor);
         const streamKey = `${normVendor}||${pnlTarget}`;
         let acc = streamMap.get(streamKey);
         if (!acc) {
           acc = {
             streamKey,
-            vendor: tx.vendor.trim(),
+            vendor: effectiveVendor,
             targetLineId: pnlTarget,
             sourceAccounts: new Set<string>(),
+            rawVendors: new Set<string>(),
+            appliedAliasCount: 0,
             txs: [],
           };
           streamMap.set(streamKey, acc);
         }
+        if (resolved.matchedRule) {
+          acc.vendor = effectiveVendor;
+          acc.appliedAliasCount++;
+          aliasedTransactionCount++;
+          aliasMatchCounts[resolved.matchedRule.id] =
+            (aliasMatchCounts[resolved.matchedRule.id] ?? 0) + 1;
+        }
+        if (tx.vendor.trim()) acc.rawVendors.add(tx.vendor.trim());
         if (primaryAccount) acc.sourceAccounts.add(primaryAccount);
         acc.txs.push({
           date: tx.date,
@@ -1753,7 +1996,7 @@ export function computeCadenceForecast(
           split_account: tx.split_account,
           amount: tx.amount,
           category: 'transfer_cc_payment',
-          reason: 'Internal transfer / CC payment excluded from P&L; updates BlueVine Cash & Card balances',
+          reason: 'Internal transfer / CC payment excluded from P&L; updates Cash & Credit Card balances',
         });
         continue;
       }
@@ -1862,21 +2105,33 @@ export function computeCadenceForecast(
       }
     }
 
-    // 5. Group into Vendor + Target Account stream
+    // 5. Group into Vendor + Target Account stream (applying Payee / Description Alias rules first)
     const flaggedTransfer = isFlaggedTransferDescription(tx);
-    const normVendor = normalizeVendorKey(tx.vendor);
+    const resolved = resolveCanonicalPayee(tx.vendor, tx.memo, activeAliases);
+    const effectiveVendor = resolved.canonicalVendor || tx.vendor.trim();
+    const normVendor = normalizeVendorKey(effectiveVendor);
     const streamKey = `${normVendor}||${pnlTarget}`;
     let acc = streamMap.get(streamKey);
     if (!acc) {
       acc = {
         streamKey,
-        vendor: tx.vendor.trim(),
+        vendor: effectiveVendor,
         targetLineId: pnlTarget,
         sourceAccounts: new Set<string>(),
+        rawVendors: new Set<string>(),
+        appliedAliasCount: 0,
         txs: [],
       };
       streamMap.set(streamKey, acc);
     }
+    if (resolved.matchedRule) {
+      acc.vendor = effectiveVendor;
+      acc.appliedAliasCount++;
+      aliasedTransactionCount++;
+      aliasMatchCounts[resolved.matchedRule.id] =
+        (aliasMatchCounts[resolved.matchedRule.id] ?? 0) + 1;
+    }
+    if (tx.vendor.trim()) acc.rawVendors.add(tx.vendor.trim());
     if (sourcePnlAccountName) acc.sourceAccounts.add(sourcePnlAccountName);
     acc.txs.push({
       date: tx.date,
@@ -1937,20 +2192,83 @@ export function computeCadenceForecast(
     capContribYtd = round2(Math.abs(contribNet));
   }
 
-  // 6. Run Cadence Detection on Every Stream (guarding against "Transfer to " / "Credit Card Payment" inside P&L)
-  const streams: CadenceStreamSummary[] = [];
-  const autoPnlByLine = {} as Record<PnlLineId, PnlLineAmounts>;
-  for (const meta of PNL_LINE_ITEMS) {
-    autoPnlByLine[meta.id] = { ytd: 0, remaining: 0 };
+  // 6. Run Cadence Detection on Every Granular Stream (guarding against "Transfer to " / "Credit Card Payment" inside P&L)
+  const groupingMode: CadenceGroupingMode = state.grouping_mode ?? 'category';
+  const granularStreams: CadenceStreamSummary[] = [];
+
+  interface CategoryTxRecord {
+    date: string;
+    amount: number;
+    sourceAccount: string;
+    flaggedTransfer: boolean;
+    memo: string;
+    canonicalVendor: string;
+    vendorKey: string;
+    isAliased: boolean;
   }
 
-  let flaggedTransferStreamCount = 0;
+  interface CategoryAcc {
+    streamKey: string;
+    categoryName: string;
+    targetLineId: PnlLineId;
+    sourceAccounts: Set<string>;
+    rawVendors: Set<string>;
+    appliedAliasCount: number;
+    txs: CategoryTxRecord[];
+  }
+
+  const categoryMap = new Map<string, CategoryAcc>();
+  let granularFlaggedStreamCount = 0;
 
   for (const acc of streamMap.values()) {
     const flaggedTxs = acc.txs.filter((t) => t.flaggedTransfer);
     const cleanTxs = acc.txs.filter((t) => !t.flaggedTransfer);
     const hasTransferFlag = flaggedTxs.length > 0;
-    if (hasTransferFlag) flaggedTransferStreamCount++;
+    if (hasTransferFlag) granularFlaggedStreamCount++;
+
+    // Populate category rollup buckets from every P&L transaction (pure BS accounts were already excluded above)
+    const canonicalVendorKey = normalizeVendorKey(acc.vendor);
+    for (const t of acc.txs) {
+      const catLabel = extractPnlCategoryLabel(t.sourceAccount, acc.targetLineId, setup);
+      const catKey = `cat::${normalizeCategoryKey(catLabel)}||${acc.targetLineId}`;
+      let catAcc = categoryMap.get(catKey);
+      if (!catAcc) {
+        catAcc = {
+          streamKey: catKey,
+          categoryName: catLabel,
+          targetLineId: acc.targetLineId,
+          sourceAccounts: new Set<string>(),
+          rawVendors: new Set<string>(),
+          appliedAliasCount: 0,
+          txs: [],
+        };
+        categoryMap.set(catKey, catAcc);
+      }
+      if (t.sourceAccount) catAcc.sourceAccounts.add(t.sourceAccount);
+      if (acc.vendor) catAcc.rawVendors.add(acc.vendor);
+      catAcc.txs.push({
+        date: t.date,
+        amount: t.amount,
+        sourceAccount: t.sourceAccount,
+        flaggedTransfer: t.flaggedTransfer,
+        memo: t.memo,
+        canonicalVendor: acc.vendor,
+        vendorKey: canonicalVendorKey,
+        isAliased: acc.appliedAliasCount > 0,
+      });
+    }
+    if (acc.appliedAliasCount > 0) {
+      // Attribute alias count cleanly to matching category buckets
+      const touchedCatKeys = new Set<string>();
+      for (const t of acc.txs) {
+        const catLabel = extractPnlCategoryLabel(t.sourceAccount, acc.targetLineId, setup);
+        touchedCatKeys.add(`cat::${normalizeCategoryKey(catLabel)}||${acc.targetLineId}`);
+      }
+      for (const ck of touchedCatKeys) {
+        const c = categoryMap.get(ck);
+        if (c) c.appliedAliasCount += acc.appliedAliasCount;
+      }
+    }
 
     // YTD always includes ALL rows in the P&L section so YTD reconciles $0.00 against QBO
     let ytdSum = 0;
@@ -2042,7 +2360,7 @@ export function computeCadenceForecast(
         : `${flaggedTxs.length} transfer/CC description row(s) excluded from cadence math (kept in YTD)`
       : undefined;
 
-    streams.push({
+    granularStreams.push({
       streamKey: acc.streamKey,
       vendor: acc.vendor,
       targetLineId: acc.targetLineId,
@@ -2079,31 +2397,319 @@ export function computeCadenceForecast(
       hasTransferFlag,
       flaggedTransferCount: flaggedTxs.length,
       flaggedTransferNote,
+      mergedRawVendors: Array.from(acc.rawVendors),
+      appliedAliasCount: acc.appliedAliasCount,
+      isAliased: acc.appliedAliasCount > 0,
+      isCategoryRow: false,
     });
-
-    autoPnlByLine[acc.targetLineId] = {
-      ytd: round2(autoPnlByLine[acc.targetLineId].ytd + ytdSum),
-      remaining: round2(autoPnlByLine[acc.targetLineId].remaining + effectiveRemainingAmount),
-    };
   }
 
-  // Sort streams by Target Line order, then largest YTD descending
+  // 6B. Build P&L Category Rollup Rows (~28 operational categories instead of 100+ granular lines)
+  //     - Defaults active P&L categories to 'cadence' (using sub-stream calendar cadence + pace baseline)
+  //     - Computes category-level Monthly SES (default alpha = 0.50) for 1-click Exp. Smooth toggling
+  //     - Preserves exact state sourcing (CA vs AZ), 50/50 Meals, and Schedule K Interest targetLineId
+  const categoryStreams: CadenceStreamSummary[] = [];
+  let categoryFlaggedStreamCount = 0;
+
+  for (const catAcc of categoryMap.values()) {
+    const flaggedTxs = catAcc.txs.filter((t) => t.flaggedTransfer);
+    const cleanTxs = catAcc.txs.filter((t) => !t.flaggedTransfer);
+    const hasTransferFlag = flaggedTxs.length > 0;
+    if (hasTransferFlag) categoryFlaggedStreamCount++;
+
+    let ytdSum = 0;
+    for (const t of catAcc.txs) {
+      ytdSum = round2(ytdSum + t.amount);
+    }
+
+    const cadenceSourceTxs = cleanTxs.length > 0 ? cleanTxs : catAcc.txs;
+    const byDate = new Map<string, number>();
+    let cleanYtdSum = 0;
+    for (const t of cadenceSourceTxs) {
+      byDate.set(t.date, round2((byDate.get(t.date) ?? 0) + t.amount));
+      cleanYtdSum = round2(cleanYtdSum + t.amount);
+    }
+    const uniqueSortedDates = Array.from(byDate.keys()).sort();
+    const latestDate = uniqueSortedDates[uniqueSortedDates.length - 1] ?? asOfDate;
+    const latestAmount = byDate.get(latestDate) ?? 0;
+
+    // Group clean txs by canonical payee sub-stream inside this category for accurate calendar cadence rollup
+    const subStreamGroups = new Map<string, CategoryTxRecord[]>();
+    for (const t of cadenceSourceTxs) {
+      const existing = subStreamGroups.get(t.vendorKey);
+      if (existing) existing.push(t);
+      else subStreamGroups.set(t.vendorKey, [t]);
+    }
+    const subStreamCount = subStreamGroups.size;
+
+    let subCadenceCount = 0;
+    let subRunRateCount = 0;
+    let subCadenceRemaining = 0;
+    let subRunRateRemaining = 0;
+    let singleSubCadenceResult: CadenceDetectionResult | null = null;
+    const allSubRemainingDates: string[] = [];
+
+    for (const subTxs of subStreamGroups.values()) {
+      const subByDate = new Map<string, number>();
+      let subYtd = 0;
+      for (const st of subTxs) {
+        subByDate.set(st.date, round2((subByDate.get(st.date) ?? 0) + st.amount));
+        subYtd = round2(subYtd + st.amount);
+      }
+      const subDates = Array.from(subByDate.keys()).sort();
+      const subLatestDate = subDates[subDates.length - 1] ?? asOfDate;
+      const subLatestAmt = subByDate.get(subLatestDate) ?? 0;
+
+      const subDet = detectStreamCadence(
+        catAcc.targetLineId,
+        subDates,
+        subYtd,
+        asOfDate,
+        year,
+        elapsedDays,
+        remainingDays
+      );
+
+      if (subDet.detectedMode === 'cadence') {
+        subCadenceCount++;
+        subCadenceRemaining = round2(
+          subCadenceRemaining + round2(subDet.remainingDates.length * subLatestAmt)
+        );
+        for (const rd of subDet.remainingDates) {
+          allSubRemainingDates.push(rd);
+        }
+        if (subStreamCount === 1) {
+          singleSubCadenceResult = subDet;
+        }
+      } else if (subDet.detectedMode === 'run_rate') {
+        subRunRateCount++;
+        if (elapsedDays > 0 && subYtd > 0) {
+          subRunRateRemaining = round2(
+            subRunRateRemaining + round2(subYtd * (remainingDays / elapsedDays))
+          );
+        }
+      }
+    }
+
+    const runRateBase = cleanTxs.length > 0 ? cleanYtdSum : ytdSum;
+    const runRateRemainingAmount =
+      elapsedDays > 0 && runRateBase > 0
+        ? round2(runRateBase * (remainingDays / elapsedDays))
+        : 0;
+
+    // Also run cadence detection on the category's combined dates (catches recurring bills with varying vendor names)
+    const catDetected = detectStreamCadence(
+      catAcc.targetLineId,
+      uniqueSortedDates,
+      cleanYtdSum,
+      asOfDate,
+      year,
+      elapsedDays,
+      remainingDays
+    );
+
+    let detectedMode: Exclude<CadenceForecastMode, 'manual'> = 'cadence';
+    let detectedCadenceType: DetectedCadenceType = 'variable_run_rate';
+    let cadenceLabel = '';
+    let remainingDates: string[] = [];
+    let cadenceRemainingAmount = 0;
+    let isVariableCategory = false;
+
+    if (cleanTxs.length === 0 && hasTransferFlag) {
+      detectedMode = 'one_time';
+      detectedCadenceType = 'one_time';
+      cadenceLabel = 'Flagged Transfer / CC Desc · Exclude ($0)';
+      cadenceRemainingAmount = 0;
+    } else if (
+      ONE_TIME_DEFAULT_LINES.has(catAcc.targetLineId) ||
+      cleanYtdSum <= 0 ||
+      uniqueSortedDates.length <= 1
+    ) {
+      detectedMode = 'one_time';
+      detectedCadenceType = 'one_time';
+      cadenceLabel = catDetected.cadenceLabel;
+      cadenceRemainingAmount = 0;
+    } else if (subCadenceCount > 0) {
+      detectedMode = 'cadence';
+      cadenceRemainingAmount = round2(subCadenceRemaining + subRunRateRemaining);
+      remainingDates = Array.from(new Set(allSubRemainingDates)).sort();
+      if (subStreamCount === 1 && singleSubCadenceResult) {
+        detectedCadenceType = singleSubCadenceResult.cadenceType;
+        cadenceLabel = singleSubCadenceResult.cadenceLabel;
+        remainingDates = singleSubCadenceResult.remainingDates;
+        isVariableCategory = false;
+      } else if (subRunRateCount === 0) {
+        detectedCadenceType = 'monthly';
+        cadenceLabel = `Calendar Cadence · ${subCadenceCount} recurring (${allSubRemainingDates.length} dates left)`;
+        isVariableCategory = false;
+      } else {
+        detectedCadenceType = 'monthly';
+        cadenceLabel = `Cadence Mix · ${subCadenceCount} recurring + ${subRunRateCount} variable`;
+        isVariableCategory = true;
+      }
+    } else if (catDetected.detectedMode === 'cadence') {
+      detectedMode = 'cadence';
+      detectedCadenceType = catDetected.cadenceType;
+      cadenceLabel = catDetected.cadenceLabel;
+      remainingDates = catDetected.remainingDates;
+      cadenceRemainingAmount = round2(catDetected.remainingDates.length * latestAmount);
+      isVariableCategory = false;
+    } else {
+      // Active ongoing multi-transaction P&L category -> default to 'cadence' baseline (pace)
+      // Marked as variable/lumpy so user can toggle 1-click Exp. Smooth (alpha = 0.50) anytime
+      detectedMode = 'cadence';
+      detectedCadenceType = 'variable_run_rate';
+      cadenceRemainingAmount = runRateRemainingAmount;
+      cadenceLabel = `Category Cadence · ${cleanTxs.length} txns (${remainingDays}/${elapsedDays}d pace)`;
+      isVariableCategory = true;
+    }
+
+    // Monthly Simple Exponential Smoothing (SES) across category's aggregated monthly totals YYYY-01..asOfMonth
+    const ses = computeMonthlyExponentialSmoothing(
+      cadenceSourceTxs,
+      year,
+      asOfDate,
+      remainingDays,
+      expSmoothAlpha,
+      expSmoothDayFraction
+    );
+    const expSmoothRemainingAmount =
+      cleanTxs.length === 0 && hasTransferFlag ? 0 : ses.remainingProjection;
+
+    const override = state.stream_overrides[catAcc.streamKey];
+    const activeMode: CadenceForecastMode = override?.mode ?? detectedMode;
+    let effectiveRemainingAmount = 0;
+
+    if (activeMode === 'manual') {
+      effectiveRemainingAmount = round2(override?.manual_remaining ?? 0);
+    } else if (activeMode === 'exp_smooth') {
+      effectiveRemainingAmount = expSmoothRemainingAmount;
+    } else if (activeMode === 'cadence') {
+      if (detectedMode === 'cadence') {
+        effectiveRemainingAmount = cadenceRemainingAmount;
+      } else {
+        // User explicitly switched a one-time category onto Cadence
+        effectiveRemainingAmount = runRateRemainingAmount;
+      }
+    } else if (activeMode === 'run_rate') {
+      effectiveRemainingAmount = runRateRemainingAmount;
+    } else {
+      effectiveRemainingAmount = 0;
+    }
+
+    const flaggedTransferNote = hasTransferFlag
+      ? cleanTxs.length === 0
+        ? `${flaggedTxs.length} row(s) matched "Transfer to " / "Credit Card Payment" — defaulted to Exclude ($0)`
+        : `${flaggedTxs.length} transfer/CC description row(s) excluded from cadence math (kept in YTD)`
+      : undefined;
+
+    categoryStreams.push({
+      streamKey: catAcc.streamKey,
+      vendor: catAcc.categoryName,
+      categoryName: catAcc.categoryName,
+      targetLineId: catAcc.targetLineId,
+      sourceAccounts: Array.from(catAcc.sourceAccounts),
+      transactionCount: catAcc.txs.length,
+      dates: uniqueSortedDates,
+      ytdAmount: ytdSum,
+      latestDate,
+      latestAmount,
+      detectedMode,
+      detectedCadenceType,
+      cadenceLabel,
+      remainingDates,
+      remainingCount:
+        activeMode === 'cadence'
+          ? remainingDates.length || remainingDays
+          : activeMode === 'run_rate'
+          ? remainingDays
+          : activeMode === 'exp_smooth'
+          ? ses.monthlySeries.length
+          : 0,
+      cadenceRemainingAmount,
+      runRateRemainingAmount,
+      monthlySeries: ses.monthlySeries,
+      activeMonthCount: ses.activeMonthCount,
+      latestMonthLabel: ses.latestMonthLabel,
+      latestMonthActual: ses.latestMonthActual,
+      expSmoothLevel: ses.smoothedLevel,
+      expSmoothRemainingAmount,
+      expSmoothScaleNote: ses.scaleNote,
+      activeMode,
+      effectiveRemainingAmount,
+      isOverridden: Boolean(override),
+      hasTransferFlag,
+      flaggedTransferCount: flaggedTxs.length,
+      flaggedTransferNote,
+      mergedRawVendors: Array.from(catAcc.rawVendors),
+      appliedAliasCount: catAcc.appliedAliasCount,
+      isAliased: catAcc.appliedAliasCount > 0,
+      isCategoryRow: true,
+      subStreamCount,
+      isVariableCategory,
+    });
+  }
+
+  // Sort both lists by Target Form 1120-S Line order, then largest YTD descending
   const lineOrder = new Map<PnlLineId, number>(PNL_LINE_ITEMS.map((m, idx) => [m.id, idx]));
-  streams.sort((a, b) => {
+  const sortByLineThenYtd = (a: CadenceStreamSummary, b: CadenceStreamSummary) => {
     const la = lineOrder.get(a.targetLineId) ?? 99;
     const lb = lineOrder.get(b.targetLineId) ?? 99;
     if (la !== lb) return la - lb;
     return Math.abs(b.ytdAmount) - Math.abs(a.ytdAmount);
-  });
+  };
+  granularStreams.sort(sortByLineThenYtd);
+  categoryStreams.sort(sortByLineThenYtd);
 
-  // 7. Merge Direct Two-Way P&L Table Overrides
+  const streams = groupingMode === 'category' ? categoryStreams : granularStreams;
+  const flaggedTransferStreamCount =
+    groupingMode === 'category' ? categoryFlaggedStreamCount : granularFlaggedStreamCount;
+
+  // Populate autoPnlByLine strictly from the active view mode so P&L, Schedule L, Form 7203,
+  // CSV/Print exports, and Push to Six-Year Schedule always match the active table 100%.
+  const autoPnlByLine = {} as Record<PnlLineId, PnlLineAmounts>;
+  for (const meta of PNL_LINE_ITEMS) {
+    autoPnlByLine[meta.id] = { ytd: 0, remaining: 0 };
+  }
+  for (const s of streams) {
+    autoPnlByLine[s.targetLineId] = {
+      ytd: round2(autoPnlByLine[s.targetLineId].ytd + s.ytdAmount),
+      remaining: round2(autoPnlByLine[s.targetLineId].remaining + s.effectiveRemainingAmount),
+    };
+  }
+
+  // 7. Merge Direct Two-Way P&L Table Overrides & Active Horizon/Setup Line 17 Retirement Targets
+  // Decoupled from Schedule L 12/31 Pension Expense Payable: populate Remaining for Line 17 DBP &
+  // Employer 401(k) directly from the active projected-year Horizon/Setup retirement figures
+  // (minus any YTD actuals already posted in the ledger), unless the user explicitly overrode the row.
+  const horizonRetirement = yearProjectedComputed
+    ? resolveHorizonRetirementTargets(yearProjectedComputed, setup)
+    : null;
+
   const finalPnl = {} as Record<PnlLineId, PnlLineAmounts>;
   for (const meta of PNL_LINE_ITEMS) {
     const auto = autoPnlByLine[meta.id];
     const ov = state.pnl_line_overrides[meta.id];
+    const effectiveYtd = ov?.ytd !== undefined ? round2(ov.ytd) : auto.ytd;
+    let defaultRemaining = auto.remaining;
+
+    if (horizonRetirement) {
+      if (meta.id === 'dbp_contribution') {
+        defaultRemaining = computeRemainingRetirementFromHorizon(
+          horizonRetirement.dbpAnnual,
+          effectiveYtd
+        );
+      } else if (meta.id === 'employer_401k') {
+        defaultRemaining = computeRemainingRetirementFromHorizon(
+          horizonRetirement.employer401kAnnual,
+          effectiveYtd
+        );
+      }
+    }
+
     finalPnl[meta.id] = {
-      ytd: ov?.ytd !== undefined ? round2(ov.ytd) : auto.ytd,
-      remaining: ov?.remaining !== undefined ? round2(ov.remaining) : auto.remaining,
+      ytd: effectiveYtd,
+      remaining: ov?.remaining !== undefined ? round2(ov.remaining) : defaultRemaining,
     };
   }
 
@@ -2130,7 +2736,16 @@ export function computeCadenceForecast(
     last_pushed_at: state.last_pushed_at,
   };
 
-  const pnlComputed = calculatePnlBalanceSheet(synthesizedPnlState, year2025Computed);
+  // Delegate Schedule L, Form 7203, and auto-projected 12/31 Operating Cash math
+  // (which preserves YTD retirement outflows in operating_cash_ytd while excluding unpaid
+  // subsequent-year IRC §404(a)(6) Line 17 retirement funding when pension_payable_ye === 0).
+  const pnlComputed = calculatePnlBalanceSheet(
+    synthesizedPnlState,
+    year2025Computed,
+    yearProjectedComputed,
+    setup,
+    { respectStateRetirementRemaining: true }
+  );
 
   // 8. QBO Reconciliation Check
   const ytdRevenue = round2(autoPnlByLine.ca_revenue.ytd + autoPnlByLine.az_revenue.ytd);
@@ -2179,21 +2794,28 @@ export function computeCadenceForecast(
     makeRec('revenue', 'YTD Gross Revenue', ytdRevenue, exp?.revenue),
     makeRec('expenses', 'YTD Book Expenses', ytdBookExpenses, exp?.expenses),
     makeRec('interest', 'YTD Interest Income (Sch K)', ytdInterestIncome, exp?.interest_income),
-    makeRec('cash', 'BlueVine Checking', ytdCash, exp?.cash),
+    makeRec('cash', 'Operating Cash / Checking', ytdCash, exp?.cash),
     makeRec('cc', 'Credit Cards / AP', ytdCreditCards, exp?.credit_cards),
     makeRec('draws', 'YTD Member Draws', ytdMemberDraws, exp?.member_draws),
   ];
+
+  const aliasedStreamCount = granularStreams.filter((s) => s.isAliased).length;
 
   return {
     asOfDate,
     projectionYear: year,
     ledgerFormat,
+    groupingMode,
     expSmoothAlpha,
     expSmoothDayFraction,
     elapsedDays,
     remainingDays,
     totalDaysInYear,
     streams,
+    categoryStreams,
+    granularStreams,
+    categoryCount: categoryStreams.length,
+    granularStreamCount: granularStreams.length,
     auditRows,
     parsedTransactionCount: state.transactions.length,
     pnlTransactionCount,
@@ -2201,6 +2823,10 @@ export function computeCadenceForecast(
     transferExcludedCount,
     unmappedCount,
     flaggedTransferStreamCount,
+    activeAliasCount: activeAliases.length,
+    aliasedTransactionCount,
+    aliasedStreamCount,
+    aliasMatchCounts,
     synthesizedPnlState,
     pnlComputed,
     autoPnlByLine,
@@ -2219,326 +2845,83 @@ export function computeCadenceForecast(
 }
 
 // ============================================================================
-// Built-In Sample OSS QBO Transaction Ledger (1/1/2026 – 11/21/2026)
-// Reconciles to the exact penny:
-//   Revenue:           $319,283.71 (CA $127,340.00 + AZ $191,943.71)
-//   Book Expenses:      $88,300.27
-//   Interest Income:       $609.18 (Monthly Day 22 -> 2 left: 11/22, 12/22)
-//   BlueVine Checking:  $42,580.89
-//   Credit Cards / AP:   $2,963.77 (Amazon CC + Cap One CC + AMX CC + Amtrak)
-//   Member Draws:      $121,939.75
+// Initial Cadence State Builders (Isolated per Active Workspace Profile)
 // ============================================================================
 
-function splitIntoInstallments(total: number, count: number): number[] {
-  const base = Math.floor((total / count) * 100) / 100;
-  const arr = Array.from({ length: count }, () => base);
-  const diff = round2(total - round2(base * count));
-  arr[0] = round2(arr[0] + diff);
-  return arr;
-}
-
-export function createSampleOssTransactions(): CadenceTransactionRow[] {
-  const rows: CadenceTransactionRow[] = [];
-  let seq = 1;
-  const push = (
-    date: string,
-    transaction_type: string,
-    vendor: string,
-    account: string,
-    split_account: string,
-    amount: number,
-    memo = '',
-    num = ''
-  ) => {
-    rows.push({
-      id: `oss-${seq++}`,
-      date,
-      transaction_type,
-      num,
-      vendor,
-      memo,
-      account,
-      split_account,
-      amount: round2(amount),
-    });
-  };
-
-  // --- Opening Balances (1/1/2026) ---
-  // Reconciles BlueVine Checking to $42,580.89, Credit Cards to $2,963.77, Pension Payable to $0.00
-  push('2026-01-01', 'Opening Balance', 'Opening Balance', 'BlueVine Checking', 'Opening Balance Equity', 76904.25, '2026 Beginning Cash');
-  push('2026-01-01', 'Opening Balance', 'Opening Balance', 'Amazon CC', 'Opening Balance Equity', 950.00, '2026 Beginning Card Balance');
-  push('2026-01-01', 'Opening Balance', 'Opening Balance', 'Cap One CC', 'Opening Balance Equity', 850.00, '2026 Beginning Card Balance');
-  push('2026-01-01', 'Opening Balance', 'Opening Balance', 'AMX CC', 'Opening Balance Equity', 600.00, '2026 Beginning Card Balance');
-  push('2026-01-01', 'Opening Balance', 'Opening Balance', 'Defined Benefit Plan Payable', 'Opening Balance Equity', 140000.00, '2025 Accrued DBP Liability');
-  push('2026-01-01', 'Opening Balance', 'Opening Balance', 'OSS 401K Plan Payable', 'Opening Balance Equity', 4540.00, '2025 Accrued 401(k) Profit Sharing');
-
-  // --- Prior-Year Pension Payable Settlements (Excluded from 2026 P&L; updates Cash & Liability to $0) ---
-  push('2026-03-10', 'Check', 'Schwab Defined Benefit Trust', 'BlueVine Checking', 'Defined Benefit Plan Payable', -140000.00, '2025 DBP Plan Funding', '1042');
-  push('2026-03-10', 'Check', 'OSS 401(k) Trust', 'BlueVine Checking', 'OSS 401K Plan Payable', -4540.00, '2025 401(k) Profit Sharing Funding', '1043');
-
-  // --- 1. Revenue ($319,283.71 exact: CA $127,340.00 + AZ $191,943.71) ---
-  const caInvoices: [string, string, number][] = [
-    ['2026-01-14', 'Pacific Coast Systems (CA)', 11250.00],
-    ['2026-02-09', 'Pacific Coast Systems (CA)', 12400.00],
-    ['2026-03-19', 'Bay Area Logistics Group', 9850.00],
-    ['2026-04-06', 'Pacific Coast Systems (CA)', 14200.00],
-    ['2026-05-11', 'Bay Area Logistics Group', 10750.00],
-    ['2026-06-22', 'Pacific Coast Systems (CA)', 11900.00],
-    ['2026-07-08', 'Bay Area Logistics Group', 10540.00],
-    ['2026-08-17', 'Pacific Coast Systems (CA)', 13150.00],
-    ['2026-09-25', 'Bay Area Logistics Group', 11400.00],
-    ['2026-10-13', 'Pacific Coast Systems (CA)', 12200.00],
-    ['2026-11-16', 'Bay Area Logistics Group', 9700.00],
-  ]; // sum = 127,340.00
-  for (const [d, v, amt] of caInvoices) {
-    push(d, 'Deposit', v, 'BlueVine Checking', 'Consulting - Debra (CA)', amt, 'Client consulting invoice');
-  }
-
-  const azConsulting: [string, string, number][] = [
-    ['2026-01-20', 'Sonoran Industrial Partners', 16420.00],
-    ['2026-02-18', 'Desert Grid Operations', 14850.50],
-    ['2026-03-04', 'Sonoran Industrial Partners', 17325.00],
-    ['2026-04-21', 'Desert Grid Operations', 15110.21],
-    ['2026-05-28', 'Sonoran Industrial Partners', 18440.00],
-    ['2026-06-11', 'Desert Grid Operations', 14920.00],
-    ['2026-07-23', 'Sonoran Industrial Partners', 16780.00],
-    ['2026-08-06', 'Desert Grid Operations', 15340.00],
-    ['2026-09-14', 'Sonoran Industrial Partners', 17910.00],
-    ['2026-10-27', 'Desert Grid Operations', 18348.00],
-  ]; // sum = 165,443.71
-  for (const [d, v, amt] of azConsulting) {
-    push(d, 'Deposit', v, 'BlueVine Checking', 'Consulting - Bill (AZ)', amt, 'AZ consulting engagement');
-  }
-
-  const azServicesBill: [string, string, number][] = [
-    ['2026-02-26', 'Mesa Field Services', 5250.00],
-    ['2026-05-15', 'Mesa Field Services', 5750.00],
-    ['2026-08-24', 'Mesa Field Services', 5100.00],
-    ['2026-11-12', 'Mesa Field Services', 5400.00],
-  ]; // sum = 21,500.00
-  for (const [d, v, amt] of azServicesBill) {
-    push(d, 'Deposit', v, 'BlueVine Checking', 'Services - Bill (AZ)', amt, 'Field advisory services');
-  }
-
-  push('2026-04-10', 'Deposit', 'Phoenix Municipal Advisory', 'BlueVine Checking', 'Services Income', 2500.00, 'Advisory milestone');
-  push('2026-10-05', 'Deposit', 'Phoenix Municipal Advisory', 'BlueVine Checking', 'Services Income', 2500.00, 'Advisory milestone');
-
-  // --- 2. Schedule K Interest Income ($609.18 exact — Monthly Day 22 -> 2 left: 11/22, 12/22) ---
-  const interestInstallments = splitIntoInstallments(609.18, 10);
-  for (let m = 1; m <= 10; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-22`;
-    push(dt, 'Deposit', 'BlueVine Bank Interest', 'BlueVine Checking', 'Interest Income', interestInstallments[m - 1], 'Monthly checking APY interest');
-  }
-
-  // --- 3. Biweekly Payroll & Payroll Taxes (23 runs Jan 9 -> Nov 13 -> 3 left: 11/27, 12/11, 12/25) ---
-  const biweeklyDates: string[] = [];
-  let bwMs = Date.UTC(2026, 0, 9);
-  for (let i = 0; i < 23; i++) {
-    biweeklyDates.push(formatUtcMsToIso(bwMs));
-    bwMs += 14 * MS_PER_DAY;
-  }
-
-  const billWages = splitIntoInstallments(20534.52, 23);
-  const debraWages = splitIntoInstallments(20257.99, 23);
-  const fedTaxes = splitIntoInstallments(2531.68, 23);
-  const medCareTaxes = splitIntoInstallments(591.50, 23);
-  const caSdiTaxes = splitIntoInstallments(498.12, 23);
-  const caSuiTaxes = splitIntoInstallments(340.00, 10); // Q1–Q2 wage base cap hit
-  const azSuiTaxes = splitIntoInstallments(201.56, 8);
-
-  biweeklyDates.forEach((dt, i) => {
-    push(dt, 'Payroll Check', 'OSS Payroll — Bill', 'BlueVine Checking', 'Salary -> Bill', -billWages[i], 'Biweekly officer salary');
-    push(dt, 'Payroll Check', 'OSS Payroll — Debra', 'BlueVine Checking', 'Salary -> Debra', -debraWages[i], 'Biweekly W-2 salary');
-    push(dt, 'Expense', 'EFTPS Federal Payroll', 'BlueVine Checking', 'Taxes & Licenses:Fed', -fedTaxes[i], 'Employer SS/FUTA');
-    push(dt, 'Expense', 'EFTPS Medicare Tax', 'BlueVine Checking', 'Taxes & Licenses:MedCare', -medCareTaxes[i], 'Employer Medicare');
-    push(dt, 'Expense', 'CA EDD Payroll Tax', 'BlueVine Checking', 'Taxes & Licenses:CA SDI', -caSdiTaxes[i], 'CA payroll tax');
-    if (i < caSuiTaxes.length) {
-      push(dt, 'Expense', 'CA EDD SUI-ER', 'BlueVine Checking', 'Taxes & Licenses:CA SUI-ER', -caSuiTaxes[i], 'CA SUI employer');
-    }
-    if (i < azSuiTaxes.length) {
-      push(dt, 'Expense', 'AZ DES SUI-ER', 'BlueVine Checking', 'Taxes & Licenses:AZ SUI-ER', -azSuiTaxes[i], 'AZ SUI employer');
-    }
-  });
-
-  // --- 4. SEHI Medicare Premiums ($6,167.85 exact — Monthly Day 5 -> 1 left: 12/05) ---
-  const sehiBill = splitIntoInstallments(3083.93, 11);
-  const sehiDebra = splitIntoInstallments(3083.92, 11);
-  for (let m = 1; m <= 11; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-05`;
-    push(dt, 'Expense', 'CMS Medicare & Medigap — Bill', 'BlueVine Checking', 'Shareholder Health - Bill', -sehiBill[m - 1], 'Monthly Medicare Part B/D/G');
-    push(dt, 'Expense', 'CMS Medicare & Medigap — Debra', 'BlueVine Checking', 'Shareholder Health - Debra', -sehiDebra[m - 1], 'Monthly Medicare Part B/D/G');
-  }
-
-  // --- 5. Rents ($10,487.00 exact — Monthly Day 1 -> 1 left: 12/01) ---
-  const rentAmts = splitIntoInstallments(10487.00, 11);
-  for (let m = 1; m <= 11; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-01`;
-    push(dt, 'Check', 'Executive Suites Property Mgmt', 'BlueVine Checking', 'Rents', -rentAmts[m - 1], 'Monthly office suite rent');
-  }
-
-  // --- 6. CA FTB State Tax Refund (-$466.84 — One-Time $0 remaining) ---
-  push('2026-04-28', 'Deposit', 'CA Franchise Tax Board', 'BlueVine Checking', 'Taxes & Licenses:State', 466.84, 'Prior-year CA 100S overpayment refund');
-
-  // --- 7. Professional Fees ($6,556.00 — Variable Run-Rate) ---
-  push('2026-02-19', 'Expense', 'Vanguard CPA Advisory', 'BlueVine Checking', 'Professional Fees', -2450.00, '1120-S & K-1 preparation');
-  push('2026-06-08', 'Expense', 'Actuarial Pension Consultants', 'BlueVine Checking', 'Professional Fees', -1550.00, 'Mid-year DBP actuarial valuation');
-  push('2026-09-21', 'Expense', 'Vanguard CPA Advisory', 'BlueVine Checking', 'Professional Fees', -856.00, 'Q3 multi-state nexus review');
-  push('2026-04-14', 'Expense', 'Sterling Business Law LLP', 'BlueVine Checking', 'legal fees', -950.00, 'Annual LLC minutes & compliance');
-  push('2026-10-16', 'Expense', 'Sterling Business Law LLP', 'BlueVine Checking', 'legal fees', -750.00, 'Client MSA review');
-
-  // --- 8. Subscriptions & Software ($3,797.30 — Monthly Day 12 -> 1 left: 12/12) ---
-  const subsAmts = splitIntoInstallments(3797.30, 11);
-  for (let m = 1; m <= 11; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-12`;
-    push(dt, 'Credit Card Expense', 'Intuit QBO & Cloud SaaS', 'Cap One CC', 'Subscriptions & Software', subsAmts[m - 1], 'Monthly SaaS stack');
-  }
-
-  // --- 9. Telephone & Internet ($2,382.57 exact) ---
-  // AT&T Wireless: Monthly Day 22 (Jan-Oct = 10 drafts -> 2 left: 11/22, 12/22)
-  const attAmts = splitIntoInstallments(1450.00, 10);
-  for (let m = 1; m <= 10; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-22`;
-    push(dt, 'Credit Card Expense', 'AT&T Business Wireless', 'AMX CC', 'Telephone Expense', attAmts[m - 1], 'Monthly business mobile lines');
-  }
-  // Cox Business Internet: Monthly Day 18 (Jan-Nov = 11 drafts -> 1 left: 12/18)
-  const coxAmts = splitIntoInstallments(770.00, 11);
-  for (let m = 1; m <= 11; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-18`;
-    push(dt, 'Credit Card Expense', 'Cox Business Fiber', 'Cap One CC', 'Internet', coxAmts[m - 1], 'Office fiber internet');
-  }
-  // Computer and Internet Expenses (variable on Amazon CC)
-  push('2026-03-11', 'Credit Card Expense', 'Cloudflare & Domain Registrar', 'Amazon CC', 'Computer and Internet Expenses', 84.57, 'Domain & DNS renewal');
-  push('2026-08-29', 'Credit Card Expense', 'Cloudflare & Domain Registrar', 'Amazon CC', 'Computer and Internet Expenses', 78.00, 'SSL & backup storage');
-
-  // --- 10. Travel Excl. Meals ($405.34 exact) ---
-  push('2026-03-24', 'Credit Card Expense', 'Amtrak & Uber Business', 'Amtrak', 'Travel Expense:Ground Transportation', 82.40, 'Client site transit');
-  push('2026-07-14', 'Credit Card Expense', 'Amtrak & Uber Business', 'Amtrak', 'Travel Expense:Ground Transportation', 60.44, 'Airport ground transfer');
-  push('2026-05-07', 'Credit Card Expense', 'Marriott Courtyard', 'AMX CC', 'Travel Expense:Lodging', 142.50, 'Client site overnight');
-  push('2026-09-18', 'Credit Card Expense', 'Southwest Airlines', 'AMX CC', 'Travel Expense:Airfare', 120.00, 'Regional client flight');
-
-  // --- 11. Meals 100% Gross ($1,806.58 exact — including nested Travel meal lines moved out of Travel) ---
-  push('2026-02-11', 'Credit Card Expense', 'Client Dining — Restaurants', 'AMX CC', 'Business Meals at Restaurant (50%)', 248.90, 'Client lunch meeting');
-  push('2026-06-19', 'Credit Card Expense', 'Client Dining — Restaurants', 'AMX CC', 'Business Meals at Restaurant (50%)', 216.50, 'Quarterly review dinner');
-  push('2026-10-08', 'Credit Card Expense', 'Client Dining — Restaurants', 'AMX CC', 'Meals at Restaurant', 220.00, 'Client strategy lunch');
-  push('2026-03-25', 'Credit Card Expense', 'Client Travel Dining', 'AMX CC', 'Travel Expense:Business Meals', 284.18, 'On-site client working dinner');
-  push('2026-09-19', 'Credit Card Expense', 'Client Travel Dining', 'AMX CC', 'Travel Expense:Business Meals', 258.00, 'Travel business meal');
-  push('2026-05-08', 'Credit Card Expense', 'Travel Solo Meals', 'Cap One CC', 'Solo Meals (50%)', 164.50, 'Travel per-diem meals');
-  push('2026-08-12', 'Credit Card Expense', 'Travel Solo Meals', 'Cap One CC', 'Solo Meals (50%)', 148.00, 'Travel solo dinner');
-  push('2026-07-15', 'Credit Card Expense', 'Travel Individual Meals', 'Cap One CC', 'Travel Expense:Individual Meals', 138.25, 'Out-of-town individual meals');
-  push('2026-11-04', 'Credit Card Expense', 'Travel Individual Meals', 'Cap One CC', 'Travel Expense:Individual Meals', 128.25, 'Out-of-town individual meals');
-
-  // --- 12. Office Expense ($7,862.31 exact) ---
-  push('2026-01-29', 'Credit Card Expense', 'Amazon Business Supplies', 'Amazon CC', 'Office Supplies', 892.40, 'Office consumables & toner');
-  push('2026-04-03', 'Credit Card Expense', 'Amazon Business Supplies', 'Amazon CC', 'Office Supplies', 1124.91, 'Filing & desk supplies');
-  push('2026-07-21', 'Credit Card Expense', 'Amazon Business Supplies', 'Amazon CC', 'Office Supplies', 1285.00, 'Printing & shipping supplies');
-  push('2026-10-29', 'Credit Card Expense', 'Amazon Business Supplies', 'Amazon CC', 'Office Supplies', 1085.00, 'Q4 office supplies');
-  push('2026-06-04', 'Credit Card Expense', 'Apple Business Store', 'AMX CC', 'Office Equipment', 3475.00, 'Workstation laptop & 4K display (One-Time)');
-
-  // --- 13. Insurance ($1,190.92 exact — Quarterly: 3/15, 6/15, 9/15 -> 1 left: 12/15) ---
-  const insAmts = splitIntoInstallments(1190.92, 3);
-  push('2026-03-15', 'Expense', 'Hiscox Business Insurance', 'BlueVine Checking', 'Insurance', -insAmts[0], 'Q1 E&O & General Liability');
-  push('2026-06-15', 'Expense', 'Hiscox Business Insurance', 'BlueVine Checking', 'Insurance', -insAmts[1], 'Q2 E&O & General Liability');
-  push('2026-09-15', 'Expense', 'Hiscox Business Insurance', 'BlueVine Checking', 'Insurance', -insAmts[2], 'Q3 E&O & General Liability');
-
-  // --- 14. Utilities ($149.45 exact — Monthly Day 25, Jan-Oct -> 2 left: 11/25, 12/25) ---
-  const utilAmts = splitIntoInstallments(149.45, 10);
-  for (let m = 1; m <= 10; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-25`;
-    push(dt, 'Expense', 'Southwest Office Utilities', 'BlueVine Checking', 'Utilities', -utilAmts[m - 1], 'Monthly office utility share');
-  }
-
-  // --- 15. Bank & Payroll Processing Fees ($1,032.99 exact) ---
-  for (let m = 1; m <= 11; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-15`;
-    push(dt, 'Expense', 'Gusto Payroll Processing', 'BlueVine Checking', 'Payroll Expenses', -80.00, 'Monthly payroll platform fee');
-  } // 880.00
-  push('2026-03-31', 'Expense', 'BlueVine Wire & Service Fees', 'BlueVine Checking', 'Bank Service Charges', -75.00, 'Domestic wire fees');
-  push('2026-09-30', 'Expense', 'BlueVine Wire & Service Fees', 'BlueVine Checking', 'Bank Service Charges', -77.99, 'Bank service charges');
-
-  // --- 16. Other Deductions ($1,973.43 exact so total Book Expenses = $88,300.27 exact!) ---
-  push('2026-05-20', 'Credit Card Expense', 'AICPA & CPE Annual Summit', 'Cap One CC', 'Continuing Education', 650.00, 'Annual continuing education (One-Time)');
-  push('2026-04-30', 'Expense', 'Commercial Line Interest', 'BlueVine Checking', 'Interest Expense', -92.10, 'Short-term interest');
-  push('2026-10-31', 'Expense', 'Commercial Line Interest', 'BlueVine Checking', 'Interest Expense', -92.10, 'Short-term interest');
-  push('2026-03-06', 'Expense', 'Office Petty Cash', 'BlueVine Checking', 'Petty Cash', -145.00, 'Postage & office petty cash');
-  push('2026-08-19', 'Expense', 'Office Petty Cash', 'BlueVine Checking', 'Petty Cash', -150.00, 'Local courier & petty cash');
-  push('2026-02-04', 'Credit Card Expense', 'FedEx & UPS Business', 'Amazon CC', 'Shipping', 281.41, 'Client document shipping');
-  push('2026-06-26', 'Credit Card Expense', 'FedEx & UPS Business', 'Amazon CC', 'Shipping', 298.60, 'Equipment return & shipping');
-  push('2026-11-09', 'Credit Card Expense', 'FedEx & UPS Business', 'Amazon CC', 'Shipping', 264.22, 'Client binder courier');
-
-  // --- 17. Credit Card Payments from BlueVine Checking (Excluded from P&L; reconciles CC balance to $2,963.77 exact!) ---
-  // Calculate exact CC charges by card from rows above so ending CC balance = $2,963.77 exact:
-  // Amazon CC: Beg 950 + (84.57+78+892.40+1124.91+1285+1085+281.41+298.60+264.22 = 5394.11) = 6344.11 -> Pay 5400.00 => End 944.11
-  // Cap One CC: Beg 850 + (3797.30+770+164.50+148+138.25+128.25+650 = 5796.30) = 6646.30 -> Pay 5700.00 => End 946.30
-  // AMX CC: Beg 600 + (1450+142.50+120+248.90+216.50+220+284.18+258+3475 = 6415.08) = 7015.08 -> Pay 6000.00 => End 1015.08
-  // Amtrak: Beg 0 + (82.40+60.44 = 142.84) -> Pay 84.56 => End 58.28
-  // Total Ending CC = 944.11 + 946.30 + 1015.08 + 58.28 = $2,963.77 EXACT!
-  push('2026-03-20', 'Credit Card Payment', 'Amazon CC Payment', 'BlueVine Checking', 'Amazon CC', -1800.00, 'Autopay card balance');
-  push('2026-07-20', 'Credit Card Payment', 'Amazon CC Payment', 'BlueVine Checking', 'Amazon CC', -1800.00, 'Autopay card balance');
-  push('2026-10-20', 'Credit Card Payment', 'Amazon CC Payment', 'BlueVine Checking', 'Amazon CC', -1800.00, 'Autopay card balance');
-
-  push('2026-04-18', 'Credit Card Payment', 'Cap One CC Payment', 'BlueVine Checking', 'Cap One CC', -2850.00, 'Card statement payoff');
-  push('2026-09-18', 'Credit Card Payment', 'Cap One CC Payment', 'BlueVine Checking', 'Cap One CC', -2850.00, 'Card statement payoff');
-
-  push('2026-06-24', 'Credit Card Payment', 'AMX CC Payment', 'BlueVine Checking', 'AMX CC', -4000.00, 'AMEX statement payment');
-  push('2026-10-24', 'Credit Card Payment', 'AMX CC Payment', 'BlueVine Checking', 'AMX CC', -2000.00, 'AMEX statement payment');
-
-  push('2026-08-05', 'Credit Card Payment', 'Amtrak Card Payment', 'BlueVine Checking', 'Amtrak', -84.56, 'Amtrak statement payment');
-
-  // --- 18. Member Draws ($121,939.75 exact — excluded from P&L, tracked in Form 7203) ---
-  const drawInstallments = splitIntoInstallments(121939.75, 11);
-  for (let m = 1; m <= 11; m++) {
-    const dt = `2026-${String(m).padStart(2, '0')}-15`;
-    push(dt, 'Check', 'Shareholder Distribution (Bill & Debra)', 'BlueVine Checking', 'Member Draws', -drawInstallments[m - 1], 'Monthly S-Corp member draw');
-  }
-
-  return rows.sort((a, b) => a.date.localeCompare(b.date));
-}
-
-export const OSS_NOV21_2026_QBO_BENCHMARKS: NonNullable<CadenceForecasterState['qbo_expected']> = {
-  revenue: 319283.71,
-  expenses: 88300.27,
-  interest_income: 609.18,
-  cash: 42580.89,
-  credit_cards: 2963.77,
-  member_draws: 121939.75,
-};
-
 export function createInitialCadenceForecasterState(
-  year2025EndingBasis = 0
+  year2025EndingBasis = 0,
+  initialAliases: PayeeAliasRule[] = [],
+  setup?: SetupConfig | null
 ): CadenceForecasterState {
-  const sampleTransactions = createSampleOssTransactions();
+  const projectionYear = setup?.current_tax_year ?? 2026;
+
+  if (setup?.workspace_profile_kind === 'test_persona') {
+    const personaCadence = buildTestPersonaCadence(projectionYear);
+    return {
+      ...personaCadence,
+      payee_aliases: initialAliases,
+      balance_sheet: {
+        ...personaCadence.balance_sheet,
+        beginning_stock_basis_override: year2025EndingBasis > 0 ? year2025EndingBasis : null,
+      },
+    };
+  }
+
+  if (isDefaultSeedSetup(setup)) {
+    const seedCadence = DEFAULT_PROFILE_SEED.default_cadence_2026;
+    const sampleTransactions = createDefaultSeedCadenceTransactions();
+    return {
+      projection_year: seedCadence.projection_year,
+      source_label: seedCadence.source_label,
+      ledger_format: 'transaction_list',
+      as_of_date: seedCadence.as_of_date,
+      grouping_mode: 'category',
+      exp_smooth_alpha: DEFAULT_EXP_SMOOTH_ALPHA,
+      exp_smooth_day_fraction: false,
+      payee_aliases: initialAliases,
+      transactions: sampleTransactions,
+      stream_overrides: {},
+      // Line 17 retirement Remaining auto-syncs from active Horizon/Setup plan figures minus YTD actuals
+      pnl_line_overrides: {},
+      balance_sheet: {
+        ...seedCadence.balance_sheet,
+        pension_payable_ye: DEFAULT_PROFILE_SEED.default_pension_payable_ye,
+        beginning_stock_basis_override: year2025EndingBasis > 0 ? year2025EndingBasis : null,
+      },
+      qbo_expected: { ...seedCadence.qbo_expected },
+    };
+  }
+
+  // Blank User or Custom Household: clean neutral empty ledger with zero leakage
   return {
-    projection_year: 2026,
-    source_label: 'Sample OSS QBO Transaction Ledger (1/1/2026–11/21/2026)',
+    projection_year: projectionYear,
+    source_label: 'No transactions imported yet',
     ledger_format: 'transaction_list',
-    as_of_date: '2026-11-21',
+    as_of_date: `${projectionYear}-12-31`,
+    grouping_mode: 'category',
     exp_smooth_alpha: DEFAULT_EXP_SMOOTH_ALPHA,
     exp_smooth_day_fraction: false,
-    transactions: sampleTransactions,
+    payee_aliases: initialAliases,
+    transactions: [],
     stream_overrides: {},
-    pnl_line_overrides: {
-      // Planned year-end retirement accruals (discretionary Mode C defaults to $0 unless entered)
-      dbp_contribution: { remaining: 61000.0 },
-      employer_401k: { remaining: 3571.0 },
-    },
+    pnl_line_overrides: {},
     balance_sheet: {
-      as_of_date: '2026-11-21',
-      operating_cash_beg: 76904.25,
-      operating_cash_ytd: 42580.89,
+      as_of_date: `${projectionYear}-12-31`,
+      operating_cash_beg: 0,
+      operating_cash_ytd: 0,
       operating_cash_ye_override: null,
-      pension_payable_beg: 144540.0,
-      pension_payable_ytd: 0.0,
-      pension_payable_ye: 64571.0,
-      cc_ap_beg: 2400.0,
-      cc_ap_ytd: 2963.77,
-      cc_ap_ye: 2963.77,
-      member_draws_ytd: 121939.75,
-      member_draws_remaining: 0.0,
-      capital_contributions_ytd: 0.0,
-      capital_contributions_remaining: 0.0,
+      pension_payable_beg: 0,
+      pension_payable_ytd: 0,
+      pension_payable_ye: 0,
+      cc_ap_beg: 0,
+      cc_ap_ytd: 0,
+      cc_ap_ye: 0,
+      member_draws_ytd: 0,
+      member_draws_remaining: 0,
+      capital_contributions_ytd: 0,
+      capital_contributions_remaining: 0,
       beginning_stock_basis_override: year2025EndingBasis > 0 ? year2025EndingBasis : null,
     },
-    qbo_expected: { ...OSS_NOV21_2026_QBO_BENCHMARKS },
   };
 }
 
@@ -2550,24 +2933,33 @@ export function buildStateFromImportedTransactions(
   prevBalanceSheet?: BalanceSheetProjectionInputs,
   ledgerFormat: 'general_ledger' | 'transaction_list' = 'transaction_list',
   prevQboExpected?: CadenceForecasterState['qbo_expected'],
-  prevExpSmooth?: { alpha?: number; dayFraction?: boolean }
+  prevExpSmooth?: { alpha?: number; dayFraction?: boolean },
+  prevAliases?: PayeeAliasRule[],
+  prevGroupingMode?: CadenceGroupingMode,
+  setup?: SetupConfig | null
 ): CadenceForecasterState {
   const year = detectedYear && detectedYear >= 2020 && detectedYear <= 2040 ? detectedYear : 2026;
-  const asOfDate = detectedAsOfDate || `${year}-11-21`;
+  const asOfDate = detectedAsOfDate || `${year}-12-31`;
 
-  // Preserve 11/21/2026 OSS reconciliation benchmarks when importing a 2026 ledger dated 11/21/2026
-  // (or an Operating Support Services 2026 export) so the user gets immediate $0.00 diff confirmation
-  const shouldApplyOssBenchmarks =
-    year === 2026 &&
-    (asOfDate === '2026-11-21' || /operating support services/i.test(sourceLabel));
+  // Apply default seed reconciliation benchmarks strictly when importing a matching default-profile ledger
+  const seedCadence = DEFAULT_PROFILE_SEED.default_cadence_2026;
+  const shouldApplySeedBenchmarks =
+    isDefaultSeedSetup(setup) &&
+    year === seedCadence.projection_year &&
+    (asOfDate === seedCadence.as_of_date ||
+      sourceLabel.toLowerCase().includes(DEFAULT_PROFILE_SEED.business_name.toLowerCase()));
+
+  const preservedAliases = Array.isArray(prevAliases) ? prevAliases : [];
 
   const draft: CadenceForecasterState = {
     projection_year: year,
     source_label: sourceLabel,
     ledger_format: ledgerFormat,
     as_of_date: asOfDate,
+    grouping_mode: prevGroupingMode ?? 'category',
     exp_smooth_alpha: clampExpSmoothAlpha(prevExpSmooth?.alpha),
     exp_smooth_day_fraction: Boolean(prevExpSmooth?.dayFraction),
+    payee_aliases: preservedAliases,
     transactions,
     stream_overrides: {},
     pnl_line_overrides: {},
@@ -2594,13 +2986,13 @@ export function buildStateFromImportedTransactions(
           capital_contributions_remaining: 0,
           beginning_stock_basis_override: null,
         },
-    ...(shouldApplyOssBenchmarks
-      ? { qbo_expected: prevQboExpected ?? { ...OSS_NOV21_2026_QBO_BENCHMARKS } }
+    ...(shouldApplySeedBenchmarks
+      ? { qbo_expected: prevQboExpected ?? { ...seedCadence.qbo_expected } }
       : {}),
   };
 
   // Run one pass to auto-populate Balance Sheet YTD & Beginning balances from the ledger
-  const probe = computeCadenceForecast(draft);
+  const probe = computeCadenceForecast(draft, undefined, undefined, setup ?? undefined);
   const r = probe.autoBsRollup;
   draft.balance_sheet = {
     ...draft.balance_sheet,

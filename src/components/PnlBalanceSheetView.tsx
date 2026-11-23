@@ -14,9 +14,12 @@ import {
 import type {
   BalanceSheetProjectionInputs,
   ComputedTaxYear,
+  GuardrailAcknowledgment,
+  PlanningGoalGuardrail,
   PnlBalanceSheetState,
   PnlLineId,
   SetupConfig,
+  ValidationIssue,
   WorkspaceTab,
 } from '../types/tax';
 import {
@@ -29,17 +32,26 @@ import {
   type ComputedPnlBalanceSheet,
   type CpaReportMetadata,
 } from '../engine/pnlBalanceSheet';
+import { evaluateAllPlanningGoals } from '../engine/planningGoals';
 import { getPersonNames } from '../engine/scheduleCatalog';
+import { getSetupBusinessIdentity, getSetupStates } from '../utils/setupHelpers';
 import { formatCurrencyExact } from '../utils/format';
 import { QboImportModal } from './QboImportModal';
 import { CpaPrintPackageModal } from './CpaPrintPackageModal';
+import { PlanningGoalsPanel } from './PlanningGoalsPanel';
 
 interface PnlBalanceSheetViewProps {
   setup: SetupConfig;
   pnlState: PnlBalanceSheetState;
+  planningGoals: PlanningGoalGuardrail[];
+  issues?: ValidationIssue[];
+  guardrailAcknowledgments?: Record<string, GuardrailAcknowledgment>;
   year2025Computed?: ComputedTaxYear;
   year2026Computed?: ComputedTaxYear;
   onUpdatePnlState: (updater: (prev: PnlBalanceSheetState) => PnlBalanceSheetState) => void;
+  onUpdatePlanningGoals: (
+    updater: (prev: PlanningGoalGuardrail[]) => PlanningGoalGuardrail[]
+  ) => void;
   onPushTo2026Schedule: (
     pnlState: PnlBalanceSheetState,
     computed: ComputedPnlBalanceSheet
@@ -77,9 +89,13 @@ function parseNumericInput(raw: string): number | null {
 export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
   setup,
   pnlState,
+  planningGoals,
+  issues,
+  guardrailAcknowledgments,
   year2025Computed,
   year2026Computed,
   onUpdatePnlState,
+  onUpdatePlanningGoals,
   onPushTo2026Schedule,
   onResetFrom2026Schedule,
   onNavigate,
@@ -94,12 +110,29 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
   } | null>(null);
 
   const { primaryName, spouseName } = getPersonNames(setup);
-  const entityName = year2025Computed?.scorp_in.entity_name ?? 'Operating Support Services LLC';
-  const entityEin = year2025Computed?.scorp_in.entity_ein ?? '83-1706286';
+  const { businessName, businessEin } = getSetupBusinessIdentity(
+    setup,
+    year2025Computed?.scorp_in.entity_name
+  );
+  const entityName = businessName;
+  const entityEin = businessEin || year2025Computed?.scorp_in.entity_ein?.trim() || '';
+  const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+  const pCode = primaryStateCode || 'State 1';
+  const sCode = secondaryStateCode || 'State 2';
+  const priorYearLabel = `${pnlState.projection_year - 1} Filed`;
+  const showStockBasis = setup.has_stock_basis !== false;
 
   const computed = useMemo(
-    () => calculatePnlBalanceSheet(pnlState, year2025Computed),
-    [pnlState, year2025Computed]
+    () => calculatePnlBalanceSheet(pnlState, year2025Computed, year2026Computed, setup),
+    [pnlState, year2025Computed, year2026Computed, setup]
+  );
+
+  const activeEvaluatedGoals = useMemo(
+    () =>
+      evaluateAllPlanningGoals(planningGoals, computed, pnlState, setup).filter(
+        (g) => g.goal.enabled
+      ),
+    [planningGoals, computed, pnlState, setup]
   );
 
   const cpaReportMeta = useMemo<CpaReportMetadata>(
@@ -107,8 +140,9 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
       moduleName: 'Rolling Tax Planner — P&L & Balance Sheet Projection',
       sourceMode,
       forecastMethodSummary: 'Two-Way Inline Forecast (YTD Actuals + Manual / Run-Rate Remaining)',
+      activeGoals: activeEvaluatedGoals,
     }),
-    [sourceMode]
+    [sourceMode, activeEvaluatedGoals]
   );
 
   // Two-way P&L inline edit commit
@@ -117,10 +151,13 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
     setActiveEdit(null);
     if (parsed === null) return;
 
+    const isLine17Retirement = lineId === 'dbp_contribution' || lineId === 'employer_401k';
+    const liveVals = computed.lines[lineId];
+
     onUpdatePnlState((prev) => {
       const current = prev.pnl[lineId] ?? { ytd: 0, remaining: 0 };
       let nextYtd = current.ytd;
-      let nextRemaining = current.remaining;
+      let nextRemaining = liveVals ? liveVals.remaining : current.remaining;
 
       if (col === 'ytd') {
         nextYtd = parsed;
@@ -131,13 +168,39 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
         nextRemaining = round2(parsed - current.ytd);
       }
 
+      const nextManualOverrides =
+        isLine17Retirement && (col === 'remaining' || col === 'projected')
+          ? {
+              ...(prev.retirement_line17_manual_overrides ?? {}),
+              [lineId]: true,
+            }
+          : prev.retirement_line17_manual_overrides;
+
       return {
         ...prev,
         pnl: {
           ...prev.pnl,
           [lineId]: { ytd: round2(nextYtd), remaining: round2(nextRemaining) },
         },
+        ...(nextManualOverrides
+          ? { retirement_line17_manual_overrides: nextManualOverrides }
+          : {}),
       };
+    });
+  };
+
+  const resetRetirementLineToHorizon = (lineId: 'dbp_contribution' | 'employer_401k') => {
+    onUpdatePnlState((prev) => {
+      const nextManual = { ...(prev.retirement_line17_manual_overrides ?? {}) };
+      delete nextManual[lineId];
+      const hasAny = Boolean(nextManual.dbp_contribution || nextManual.employer_401k);
+      const nextState: PnlBalanceSheetState = { ...prev };
+      if (hasAny) {
+        nextState.retirement_line17_manual_overrides = nextManual;
+      } else {
+        delete nextState.retirement_line17_manual_overrides;
+      }
+      return nextState;
     });
   };
 
@@ -198,7 +261,9 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Operating_Support_Services_${pnlState.projection_year}_CPA_Projection.csv`;
+    const safeEntity =
+      entityName.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '') || 'CPA_Report';
+    a.download = `${safeEntity}_${pnlState.projection_year}_CPA_Projection.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -407,7 +472,9 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
             {formatCurrencyExact(computed.totalRevenue.projected)}
           </div>
           <div className="text-xs text-slate-500 font-mono tabular-nums mt-1">
-            CA {computed.caPct.projected}% · AZ {computed.azPct.projected}%
+            {setup.multi_state_active
+              ? `${pCode} ${computed.caPct.projected}% · ${sCode} ${computed.azPct.projected}%`
+              : `${pCode} 100%`}
           </div>
         </div>
 
@@ -417,10 +484,10 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
             {formatCurrencyExact(computed.ordinaryBusinessIncome.projected)}
           </div>
           <div className="text-xs text-slate-500 font-mono tabular-nums mt-1">
-            2025 Filed {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
+            {priorYearLabel} {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
             {k1DiffFromSchedule !== null && Math.abs(k1DiffFromSchedule) >= 1
               ? ` · Schedule Δ ${formatCurrencyExact(k1DiffFromSchedule, true)}`
-              : ' · Synced w/ 2026'}
+              : ` · Synced w/ ${pnlState.projection_year}`}
           </div>
         </div>
 
@@ -435,27 +502,40 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-lg p-4">
-          <div className="text-xs text-slate-500">Projected Ending Stock Basis</div>
-          <div
-            className={`text-xl font-bold font-mono tabular-nums mt-1 ${
-              computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
-            }`}
-          >
-            {formatCurrencyExact(computed.projectedEndingStockBasis)}
+        {showStockBasis && (
+          <div className="bg-white border border-slate-200 rounded-lg p-4">
+            <div className="text-xs text-slate-500">Projected Ending Stock Basis</div>
+            <div
+              className={`text-xl font-bold font-mono tabular-nums mt-1 ${
+                computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
+              }`}
+            >
+              {formatCurrencyExact(computed.projectedEndingStockBasis)}
+            </div>
+            <div
+              className={`text-xs font-medium mt-1 ${
+                computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
+              }`}
+            >
+              {computed.drawsExceedBasis
+                ? `Alert: Excess gain ${formatCurrencyExact(computed.projectedExcessDistributionGain)}`
+                : `Safe · Cushion before draws ${formatCurrencyExact(
+                    computed.basisAvailableBeforeDraws - computed.projectedDrawsTotal
+                  )}`}
+            </div>
           </div>
-          <div
-            className={`text-xs font-medium mt-1 ${
-              computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
-            }`}
-          >
-            {computed.drawsExceedBasis
-              ? `Alert: Excess gain ${formatCurrencyExact(computed.projectedExcessDistributionGain)}`
-              : `Safe · Cushion before draws ${formatCurrencyExact(
-                  computed.basisAvailableBeforeDraws - computed.projectedDrawsTotal
-                )}`}
-          </div>
-        </div>
+        )}
+      </div>
+
+      {/* Planning Goals & Guardrails Selector (Live Evaluation + Auto-Included in CPA Package & CSV) */}
+      <div className="no-print">
+        <PlanningGoalsPanel
+          setup={setup}
+          goals={planningGoals}
+          computed={computed}
+          pnlState={pnlState}
+          onUpdateGoals={onUpdatePlanningGoals}
+        />
       </div>
 
       {/* ================================================================= */}
@@ -500,7 +580,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                 <th className="py-2.5 px-3 text-right">YTD Actuals (QBO)</th>
                 <th className="py-2.5 px-3 text-right">Remaining Forecast</th>
                 <th className="py-2.5 px-3 text-right">Projected Full Year</th>
-                <th className="py-2.5 px-4 text-right text-slate-500">2025 Filed Actuals</th>
+                <th className="py-2.5 px-4 text-right text-slate-500">{priorYearLabel} Actuals</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs">
@@ -523,6 +603,19 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                     {items.map((item) => {
                       const vals = computed.lines[item.id];
                       const label = getPnlLineLabel(item, setup);
+                      const isRetLine17 =
+                        item.id === 'dbp_contribution' || item.id === 'employer_401k';
+                      const isManualRet =
+                        item.id === 'dbp_contribution'
+                          ? Boolean(pnlState.retirement_line17_manual_overrides?.dbp_contribution)
+                          : item.id === 'employer_401k'
+                          ? Boolean(pnlState.retirement_line17_manual_overrides?.employer_401k)
+                          : false;
+                      const isHorizonRetSynced =
+                        isRetLine17 &&
+                        !isManualRet &&
+                        Boolean(year2026Computed) &&
+                        (vals.remaining > 0 || vals.projected > 0);
                       return (
                         <React.Fragment key={item.id}>
                           <tr className="hover:bg-slate-50/60 transition-colors">
@@ -544,8 +637,25 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                               )}
                             </td>
                             <td className="py-2 px-3 text-right align-top">
-                              {renderEditableCell(`pnl:${item.id}:rem`, vals.remaining, (d) =>
-                                commitPnlEdit(item.id, 'remaining', d)
+                              {renderEditableCell(
+                                `pnl:${item.id}:rem`,
+                                vals.remaining,
+                                (d) => commitPnlEdit(item.id, 'remaining', d),
+                                {
+                                  subLabel: isManualRet
+                                    ? 'Manual'
+                                    : isHorizonRetSynced
+                                    ? 'Horizon Plan'
+                                    : undefined,
+                                  resetAction:
+                                    isManualRet &&
+                                    (item.id === 'dbp_contribution' || item.id === 'employer_401k')
+                                      ? () =>
+                                          resetRetirementLineToHorizon(
+                                            item.id as 'dbp_contribution' | 'employer_401k'
+                                          )
+                                      : undefined,
+                                }
                               )}
                             </td>
                             <td className="py-2 px-3 text-right align-top bg-teal-50/20">
@@ -610,40 +720,50 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                         <td className="py-2.5 px-4 align-top">
                           <div className="text-slate-900">Total Gross Receipts</div>
                           <div className="text-[11px] font-normal text-slate-500">
-                            Auto-summed CA + AZ revenue · Live state apportionment split
+                            {setup.multi_state_active
+                              ? `Auto-summed ${pCode} + ${sCode} revenue · Live state apportionment split`
+                              : 'Auto-summed gross receipts'}
                           </div>
                         </td>
                         <td className="py-2.5 px-3 text-right align-top">
                           <div className="font-mono tabular-nums text-slate-900">
                             {formatCurrencyExact(computed.totalRevenue.ytd)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
-                            CA {computed.caPct.ytd}% / AZ {computed.azPct.ytd}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
+                              {pCode} {computed.caPct.ytd}% / {sCode} {computed.azPct.ytd}%
+                            </div>
+                          )}
                         </td>
                         <td className="py-2.5 px-3 text-right align-top">
                           <div className="font-mono tabular-nums text-slate-900">
                             {formatCurrencyExact(computed.totalRevenue.remaining)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
-                            CA {computed.caPct.remaining}% / AZ {computed.azPct.remaining}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
+                              {pCode} {computed.caPct.remaining}% / {sCode} {computed.azPct.remaining}%
+                            </div>
+                          )}
                         </td>
                         <td className="py-2.5 px-3 text-right align-top">
                           <div className="font-mono tabular-nums text-teal-900">
                             {formatCurrencyExact(computed.totalRevenue.projected)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-medium text-teal-800 mt-0.5">
-                            CA {computed.caPct.projected}% / AZ {computed.azPct.projected}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-medium text-teal-800 mt-0.5">
+                              {pCode} {computed.caPct.projected}% / {sCode} {computed.azPct.projected}%
+                            </div>
+                          )}
                         </td>
                         <td className="py-2.5 px-4 text-right align-top">
                           <div className="font-mono tabular-nums text-slate-600">
                             {formatCurrencyExact(computed.totalRevenue.filed2025)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-normal text-slate-500 mt-0.5">
-                            CA {computed.caPct.filed2025}% / AZ {computed.azPct.filed2025}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-normal text-slate-500 mt-0.5">
+                              {pCode} {computed.caPct.filed2025}% / {sCode} {computed.azPct.filed2025}%
+                            </div>
+                          )}
                         </td>
                       </tr>
                     )}
@@ -689,7 +809,11 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                         <td className="py-2.5 px-4 align-top">
                           <div>Total Operating Expenses (Excl. W-2 &amp; Retirement)</div>
                           <div className="text-[11px] font-normal text-slate-500 mt-0.5">
-                            Tax-deductible total (includes 50% Meals) · Book total w/ 100% Meals:{' '}
+                            Excl. Payroll Taxes (1120-S / Horizon OpEx):{' '}
+                            <span className="font-mono tabular-nums font-medium text-slate-700">
+                              {formatCurrencyExact(computed.totalOperatingExpensesExclPayroll.projected)}
+                            </span>{' '}
+                            · Book total w/ 100% Meals:{' '}
                             <span className="font-mono tabular-nums">
                               {formatCurrencyExact(computed.totalOperatingExpensesBook.projected)}
                             </span>
@@ -798,7 +922,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
       {/* ================================================================= */}
       <section className="no-print space-y-4">
         {/* Basis Excess Alert or Safe Status Strip */}
-        {computed.drawsExceedBasis ? (
+        {showStockBasis && (computed.drawsExceedBasis ? (
           <div className="bg-red-50 border border-red-200 rounded-lg px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-start gap-2.5">
               <AlertTriangle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
@@ -810,7 +934,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                   </span>
                   :
                 </span>{' '}
-                Projected 2026 distributions ({formatCurrencyExact(computed.projectedDrawsTotal)}) exceed
+                Projected {pnlState.projection_year} distributions ({formatCurrencyExact(computed.projectedDrawsTotal)}) exceed
                 available Form 7203 stock basis ({formatCurrencyExact(computed.basisAvailableBeforeDraws)}),
                 triggering a{' '}
                 <span className="font-mono font-semibold tabular-nums">
@@ -829,7 +953,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
           <div className="bg-emerald-50/70 border border-emerald-200 rounded-lg px-5 py-3 flex items-center gap-2.5 text-xs text-emerald-900">
             <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
             <span>
-              <span className="font-semibold">Stock Basis Clear:</span> Projected 2026 member draws (
+              <span className="font-semibold">Stock Basis Clear:</span> Projected {pnlState.projection_year} member draws (
               <span className="font-mono tabular-nums">
                 {formatCurrencyExact(computed.projectedDrawsTotal)}
               </span>
@@ -844,9 +968,9 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
               in projected ending stock basis after 50% nondeductible meals.
             </span>
           </div>
-        )}
+        ))}
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
+        <div className={`grid grid-cols-1 ${showStockBasis ? 'lg:grid-cols-2' : ''} gap-6 items-stretch`}>
           {/* Left: Schedule L Balance Sheet Projection */}
           <div className="bg-white border border-slate-200 rounded-lg overflow-hidden flex flex-col">
             <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between gap-3">
@@ -883,7 +1007,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                     <td className="py-2.5 px-4 align-top">
                       <div className="font-medium text-slate-800">Operating Cash</div>
                       <div className="text-[11px] text-slate-400">
-                        QBO: BlueVine Checking
+                        QBO: Business Operating Checking / Cash
                       </div>
                     </td>
                     <td className="py-2.5 px-2.5 text-right align-top">
@@ -907,6 +1031,8 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                           subLabel:
                             bs.operating_cash_ye_override !== null
                               ? 'Override'
+                              : computed.subsequentYearRetirementAddback > 0
+                              ? 'Auto · excl. §404(a)(6)'
                               : 'Auto cash flow',
                           resetAction:
                             bs.operating_cash_ye_override !== null
@@ -928,7 +1054,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                     <td className="py-2.5 px-4 align-top">
                       <div className="font-medium text-slate-800">Pension Expense Payable</div>
                       <div className="text-[11px] text-slate-400">
-                        QBO: Defined Benefit Plan Payable + OSS 401K Plan Payable
+                        QBO: Defined Benefit Plan Payable + Employer 401(k) Payable
                       </div>
                     </td>
                     <td className="py-2.5 px-2.5 text-right align-top">
@@ -946,7 +1072,16 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                         'bs:pension_ye',
                         bs.pension_payable_ye,
                         (d) => commitBsField('pension_payable_ye', d),
-                        { bold: true }
+                        {
+                          bold: true,
+                          subLabel:
+                            bs.pension_payable_ye === 0 &&
+                            computed.lines.dbp_contribution.projected +
+                              computed.lines.employer_401k.projected >
+                              0
+                              ? 'IRC §404(a)(6) / cash-basis'
+                              : undefined,
+                        }
                       )}
                     </td>
                   </tr>
@@ -957,7 +1092,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
                         Credit Card / Accounts Payable
                       </div>
                       <div className="text-[11px] text-slate-400">
-                        QBO: Amazon CC, Amtrak, AMX CC, Cap One CC
+                        QBO: Business Credit Cards &amp; Accounts Payable
                       </div>
                     </td>
                     <td className="py-2.5 px-2.5 text-right align-top">
@@ -1007,6 +1142,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
           </div>
 
           {/* Right: Form 7203 Shareholder Stock Basis & Draws */}
+          {showStockBasis && (
           <div className="bg-white border border-slate-200 rounded-lg overflow-hidden flex flex-col">
             <div className="px-5 py-3.5 border-b border-slate-200">
               <h2 className="text-sm font-semibold text-slate-900">
@@ -1199,6 +1335,7 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
               </table>
             </div>
           </div>
+          )}
         </div>
       </section>
 
@@ -1285,6 +1422,8 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
           entityName={entityName}
           entityEin={entityEin}
           reportMeta={cpaReportMeta}
+          issues={issues}
+          guardrailAcknowledgments={guardrailAcknowledgments}
           onDownloadCsv={handleDownloadCsv}
           onClose={() => setShowPrintModal(false)}
         />

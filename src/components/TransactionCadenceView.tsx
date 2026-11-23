@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
@@ -7,35 +7,52 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Eye,
+  EyeOff,
   FileSpreadsheet,
+  GitMerge,
+  Info,
+  Layers,
+  List,
   Pencil,
+  Plus,
   Printer,
   RotateCcw,
   Search,
   Send,
   ShieldCheck,
+  Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import type {
   BalanceSheetProjectionInputs,
   CadenceForecastMode,
   CadenceForecasterState,
+  CadenceGroupingMode,
   ComputedTaxYear,
+  GuardrailAcknowledgment,
+  PayeeAliasMatchType,
+  PayeeAliasRule,
+  PlanningGoalGuardrail,
   PnlBalanceSheetState,
   PnlLineId,
+  PushToHorizonImpact,
   SetupConfig,
+  ValidationIssue,
   WorkspaceTab,
 } from '../types/tax';
 import {
-  CPA_DISCLOSURE_METADATA,
   PNL_OPERATING_ITEMS,
   PNL_SECTIONS,
   SCHEDULE_K_LINE_META,
+  buildCpaDisclosureMetadata,
   buildCpaProjectionCsv,
   getPnlLineLabel,
   type ComputedPnlBalanceSheet,
   type CpaReportMetadata,
 } from '../engine/pnlBalanceSheet';
+import { getSetupBusinessIdentity, getSetupStates } from '../utils/setupHelpers';
 import {
   DEFAULT_EXP_SMOOTH_ALPHA,
   buildStateFromImportedTransactions,
@@ -46,22 +63,38 @@ import {
   parseQboTransactionText,
   type AuditRowCategory,
 } from '../engine/cadenceEngine';
+import { evaluateAllPlanningGoals } from '../engine/planningGoals';
 import { getPersonNames } from '../engine/scheduleCatalog';
-import { formatCurrencyExact } from '../utils/format';
+import { formatCurrency, formatCurrencyExact } from '../utils/format';
 import { CpaPrintPackageModal } from './CpaPrintPackageModal';
+import { PlanningGoalsPanel } from './PlanningGoalsPanel';
+
+const HIDE_EXCL_ZERO_STORAGE_KEY = 'rolling-tax-planner-hide-excl-zero-v1';
+
+function formatSignedDelta(amount: number): string {
+  const rounded = Math.round(amount);
+  if (rounded === 0) return '$0';
+  return `${rounded > 0 ? '+' : '-'}${formatCurrency(Math.abs(rounded))}`;
+}
 
 interface TransactionCadenceViewProps {
   setup: SetupConfig;
   cadenceState: CadenceForecasterState;
+  planningGoals: PlanningGoalGuardrail[];
+  issues?: ValidationIssue[];
+  guardrailAcknowledgments?: Record<string, GuardrailAcknowledgment>;
   year2025Computed?: ComputedTaxYear;
   year2026Computed?: ComputedTaxYear;
   onUpdateCadenceState: (
     updater: (prev: CadenceForecasterState) => CadenceForecasterState
   ) => void;
+  onUpdatePlanningGoals: (
+    updater: (prev: PlanningGoalGuardrail[]) => PlanningGoalGuardrail[]
+  ) => void;
   onPushTo2026Schedule: (
     pnlSnapshot: PnlBalanceSheetState,
     computed: ComputedPnlBalanceSheet
-  ) => void;
+  ) => PushToHorizonImpact | void;
   onNavigate: (tab: WorkspaceTab) => void;
 }
 
@@ -107,12 +140,72 @@ const AUDIT_CATEGORY_LABELS: Record<AuditRowCategory, string> = {
   non_target_year: 'Outside Date Window',
 };
 
+const EXP_SMOOTH_TOOLTIP =
+  "Exponential Smoothing weights recent values more heavily than older ones using a smoothing factor (alpha, between 0 and 1) to filter out one-off noise and project underlying trend. Lower alpha (e.g., 0.05 to 0.09) reacts more slowly to single spikes so a one-time bill or invoice doesn't swing the forecast; moving from 0.05 to 0.09 gives slightly more weight to recent changes while still keeping the forecast steady.";
+
+const ExpSmoothHoverTooltip: React.FC<{
+  text?: string;
+  children: React.ReactNode;
+}> = ({ text = EXP_SMOOTH_TOOLTIP, children }) => {
+  const [coords, setCoords] = useState<{
+    left: number;
+    top: number;
+    placement: 'top' | 'bottom';
+  } | null>(null);
+
+  const showFromElement = (el: HTMLElement) => {
+    const rect = el.getBoundingClientRect();
+    const tooltipWidth = 320;
+    const margin = 12;
+    const centerX = rect.left + rect.width / 2;
+    const clampedLeft = Math.max(
+      margin,
+      Math.min(window.innerWidth - tooltipWidth - margin, centerX - tooltipWidth / 2)
+    );
+    const showBelow = rect.top < 160;
+    setCoords({
+      left: clampedLeft,
+      top: showBelow ? rect.bottom + 8 : rect.top - 8,
+      placement: showBelow ? 'bottom' : 'top',
+    });
+  };
+
+  return (
+    <span
+      className="inline-flex items-center"
+      onMouseEnter={(e) => showFromElement(e.currentTarget)}
+      onMouseLeave={() => setCoords(null)}
+      onFocus={(e) => showFromElement(e.currentTarget)}
+      onBlur={() => setCoords(null)}
+    >
+      {children}
+      {coords && (
+        <span
+          role="tooltip"
+          style={{
+            left: `${coords.left}px`,
+            top: `${coords.top}px`,
+            transform: coords.placement === 'top' ? 'translateY(-100%)' : undefined,
+          }}
+          className="fixed z-50 w-80 px-3 py-2 rounded-md bg-slate-900 text-slate-50 border border-slate-700/80 shadow-lg text-[11px] font-normal leading-relaxed text-left whitespace-normal pointer-events-none"
+        >
+          {text}
+        </span>
+      )}
+    </span>
+  );
+};
+
 export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   setup,
   cadenceState,
+  planningGoals,
+  issues,
+  guardrailAcknowledgments,
   year2025Computed,
   year2026Computed,
   onUpdateCadenceState,
+  onUpdatePlanningGoals,
   onPushTo2026Schedule,
   onNavigate,
 }) => {
@@ -126,21 +219,194 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   const [showCadenceDrawer, setShowCadenceDrawer] = useState(true);
   const [streamFilter, setStreamFilter] = useState<StreamFilterTab>('all');
   const [streamSearch, setStreamSearch] = useState('');
+  const [hideExcludedZeroRows, setHideExcludedZeroRows] = useState<boolean>(() => {
+    if (typeof window === 'undefined' || !window.localStorage) return false;
+    try {
+      return window.localStorage.getItem(HIDE_EXCL_ZERO_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [showAliasPanel, setShowAliasPanel] = useState(false);
+  const [editingAliasId, setEditingAliasId] = useState<string | null>(null);
+  const [aliasPatternDraft, setAliasPatternDraft] = useState('');
+  const [aliasMatchTypeDraft, setAliasMatchTypeDraft] = useState<PayeeAliasMatchType>('contains');
+  const [aliasCanonicalDraft, setAliasCanonicalDraft] = useState('');
+  const [quickMergeStreamKey, setQuickMergeStreamKey] = useState<string | null>(null);
+  const [quickMergePattern, setQuickMergePattern] = useState('');
+  const [quickMergeMatchType, setQuickMergeMatchType] = useState<PayeeAliasMatchType>('contains');
+  const [quickMergeCanonical, setQuickMergeCanonical] = useState('');
   const [showPrintModal, setShowPrintModal] = useState(false);
   const [bannerMessage, setBannerMessage] = useState<{
     type: 'push' | 'import';
     text: string;
   } | null>(null);
+  const [pushToast, setPushToast] = useState<PushToHorizonImpact | null>(null);
+
+  useEffect(() => {
+    if (!pushToast) return;
+    const timer = window.setTimeout(() => {
+      setPushToast(null);
+    }, 9000);
+    return () => window.clearTimeout(timer);
+  }, [pushToast]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const { primaryName, spouseName } = getPersonNames(setup);
-  const entityName = year2025Computed?.scorp_in.entity_name ?? 'Operating Support Services LLC';
-  const entityEin = year2025Computed?.scorp_in.entity_ein ?? '83-1706286';
+  const { businessName, businessEin } = getSetupBusinessIdentity(
+    setup,
+    year2025Computed?.scorp_in.entity_name
+  );
+  const entityName = businessName;
+  const entityEin = businessEin || year2025Computed?.scorp_in.entity_ein?.trim() || '';
+  const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+  const pCode = primaryStateCode || 'State 1';
+  const sCode = secondaryStateCode || 'State 2';
+  const priorYearLabel = `${cadenceState.projection_year - 1} Filed`;
+  const cpaDisclosure = buildCpaDisclosureMetadata(setup, entityName);
+  const showStockBasis = setup.has_stock_basis !== false;
+
+  const payeeAliases = cadenceState.payee_aliases ?? [];
+
+  const updatePayeeAliases = (updater: (prev: PayeeAliasRule[]) => PayeeAliasRule[]) => {
+    onUpdateCadenceState((prev) => {
+      const nextAliases = updater(prev.payee_aliases ?? []);
+      return {
+        ...prev,
+        payee_aliases: nextAliases,
+      };
+    });
+  };
+
+  const handleToggleHideExcludedZero = () => {
+    setHideExcludedZeroRows((prev) => {
+      const next = !prev;
+      if (next && streamFilter === 'one_time') {
+        setStreamFilter('all');
+      }
+      try {
+        window.localStorage.setItem(HIDE_EXCL_ZERO_STORAGE_KEY, String(next));
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+  };
+
+  const handleSelectStreamFilter = (tab: StreamFilterTab) => {
+    setStreamFilter(tab);
+    if (tab === 'one_time' && hideExcludedZeroRows) {
+      setHideExcludedZeroRows(false);
+      try {
+        window.localStorage.setItem(HIDE_EXCL_ZERO_STORAGE_KEY, 'false');
+      } catch {
+        // Ignore storage errors
+      }
+    }
+  };
+
+  const handleSubmitAliasForm = (e: React.FormEvent) => {
+    e.preventDefault();
+    const pattern = aliasPatternDraft.trim();
+    const canonical = aliasCanonicalDraft.trim();
+    if (!pattern || !canonical) return;
+
+    if (editingAliasId) {
+      updatePayeeAliases((prev) =>
+        prev.map((rule) =>
+          rule.id === editingAliasId
+            ? { ...rule, pattern, match_type: aliasMatchTypeDraft, canonical_name: canonical }
+            : rule
+        )
+      );
+      setEditingAliasId(null);
+    } else {
+      const newRule: PayeeAliasRule = {
+        id: `alias-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        pattern,
+        match_type: aliasMatchTypeDraft,
+        canonical_name: canonical,
+      };
+      updatePayeeAliases((prev) => [...prev, newRule]);
+    }
+
+    setAliasPatternDraft('');
+    setAliasMatchTypeDraft('contains');
+    setAliasCanonicalDraft('');
+  };
+
+  const handleStartEditAlias = (rule: PayeeAliasRule) => {
+    setEditingAliasId(rule.id);
+    setAliasPatternDraft(rule.pattern);
+    setAliasMatchTypeDraft(rule.match_type);
+    setAliasCanonicalDraft(rule.canonical_name);
+    setShowAliasPanel(true);
+  };
+
+  const handleCancelEditAlias = () => {
+    setEditingAliasId(null);
+    setAliasPatternDraft('');
+    setAliasMatchTypeDraft('contains');
+    setAliasCanonicalDraft('');
+  };
+
+  const handleDeleteAlias = (id: string) => {
+    updatePayeeAliases((prev) => prev.filter((r) => r.id !== id));
+    if (editingAliasId === id) {
+      handleCancelEditAlias();
+    }
+  };
+
+  const handleOpenQuickMerge = (streamKey: string, vendorName: string) => {
+    if (quickMergeStreamKey === streamKey) {
+      setQuickMergeStreamKey(null);
+      return;
+    }
+    setQuickMergeStreamKey(streamKey);
+    setQuickMergePattern(vendorName);
+    setQuickMergeMatchType('contains');
+    setQuickMergeCanonical('');
+  };
+
+  const handleApplyQuickMerge = (
+    patternInput: string,
+    canonicalInput: string,
+    matchType: PayeeAliasMatchType = 'contains'
+  ) => {
+    const pattern = patternInput.trim();
+    const canonical = canonicalInput.trim();
+    if (!pattern || !canonical) return;
+
+    updatePayeeAliases((prev) => {
+      const existingIdx = prev.findIndex(
+        (r) =>
+          r.pattern.trim().toLowerCase() === pattern.toLowerCase() &&
+          r.match_type === matchType
+      );
+      if (existingIdx >= 0) {
+        return prev.map((r, idx) =>
+          idx === existingIdx ? { ...r, canonical_name: canonical } : r
+        );
+      }
+      return [
+        ...prev,
+        {
+          id: `alias-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          pattern,
+          match_type: matchType,
+          canonical_name: canonical,
+        },
+      ];
+    });
+    setQuickMergeStreamKey(null);
+    setQuickMergePattern('');
+    setQuickMergeCanonical('');
+  };
 
   const forecast = useMemo(
-    () => computeCadenceForecast(cadenceState, year2025Computed),
-    [cadenceState, year2025Computed]
+    () => computeCadenceForecast(cadenceState, year2025Computed, year2026Computed, setup),
+    [cadenceState, year2025Computed, year2026Computed, setup]
   );
 
   const computed = forecast.pnlComputed;
@@ -155,6 +421,17 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     map.set(SCHEDULE_K_LINE_META.id, SCHEDULE_K_LINE_META.label);
     return map;
   }, [setup]);
+
+  const canonicalPayeeSuggestions = useMemo(() => {
+    const names = new Set<string>();
+    for (const s of forecast.granularStreams) {
+      if (s.vendor.trim()) names.add(s.vendor.trim());
+    }
+    for (const r of payeeAliases) {
+      if (r.canonical_name.trim()) names.add(r.canonical_name.trim());
+    }
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }, [forecast.granularStreams, payeeAliases]);
 
   // File upload handler (CSV / TSV / XLSX / XLS)
   const handleFileUpload = async (file: File) => {
@@ -180,7 +457,10 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
         {
           alpha: cadenceState.exp_smooth_alpha,
           dayFraction: cadenceState.exp_smooth_day_fraction,
-        }
+        },
+        cadenceState.payee_aliases,
+        cadenceState.grouping_mode,
+        setup
       );
       onUpdateCadenceState(() => nextState);
       setShowImportPanel(false);
@@ -221,7 +501,10 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       {
         alpha: cadenceState.exp_smooth_alpha,
         dayFraction: cadenceState.exp_smooth_day_fraction,
-      }
+      },
+      cadenceState.payee_aliases,
+      cadenceState.grouping_mode,
+      setup
     );
     onUpdateCadenceState(() => nextState);
     setPasteText('');
@@ -234,16 +517,19 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     });
   };
 
-  const handleLoadSampleOss = () => {
+  const handleLoadSampleLedger = () => {
     setImportError(null);
     const fresh = createInitialCadenceForecasterState(
-      year2025Computed?.scorp_out.stock_basis_ending ?? 0
+      year2025Computed?.scorp_out.stock_basis_ending ?? 0,
+      cadenceState.payee_aliases ?? [],
+      setup
     );
+    fresh.grouping_mode = cadenceState.grouping_mode ?? 'category';
     onUpdateCadenceState(() => fresh);
     setShowImportPanel(false);
     setBannerMessage({
       type: 'import',
-      text: `Loaded Sample OSS QBO Transaction Ledger (1/1/2026–11/21/2026 · ${fresh.transactions.length} transactions) reconciling to $319,283.71 revenue, $88,300.27 expenses, $609.18 interest, $42,580.89 BlueVine Checking, $2,963.77 credit cards, and $121,939.75 draws.`,
+      text: `Loaded Sample QBO Transaction Ledger (${fresh.transactions.length} transactions) for cadence forecasting and reconciliation testing.`,
     });
   };
 
@@ -312,12 +598,51 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     }));
   };
 
+  const isCategoryMode = forecast.groupingMode === 'category';
+
+  const handleGroupingModeChange = (nextMode: CadenceGroupingMode) => {
+    setQuickMergeStreamKey(null);
+    setActiveEdit(null);
+    if (streamFilter === 'run_rate' && nextMode === 'category') {
+      setStreamFilter('all');
+    }
+    onUpdateCadenceState((prev) => ({
+      ...prev,
+      grouping_mode: nextMode,
+    }));
+  };
+
+  const handleToggleCategoryExpSmooth = (
+    streamKey: string,
+    activeMode: CadenceForecastMode,
+    detectedMode: Exclude<CadenceForecastMode, 'manual'>
+  ) => {
+    onUpdateCadenceState((prev) => {
+      const nextOverrides = { ...prev.stream_overrides };
+      if (activeMode === 'exp_smooth') {
+        if (detectedMode === 'cadence') {
+          delete nextOverrides[streamKey];
+        } else {
+          nextOverrides[streamKey] = { mode: 'cadence' };
+        }
+      } else {
+        nextOverrides[streamKey] = { mode: 'exp_smooth' };
+      }
+      return {
+        ...prev,
+        stream_overrides: nextOverrides,
+      };
+    });
+  };
+
   const variableEligibleStreams = useMemo(
     () =>
-      forecast.streams.filter(
-        (s) => s.detectedMode === 'run_rate' && s.activeMonthCount >= 2 && s.activeMode !== 'manual'
+      forecast.streams.filter((s) =>
+        isCategoryMode
+          ? Boolean(s.isVariableCategory) && s.activeMonthCount >= 2 && s.activeMode !== 'manual'
+          : s.detectedMode === 'run_rate' && s.activeMonthCount >= 2 && s.activeMode !== 'manual'
       ),
-    [forecast.streams]
+    [forecast.streams, isCategoryMode]
   );
 
   const variableOnExpSmoothCount = useMemo(
@@ -469,6 +794,14 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     };
   }, [forecast.streams]);
 
+  const activeEvaluatedGoals = useMemo(
+    () =>
+      evaluateAllPlanningGoals(planningGoals, computed, pnlState, setup).filter(
+        (g) => g.goal.enabled
+      ),
+    [planningGoals, computed, pnlState, setup]
+  );
+
   const cpaReportMeta = useMemo<CpaReportMetadata>(() => {
     const rawLabel = cadenceState.source_label?.trim() || 'Sample Ledger';
     const isSample = /sample|built-in/i.test(rawLabel);
@@ -479,7 +812,11 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
         : 'QBO Transaction List';
     const sourceMode = `${formatPrefix} (${rawLabel} · ${cadenceState.transactions.length} rows)`;
 
-    const modeParts: string[] = [];
+    const modeParts: string[] = [
+      forecast.groupingMode === 'category'
+        ? `P&L Category Rollup (${forecast.categoryCount} categories)`
+        : `Granular Streams (${forecast.granularStreamCount} streams)`,
+    ];
     if (streamCounts.cadence > 0) modeParts.push(`Cadence (${streamCounts.cadence})`);
     if (streamCounts.exp_smooth > 0) {
       modeParts.push(
@@ -500,11 +837,16 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       forecastMethodSummary: modeParts.join(' · '),
       elapsedDays: forecast.elapsedDays,
       remainingDays: forecast.remainingDays,
+      activeGoals: activeEvaluatedGoals,
     };
   }, [
+    activeEvaluatedGoals,
     cadenceState.source_label,
     cadenceState.transactions.length,
+    forecast.categoryCount,
     forecast.elapsedDays,
+    forecast.granularStreamCount,
+    forecast.groupingMode,
     forecast.remainingDays,
     forecast.ledgerFormat,
     forecast.expSmoothAlpha,
@@ -525,26 +867,47 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Operating_Support_Services_${pnlState.projection_year}_Cadence_CPA_Projection.csv`;
+    const safeEntity =
+      entityName.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '') || 'CPA_Report';
+    a.download = `${safeEntity}_${pnlState.projection_year}_Cadence_CPA_Projection.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
+  const canPushForecast =
+    cadenceState.transactions.length > 0 ||
+    computed.totalRevenue.projected > 0 ||
+    computed.lines.bill_officer_w2.projected > 0 ||
+    computed.lines.debra_salaries_wages.projected > 0;
+
   const handlePush = () => {
-    onPushTo2026Schedule(pnlState, computed);
-    setBannerMessage({
-      type: 'push',
-      text: `Pushed cadence-projected ${pnlState.projection_year} financials to the Six-Year Financial Schedule (Revenue ${formatCurrencyExact(
-        computed.totalRevenue.projected
-      )} · K-1 Profit ${formatCurrencyExact(
-        computed.ordinaryBusinessIncome.projected
-      )} · Sch K Interest ${formatCurrencyExact(
-        computed.scheduleKInterest.projected
-      )} · Draws ${formatCurrencyExact(computed.projectedDrawsTotal)}).`,
-    });
+    if (!canPushForecast) return;
+    const impact = onPushTo2026Schedule(pnlState, computed);
+    if (impact) {
+      setPushToast(impact);
+      setBannerMessage({
+        type: 'push',
+        text: `Pushed ${impact.taxYear} forecast to Six-Year Horizon — Updated ${
+          impact.taxYear
+        } K-1: ${formatCurrency(impact.newK1)} (${formatSignedDelta(
+          impact.k1Delta
+        )}) · Total ${impact.taxYear} All-In Tax: ${formatCurrency(
+          impact.newAllInTax
+        )} (${formatSignedDelta(impact.taxDelta)}).`,
+      });
+    } else {
+      setBannerMessage({
+        type: 'push',
+        text: `Pushed cadence-projected ${pnlState.projection_year} financials to the Six-Year Financial Schedule (Revenue ${formatCurrencyExact(
+          computed.totalRevenue.projected
+        )} · K-1 Profit ${formatCurrencyExact(
+          computed.ordinaryBusinessIncome.projected
+        )} · Draws ${formatCurrencyExact(computed.projectedDrawsTotal)}).`,
+      });
+    }
   };
 
-  const filteredStreams = useMemo(() => {
+  const streamsMatchingTabAndSearch = useMemo(() => {
     const q = streamSearch.trim().toLowerCase();
     return forecast.streams.filter((s) => {
       if (streamFilter === 'cadence' && s.activeMode !== 'cadence') return false;
@@ -557,6 +920,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       const targetLabel = (lineLabelMap.get(s.targetLineId) ?? '').toLowerCase();
       return (
         s.vendor.toLowerCase().includes(q) ||
+        s.mergedRawVendors.some((rv) => rv.toLowerCase().includes(q)) ||
         targetLabel.includes(q) ||
         s.cadenceLabel.toLowerCase().includes(q) ||
         s.sourceAccounts.some((a) => a.toLowerCase().includes(q)) ||
@@ -564,6 +928,17 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       );
     });
   }, [forecast.streams, streamFilter, streamSearch, lineLabelMap]);
+
+  const hiddenExcludedZeroCount = useMemo(() => {
+    if (!hideExcludedZeroRows) return 0;
+    return streamsMatchingTabAndSearch.filter((s) => s.activeMode === 'one_time').length;
+  }, [streamsMatchingTabAndSearch, hideExcludedZeroRows]);
+
+  // Display-only filter: hiding Excl. $0 rows never alters YTD totals, remaining projections, or CPA reports
+  const filteredStreams = useMemo(() => {
+    if (!hideExcludedZeroRows) return streamsMatchingTabAndSearch;
+    return streamsMatchingTabAndSearch.filter((s) => s.activeMode !== 'one_time');
+  }, [streamsMatchingTabAndSearch, hideExcludedZeroRows]);
 
   const filteredAuditRows = useMemo(() => {
     if (auditCategoryFilter === 'all') return forecast.auditRows;
@@ -601,7 +976,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
               setActiveEdit(null);
             }
           }}
-          className="w-28 px-2 py-1 text-right text-xs font-mono tabular-nums bg-white border border-teal-700 rounded text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
+          className="w-full max-w-[96px] px-1.5 py-0.5 text-right text-[11px] font-mono tabular-nums bg-white border border-teal-700 rounded text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-700/20"
         />
       );
     }
@@ -612,7 +987,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           type="button"
           onClick={() => setActiveEdit({ key: editKey, draft: String(round2(value)) })}
           title="Click to edit inline"
-          className={`group inline-flex items-center justify-end gap-1 px-1.5 py-0.5 -mr-1.5 rounded hover:bg-teal-50/80 transition-colors font-mono tabular-nums text-xs whitespace-nowrap ${
+          className={`group inline-flex items-center justify-end gap-0.5 px-1 py-0.5 -mr-1 rounded hover:bg-teal-50/80 transition-colors font-mono tabular-nums text-[11px] whitespace-nowrap ${
             options?.bold ? 'font-semibold text-slate-900' : 'text-slate-800'
           } ${options?.accent ? 'text-teal-900' : ''}`}
         >
@@ -725,10 +1100,16 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           <button
             type="button"
             onClick={handlePush}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900 transition-colors whitespace-nowrap shrink-0"
+            disabled={!canPushForecast}
+            title={
+              canPushForecast
+                ? `Push projected ${pnlState.projection_year} forecast to the Six-Year Horizon schedule`
+                : 'Import QBO transactions or enter projected figures before pushing to the 6-Year Horizon'
+            }
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900 disabled:opacity-45 disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0"
           >
             <Send className="w-3.5 h-3.5" />
-            Push Projected 2026 to Six-Year Schedule
+            Push Projected {pnlState.projection_year} to Six-Year Schedule
           </button>
         </div>
       </div>
@@ -773,16 +1154,16 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                 Single-File QuickBooks Online Transaction Ingestion
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Upload a QBO Transaction List by Date or General Ledger export (.csv or .xlsx), paste rows directly, or test immediately with Operating Support Services, LLC&apos;s 11/21/2026 ledger.
+                Upload a QBO Transaction List by Date or General Ledger export (.csv or .xlsx), paste rows directly, or load a sample transaction ledger to test cadence forecasting.
               </p>
             </div>
             <button
               type="button"
-              onClick={handleLoadSampleOss}
+              onClick={handleLoadSampleLedger}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-md hover:bg-teal-100/70 transition-colors whitespace-nowrap shrink-0"
             >
               <FileSpreadsheet className="w-3.5 h-3.5" />
-              Load Sample OSS QBO Transaction Ledger (1/1/2026–11/21/2026)
+              Load Sample QBO Transaction Ledger
             </button>
           </div>
 
@@ -835,7 +1216,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                 rows={5}
                 value={pasteText}
                 onChange={(e) => setPasteText(e.target.value)}
-                placeholder={'Date\tTransaction Type\tNum\tName\tMemo/Description\tAccount\tSplit\tAmount\n01/09/2026\tPayroll Check\t\tOSS Payroll — Bill\tBiweekly salary\tBlueVine Checking\tSalary -> Bill\t-892.81'}
+                placeholder={'Date\tTransaction Type\tNum\tName\tMemo/Description\tAccount\tSplit\tAmount\n01/15/2026\tPayroll Check\t\tOfficer Payroll\tBiweekly salary\tOperating Checking\tOfficer Compensation\t-2500.00'}
                 className="flex-1 w-full p-2.5 text-[11px] font-mono text-slate-800 bg-white border border-slate-200 rounded-md focus:outline-none focus:border-teal-700 resize-y"
               />
               <div className="flex items-center justify-end gap-2">
@@ -898,11 +1279,11 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={handleLoadSampleOss}
+              onClick={handleLoadSampleLedger}
               className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors whitespace-nowrap"
             >
               <RotateCcw className="w-3 h-3 text-slate-400" />
-              Reload Sample OSS Ledger
+              Reload Sample Ledger
             </button>
             <button
               type="button"
@@ -994,16 +1375,16 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                 No rows in this audit category.
               </div>
             ) : (
-              <div className="overflow-x-auto bg-white border border-slate-200 rounded-md max-h-64 overflow-y-auto">
-                <table className="w-full text-left border-collapse text-xs min-w-[720px]">
+              <div className="bg-white border border-slate-200 rounded-md max-h-64 overflow-y-auto">
+                <table className="w-full table-fixed text-left border-collapse text-xs">
                   <thead className="sticky top-0 bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600">
                     <tr>
-                      <th className="py-2 px-3">Date</th>
-                      <th className="py-2 px-3">Category</th>
-                      <th className="py-2 px-3">Vendor / Name</th>
-                      <th className="py-2 px-3">Account → Split</th>
-                      <th className="py-2 px-3 text-right">Amount</th>
-                      <th className="py-2 px-3">Audit Treatment</th>
+                      <th className="py-2 px-2.5 w-[11%]">Date</th>
+                      <th className="py-2 px-2.5 w-[16%]">Category</th>
+                      <th className="py-2 px-2.5 w-[20%]">Vendor / Name</th>
+                      <th className="py-2 px-2.5 w-[20%]">Account → Split</th>
+                      <th className="py-2 px-2.5 w-[11%] text-right">Amount</th>
+                      <th className="py-2 px-2.5 w-[22%]">Audit Treatment</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -1049,7 +1430,9 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
             {formatCurrencyExact(computed.totalRevenue.projected)}
           </div>
           <div className="text-xs text-slate-500 font-mono tabular-nums mt-1">
-            CA {computed.caPct.projected}% · AZ {computed.azPct.projected}%
+            {setup.multi_state_active
+              ? `${pCode} ${computed.caPct.projected}% · ${sCode} ${computed.azPct.projected}%`
+              : `${pCode} 100%`}
           </div>
         </div>
 
@@ -1059,10 +1442,10 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
             {formatCurrencyExact(computed.ordinaryBusinessIncome.projected)}
           </div>
           <div className="text-xs text-slate-500 font-mono tabular-nums mt-1">
-            2025 Filed {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
+            {priorYearLabel} {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
             {k1DiffFromSchedule !== null && Math.abs(k1DiffFromSchedule) >= 1
               ? ` · Schedule Δ ${formatCurrencyExact(k1DiffFromSchedule, true)}`
-              : ' · Synced w/ 2026'}
+              : ` · Synced w/ ${cadenceState.projection_year}`}
           </div>
         </div>
 
@@ -1077,75 +1460,156 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-lg p-4">
-          <div className="text-xs text-slate-500">Projected Ending Stock Basis</div>
-          <div
-            className={`text-xl font-bold font-mono tabular-nums mt-1 ${
-              computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
-            }`}
-          >
-            {formatCurrencyExact(computed.projectedEndingStockBasis)}
+        {showStockBasis && (
+          <div className="bg-white border border-slate-200 rounded-lg p-4">
+            <div className="text-xs text-slate-500">Projected Ending Stock Basis</div>
+            <div
+              className={`text-xl font-bold font-mono tabular-nums mt-1 ${
+                computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
+              }`}
+            >
+              {formatCurrencyExact(computed.projectedEndingStockBasis)}
+            </div>
+            <div
+              className={`text-xs font-medium mt-1 ${
+                computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
+              }`}
+            >
+              {computed.drawsExceedBasis
+                ? `Alert: Excess gain ${formatCurrencyExact(computed.projectedExcessDistributionGain)}`
+                : `Safe · Cushion before draws ${formatCurrencyExact(
+                    computed.basisAvailableBeforeDraws - computed.projectedDrawsTotal
+                  )}`}
+            </div>
           </div>
-          <div
-            className={`text-xs font-medium mt-1 ${
-              computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
-            }`}
-          >
-            {computed.drawsExceedBasis
-              ? `Alert: Excess gain ${formatCurrencyExact(computed.projectedExcessDistributionGain)}`
-              : `Safe · Cushion before draws ${formatCurrencyExact(
-                  computed.basisAvailableBeforeDraws - computed.projectedDrawsTotal
-                )}`}
-          </div>
-        </div>
+        )}
+      </div>
+
+      {/* Planning Goals & Guardrails Selector (Live Evaluation + Auto-Included in CPA Package & CSV) */}
+      <div className="no-print">
+        <PlanningGoalsPanel
+          setup={setup}
+          goals={planningGoals}
+          computed={computed}
+          pnlState={pnlState}
+          onUpdateGoals={onUpdatePlanningGoals}
+        />
       </div>
 
       {/* ================================================================= */}
       {/* 1. Interactive Detected Cadence & Remaining-Year Schedule Drawer  */}
       {/* ================================================================= */}
       <section className="no-print bg-white border border-slate-200 rounded-lg overflow-hidden">
-        <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
-          <button
-            type="button"
-            onClick={() => setShowCadenceDrawer((v) => !v)}
-            className="flex items-start gap-2 text-left"
-          >
-            {showCadenceDrawer ? (
-              <ChevronDown className="w-4 h-4 text-slate-500 mt-0.5 shrink-0" />
-            ) : (
-              <ChevronRight className="w-4 h-4 text-slate-500 mt-0.5 shrink-0" />
-            )}
-            <div>
-              <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
-                <CalendarClock className="w-4 h-4 text-teal-800 shrink-0" />
-                <span>1. Detected Cadence &amp; Remaining-Year Schedule</span>
-              </h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                {forecast.streams.length} vendor/account streams · Mode A counts exact calendar occurrences after {forecast.asOfDate} through 12/31; Mode B projects variable pace ({forecast.remainingDays}/{forecast.elapsedDays}d); Mode C defaults one-time/discretionary items to $0.
-              </p>
+        <div className="px-4 py-3.5 border-b border-slate-200 space-y-2.5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <button
+              type="button"
+              onClick={() => setShowCadenceDrawer((v) => !v)}
+              className="flex items-start gap-2 text-left min-w-0 flex-1"
+            >
+              {showCadenceDrawer ? (
+                <ChevronDown className="w-4 h-4 text-slate-500 mt-0.5 shrink-0" />
+              ) : (
+                <ChevronRight className="w-4 h-4 text-slate-500 mt-0.5 shrink-0" />
+              )}
+              <div className="min-w-0">
+                <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+                  <CalendarClock className="w-4 h-4 text-teal-800 shrink-0" />
+                  <span>1. Detected Cadence &amp; Remaining-Year Schedule</span>
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5 leading-snug">
+                  {isCategoryMode
+                    ? `${forecast.categoryCount} operational P&L categories (from ${forecast.granularStreamCount} streams · Balance Sheet excluded) · Toggle lumpy lines to Exp. Smooth (α=${forecast.expSmoothAlpha.toFixed(2)}) in 1 click.`
+                    : `${forecast.granularStreamCount} vendor/account streams · Mode A counts calendar occurrences after ${forecast.asOfDate} through 12/31; Mode B projects variable pace (${forecast.remainingDays}/${forecast.elapsedDays}d); Mode C defaults discretionary items to $0.`}
+                </p>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={handlePush}
+              disabled={!canPushForecast}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-800 rounded-md hover:bg-teal-900 disabled:opacity-45 disabled:cursor-not-allowed shadow-xs transition-colors whitespace-nowrap shrink-0"
+              title={
+                canPushForecast
+                  ? `Push projected ${pnlState.projection_year} state-split Gross Revenue, Officer W-2, SEHI, Operating Expenses, and Member Draws directly into the Six-Year Horizon schedule`
+                  : 'Import QBO transactions or enter projected figures before pushing to the 6-Year Horizon'
+              }
+            >
+              <Send className="w-3.5 h-3.5 shrink-0" />
+              <span>Push Forecast to 6-Year Horizon</span>
+            </button>
+          </div>
+
+          {pushToast && (
+            <div className="bg-emerald-50 border border-emerald-200 rounded-md px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs text-emerald-900">
+              <div className="flex items-center gap-2 min-w-0">
+                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                <span className="leading-snug">
+                  <strong className="font-semibold">{pushToast.taxYear} Horizon updated:</strong>{' '}
+                  K-1{' '}
+                  <span className="font-mono font-semibold tabular-nums">
+                    {formatCurrency(pushToast.newK1)}
+                  </span>{' '}
+                  <span className="font-mono text-emerald-800">
+                    ({formatSignedDelta(pushToast.k1Delta)})
+                  </span>{' '}
+                  · Total All-In Tax{' '}
+                  <span className="font-mono font-semibold tabular-nums">
+                    {formatCurrency(pushToast.newAllInTax)}
+                  </span>{' '}
+                  <span className="font-mono text-emerald-800">
+                    ({formatSignedDelta(pushToast.taxDelta)})
+                  </span>
+                </span>
+              </div>
+              <div className="flex items-center gap-3 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => onNavigate('horizon')}
+                  className="inline-flex items-center gap-1 font-semibold text-teal-800 hover:text-teal-950 whitespace-nowrap"
+                >
+                  <span>View 6-Year Horizon</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPushToast(null)}
+                  className="text-emerald-700 hover:text-emerald-950"
+                  aria-label="Dismiss push confirmation"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
-          </button>
+          )}
 
           {showCadenceDrawer && (
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
               <div className="relative">
                 <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   type="text"
                   value={streamSearch}
                   onChange={(e) => setStreamSearch(e.target.value)}
-                  placeholder="Filter vendor or account..."
-                  className="pl-8 pr-3 py-1.5 text-xs bg-white border border-slate-200 rounded-md text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-teal-700 w-52"
+                  placeholder={
+                    isCategoryMode
+                      ? 'Filter P&L category or payee...'
+                      : 'Filter vendor or account...'
+                  }
+                  className="pl-8 pr-3 py-1 text-xs bg-white border border-slate-200 rounded-md text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-teal-700 w-52"
                 />
               </div>
 
-              <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-md">
+              <div className="flex flex-wrap items-center gap-1 p-0.5 bg-slate-100 rounded-md">
                 {(
                   [
                     ['all', `All (${streamCounts.all})`],
                     ['cadence', `Cadence (${streamCounts.cadence})`],
                     ['exp_smooth', `Exp. Smooth (${streamCounts.exp_smooth})`],
-                    ['run_rate', `Run-Rate (${streamCounts.run_rate})`],
+                    ...(!isCategoryMode || streamCounts.run_rate > 0
+                      ? ([['run_rate', `Run-Rate (${streamCounts.run_rate})`]] as const)
+                      : []),
                     ['one_time', `Exclude $0 (${streamCounts.one_time})`],
                     ...(streamCounts.flagged > 0
                       ? ([['flagged', `Flagged (${streamCounts.flagged})`]] as const)
@@ -1156,8 +1620,8 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                   <button
                     key={tab}
                     type="button"
-                    onClick={() => setStreamFilter(tab)}
-                    className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors whitespace-nowrap ${
+                    onClick={() => handleSelectStreamFilter(tab)}
+                    className={`px-2 py-1 text-[11px] font-medium rounded transition-colors whitespace-nowrap ${
                       streamFilter === tab
                         ? 'bg-white text-slate-900 shadow-xs'
                         : 'text-slate-600 hover:text-slate-900'
@@ -1171,14 +1635,306 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           )}
         </div>
 
+        {/* Active-Only Filter Bar ("Hide Excl. $0 Rows") + P&L Category / Granular View Mode + Payee Aliases */}
+        {showCadenceDrawer && (
+          <datalist id="canonical-payee-suggestions">
+            {canonicalPayeeSuggestions.map((name) => (
+              <option key={name} value={name} />
+            ))}
+          </datalist>
+        )}
+
+        {showCadenceDrawer && (
+          <div className="px-5 py-2.5 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex flex-wrap items-center gap-2.5">
+              {/* Group by P&L Category vs Granular Streams View Switch */}
+              <div
+                role="group"
+                aria-label="Forecast row grouping mode"
+                className="inline-flex items-center p-0.5 bg-slate-100 rounded-md border border-slate-200/90"
+              >
+                <button
+                  type="button"
+                  onClick={() => handleGroupingModeChange('category')}
+                  aria-pressed={isCategoryMode}
+                  title="Roll up operational P&L transactions into clean P&L categories (excludes bank/card/equity/liability Balance Sheet accounts while preserving multi-state revenue sourcing, 50% Meals, and Schedule K tax rules)."
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                    isCategoryMode
+                      ? 'bg-teal-800 text-white shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Layers className="w-3.5 h-3.5 shrink-0" />
+                  <span>Group by P&amp;L Category ({forecast.categoryCount})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleGroupingModeChange('stream')}
+                  aria-pressed={!isCategoryMode}
+                  title="View and forecast every individual vendor/description stream separately."
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                    !isCategoryMode
+                      ? 'bg-teal-800 text-white shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <List className="w-3.5 h-3.5 shrink-0" />
+                  <span>Granular Streams ({forecast.granularStreamCount})</span>
+                </button>
+              </div>
+
+              <span aria-hidden="true" className="text-slate-300 hidden sm:inline">|</span>
+
+              <button
+                type="button"
+                role="switch"
+                aria-checked={hideExcludedZeroRows}
+                onClick={handleToggleHideExcludedZero}
+                title="Display-only filter — hides Excl. $0 rows while reviewing without altering YTD totals, remaining projections, or CPA report numbers."
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium border transition-colors whitespace-nowrap ${
+                  hideExcludedZeroRows
+                    ? 'bg-teal-800 text-white border-teal-800 hover:bg-teal-900'
+                    : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                }`}
+              >
+                {hideExcludedZeroRows ? (
+                  <EyeOff className="w-3.5 h-3.5 shrink-0" />
+                ) : (
+                  <Eye className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                )}
+                <span>Hide Excl. $0 Rows</span>
+              </button>
+
+              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-mono tabular-nums bg-slate-100 text-slate-700 border border-slate-200/80">
+                {hideExcludedZeroRows
+                  ? `Showing ${filteredStreams.length} active ${
+                      isCategoryMode
+                        ? filteredStreams.length === 1
+                          ? 'category'
+                          : 'categories'
+                        : filteredStreams.length === 1
+                        ? 'stream'
+                        : 'streams'
+                    } · ${hiddenExcludedZeroCount} Excl. $0 hidden`
+                  : `Showing ${filteredStreams.length} of ${streamCounts.all} ${
+                      isCategoryMode
+                        ? streamCounts.all === 1
+                          ? 'category'
+                          : 'categories'
+                        : streamCounts.all === 1
+                        ? 'stream'
+                        : 'streams'
+                    } · ${streamCounts.one_time} Excl. $0`}
+              </span>
+              {hideExcludedZeroRows && (
+                <span className="text-[11px] text-slate-400 hidden xl:inline">
+                  Display filter only · YTD &amp; CPA totals unchanged
+                </span>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowAliasPanel((v) => !v)}
+              aria-expanded={showAliasPanel}
+              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-medium border transition-colors whitespace-nowrap ${
+                showAliasPanel || payeeAliases.length > 0
+                  ? 'bg-teal-50 text-teal-900 border-teal-200 hover:bg-teal-100/70'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <GitMerge className="w-3.5 h-3.5 text-teal-700 shrink-0" />
+              <span>
+                Payee / Description Aliases ({payeeAliases.length}
+                {forecast.aliasedTransactionCount > 0
+                  ? ` · ${forecast.aliasedTransactionCount} txns`
+                  : ''}
+                )
+              </span>
+              {showAliasPanel ? (
+                <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+              )}
+            </button>
+          </div>
+        )}
+
+        {/* Collapsible Payee / Description Aliases Panel */}
+        {showCadenceDrawer && showAliasPanel && (
+          <div className="px-5 py-4 bg-slate-50/70 border-b border-slate-200 space-y-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                  <GitMerge className="w-3.5 h-3.5 text-teal-800" />
+                  <span>Payee / Description Alias Rules (Merge Split Descriptions)</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Rules run before stream grouping, cadence detection, run-rate, and exponential smoothing so split descriptions (e.g., &ldquo;PayPal&rdquo; → &ldquo;Cowie Pokey&rdquo;) combine into one unified stream. Saved automatically in browser storage.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAliasPanel(false)}
+                className="text-[11px] text-slate-500 hover:text-slate-800 inline-flex items-center gap-1"
+              >
+                <X className="w-3.5 h-3.5" />
+                Collapse
+              </button>
+            </div>
+
+            <form
+              onSubmit={handleSubmitAliasForm}
+              className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end bg-white border border-slate-200 rounded-md p-3"
+            >
+              <div className="sm:col-span-4">
+                <label className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                  Raw Import Text / Pattern
+                </label>
+                <input
+                  type="text"
+                  value={aliasPatternDraft}
+                  onChange={(e) => setAliasPatternDraft(e.target.value)}
+                  placeholder='e.g., PayPal or AMZN Mktp'
+                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-200 rounded text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-teal-700"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                  Match Mode
+                </label>
+                <select
+                  value={aliasMatchTypeDraft}
+                  onChange={(e) => setAliasMatchTypeDraft(e.target.value as PayeeAliasMatchType)}
+                  className="w-full px-2 py-1.5 text-xs bg-white border border-slate-200 rounded text-slate-800 focus:outline-none focus:border-teal-700"
+                >
+                  <option value="contains">Contains</option>
+                  <option value="exact">Exact match</option>
+                </select>
+              </div>
+
+              <div className="sm:col-span-4">
+                <label className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                  Canonical Payee / Stream Name
+                </label>
+                <input
+                  type="text"
+                  list="canonical-payee-suggestions"
+                  value={aliasCanonicalDraft}
+                  onChange={(e) => setAliasCanonicalDraft(e.target.value)}
+                  placeholder="e.g., Cowie Pokey"
+                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-200 rounded text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-teal-700"
+                />
+              </div>
+
+              <div className="sm:col-span-2 flex items-center gap-1.5">
+                <button
+                  type="submit"
+                  disabled={!aliasPatternDraft.trim() || !aliasCanonicalDraft.trim()}
+                  className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-teal-800 rounded hover:bg-teal-900 disabled:opacity-40 disabled:cursor-default transition-colors whitespace-nowrap"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  {editingAliasId ? 'Save' : 'Add Rule'}
+                </button>
+                {editingAliasId && (
+                  <button
+                    type="button"
+                    onClick={handleCancelEditAlias}
+                    className="px-2 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50"
+                  >
+                    Cancel
+                  </button>
+                )}
+              </div>
+            </form>
+
+            {payeeAliases.length === 0 ? (
+              <div className="text-[11px] text-slate-500 bg-white border border-dashed border-slate-200 rounded-md px-3 py-2.5">
+                No alias rules configured yet. Add a rule above—or click{' '}
+                <span className="font-medium text-slate-700">Merge / Alias</span> on any stream row
+                below—to combine split payee descriptions into a single stream.
+              </div>
+            ) : (
+              <div className="bg-white border border-slate-200 rounded-md overflow-hidden">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead className="bg-slate-50 border-b border-slate-200 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                    <tr>
+                      <th className="py-1.5 px-3">Raw Pattern</th>
+                      <th className="py-1.5 px-2.5">Match</th>
+                      <th className="py-1.5 px-3">Canonical Payee / Stream</th>
+                      <th className="py-1.5 px-3 text-right">Matched Txns</th>
+                      <th className="py-1.5 px-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {payeeAliases.map((rule) => {
+                      const matches = forecast.aliasMatchCounts[rule.id] ?? 0;
+                      const isEditing = editingAliasId === rule.id;
+                      return (
+                        <tr
+                          key={rule.id}
+                          className={isEditing ? 'bg-teal-50/40' : 'hover:bg-slate-50/70'}
+                        >
+                          <td className="py-1.5 px-3 font-mono text-slate-800">
+                            &ldquo;{rule.pattern}&rdquo;
+                          </td>
+                          <td className="py-1.5 px-2.5 text-[11px] text-slate-600 whitespace-nowrap">
+                            {rule.match_type === 'exact' ? 'Exact' : 'Contains'}
+                          </td>
+                          <td className="py-1.5 px-3 font-medium text-slate-900">
+                            <span className="text-slate-400 mr-1.5">→</span>
+                            {rule.canonical_name}
+                          </td>
+                          <td className="py-1.5 px-3 text-right font-mono tabular-nums text-[11px]">
+                            <span className={matches > 0 ? 'text-teal-800 font-medium' : 'text-slate-400'}>
+                              {matches} {matches === 1 ? 'txn' : 'txns'}
+                            </span>
+                          </td>
+                          <td className="py-1.5 px-3 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleStartEditAlias(rule)}
+                                className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-teal-800"
+                              >
+                                <Pencil className="w-3 h-3" />
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteAlias(rule.id)}
+                                className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-red-700"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                Delete
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Monthly Exponential Smoothing Controls Toolbar */}
         {showCadenceDrawer && (
           <div className="px-5 py-2.5 bg-slate-50/80 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs">
             <div className="flex flex-wrap items-center gap-3">
               <div className="flex items-center gap-2">
-                <span className="font-semibold text-slate-700 whitespace-nowrap">
-                  Exp. Smooth α
-                </span>
+                <ExpSmoothHoverTooltip>
+                  <span
+                    tabIndex={0}
+                    className="inline-flex items-center gap-1 font-semibold text-slate-700 whitespace-nowrap cursor-help focus:outline-none focus:text-teal-800"
+                  >
+                    <span>Exp. Smooth α</span>
+                    <Info className="w-3.5 h-3.5 text-slate-400 shrink-0" aria-hidden="true" />
+                  </span>
+                </ExpSmoothHoverTooltip>
                 <input
                   type="range"
                   aria-label="Exponential smoothing factor alpha"
@@ -1236,10 +1992,16 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                 type="button"
                 onClick={handleApplyExpSmoothToVariable}
                 disabled={variableEligibleStreams.length === 0}
-                title="Applies Monthly Exp. Smooth to all variable Run-Rate streams with 2+ active months, keeping Cadence bills, Exclude ($0) items, and Manual overrides untouched."
+                title={
+                  isCategoryMode
+                    ? 'Switches all irregular/lumpy P&L categories with 2+ active months to Monthly Exp. Smooth, keeping exact calendar-scheduled categories, Exclude ($0) items, and Manual overrides untouched.'
+                    : 'Applies Monthly Exp. Smooth to all variable Run-Rate streams with 2+ active months, keeping Cadence bills, Exclude ($0) items, and Manual overrides untouched.'
+                }
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium text-teal-900 bg-teal-50 border border-teal-200 rounded hover:bg-teal-100/80 disabled:opacity-40 disabled:cursor-default transition-colors whitespace-nowrap"
               >
-                Apply Exp. Smooth to Variable Streams ({variableEligibleStreams.length})
+                {isCategoryMode
+                  ? `Exp. Smooth Irregular Categories (${variableEligibleStreams.length})`
+                  : `Apply Exp. Smooth to Variable Streams (${variableEligibleStreams.length})`}
               </button>
               {variableOnExpSmoothCount > 0 && (
                 <button
@@ -1247,7 +2009,9 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                   onClick={handleRevertVariableToRunRate}
                   className="px-2 py-1 text-[11px] font-medium text-slate-600 hover:text-slate-900 underline whitespace-nowrap"
                 >
-                  Revert Variable to Run-Rate ({variableOnExpSmoothCount})
+                  {isCategoryMode
+                    ? `Revert Irregular to Cadence (${variableOnExpSmoothCount})`
+                    : `Revert Variable to Run-Rate (${variableOnExpSmoothCount})`}
                 </button>
               )}
             </div>
@@ -1255,23 +2019,76 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
         )}
 
         {showCadenceDrawer && (
-          <div className="overflow-x-auto max-h-[460px] overflow-y-auto">
+          <div className="max-h-[540px] overflow-y-auto overflow-x-hidden">
             {filteredStreams.length === 0 ? (
               <div className="py-10 px-6 text-center text-xs text-slate-500">
-                No vendor/account streams match your current filter.
+                {isCategoryMode
+                  ? 'No P&L categories match your current filter.'
+                  : 'No vendor/account streams match your current filter.'}
               </div>
             ) : (
-              <table className="w-full text-left border-collapse min-w-[1080px]">
+              <table className="w-full table-fixed text-left border-collapse">
+                <colgroup>
+                  {isCategoryMode ? (
+                    <>
+                      <col className="w-[20%]" />
+                      <col className="w-[14.5%]" />
+                      <col className="w-[16.5%]" />
+                      <col className="w-[10%]" />
+                      <col className="w-[10.5%]" />
+                      <col className="w-[10%]" />
+                      <col className="w-[18.5%]" />
+                    </>
+                  ) : (
+                    <>
+                      <col className="w-[19%]" />
+                      <col className="w-[13%]" />
+                      <col className="w-[15%]" />
+                      <col className="w-[9%]" />
+                      <col className="w-[8.5%]" />
+                      <col className="w-[6.5%]" />
+                      <col className="w-[10.5%]" />
+                      <col className="w-[18.5%]" />
+                    </>
+                  )}
+                </colgroup>
                 <thead className="sticky top-0 z-10 bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600">
                   <tr>
-                    <th className="py-2.5 px-4">Vendor / Stream</th>
-                    <th className="py-2.5 px-3">Target Line Item</th>
-                    <th className="py-2.5 px-3">Detected Cadence / Basis</th>
-                    <th className="py-2.5 px-3 text-right">YTD Actual</th>
-                    <th className="py-2.5 px-3 text-right">Latest Amt</th>
-                    <th className="py-2.5 px-3 text-right">Rem. Basis</th>
-                    <th className="py-2.5 px-3 text-right">Remaining Forecast ($)</th>
-                    <th className="py-2.5 px-4 text-right">Forecast Mode (1-Click)</th>
+                    <th className="py-2 px-2.5">
+                      {isCategoryMode ? 'P&L Category' : 'Vendor / Stream'}
+                    </th>
+                    <th className="py-2 px-2">
+                      {isCategoryMode ? '1120-S / Tax Rule' : 'Target Line'}
+                    </th>
+                    <th className="py-2 px-2">
+                      {isCategoryMode ? 'Cadence / Smoothing' : 'Cadence / Basis'}
+                    </th>
+                    <th className="py-2 px-2 text-right">YTD Actual</th>
+                    {!isCategoryMode && (
+                      <>
+                        <th className="py-2 px-1.5 text-right">Latest</th>
+                        <th className="py-2 px-1.5 text-right">Basis</th>
+                      </>
+                    )}
+                    <th className="py-2 px-2 text-right">Remaining ($)</th>
+                    {isCategoryMode && (
+                      <th className="py-2 px-2 text-right">Proj. YE</th>
+                    )}
+                    <th className="py-2 px-2 text-right">
+                      {isCategoryMode ? (
+                        <ExpSmoothHoverTooltip>
+                          <span
+                            tabIndex={0}
+                            className="inline-flex items-center justify-end gap-1 cursor-help focus:outline-none focus:text-teal-800"
+                          >
+                            <span>Mode / Actions</span>
+                            <Info className="w-3 h-3 text-slate-400 shrink-0" aria-hidden="true" />
+                          </span>
+                        </ExpSmoothHoverTooltip>
+                      ) : (
+                        'Mode / Actions'
+                      )}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-xs">
@@ -1313,34 +2130,223 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                       `S_T = ${formatCurrencyExact(s.expSmoothLevel)} · ${s.expSmoothScaleNote} → ${formatCurrencyExact(s.expSmoothRemainingAmount)}`,
                     ].join('\n');
 
-                    return (
+                      const isQuickMergeOpen = quickMergeStreamKey === s.streamKey;
+                      const sameLinePeers = isQuickMergeOpen
+                        ? forecast.streams
+                            .filter(
+                              (peer) =>
+                                peer.targetLineId === s.targetLineId &&
+                                peer.streamKey !== s.streamKey
+                            )
+                            .slice(0, 6)
+                        : [];
+
+                      const projectedYearEnd = round2(s.ytdAmount + s.effectiveRemainingAmount);
+                      const taxRuleTag =
+                        s.targetLineId === 'ca_revenue'
+                          ? { label: `${pCode} Source`, cls: 'bg-sky-50 text-sky-800 border-sky-200' }
+                          : s.targetLineId === 'az_revenue'
+                          ? { label: `${sCode} Source`, cls: 'bg-amber-50 text-amber-800 border-amber-200' }
+                          : s.targetLineId === 'meals_gross'
+                          ? { label: '50% Meals · M-1', cls: 'bg-rose-50 text-rose-800 border-rose-200' }
+                          : s.targetLineId === 'schedule_k_interest'
+                          ? { label: 'Sch K · Separate', cls: 'bg-teal-50 text-teal-800 border-teal-200' }
+                          : null;
+
+                      const payeeTooltip =
+                        isCategoryMode && s.mergedRawVendors.length > 0
+                          ? `Included payees (${s.mergedRawVendors.length}): ${s.mergedRawVendors.join(', ')}`
+                          : undefined;
+
+                      return (
                       <tr key={s.streamKey} className="hover:bg-slate-50/60 transition-colors">
-                        <td className="py-2 px-4 align-top">
-                          <div className="font-medium text-slate-900">{s.vendor}</div>
-                          <div className="text-[11px] text-slate-400 mt-0.5 font-mono tabular-nums">
-                            {s.transactionCount} {s.transactionCount === 1 ? 'txn' : 'txns'} · last{' '}
-                            {s.latestDate}
-                            {s.sourceAccounts.length > 0 ? ` · ${s.sourceAccounts.join(', ')}` : ''}
+                        <td className="py-2 px-2.5 align-top break-words" title={payeeTooltip}>
+                          <div className="flex items-start justify-between gap-1.5">
+                            <div className="font-medium text-slate-900 leading-snug break-words min-w-0">
+                              {s.vendor}
+                            </div>
+                            {!isCategoryMode && (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenQuickMerge(s.streamKey, s.vendor)}
+                                title="Map this raw description to an existing or canonical payee name"
+                                className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-medium rounded border transition-colors whitespace-nowrap shrink-0 ${
+                                  isQuickMergeOpen
+                                    ? 'bg-teal-800 text-white border-teal-800'
+                                    : 'bg-white text-slate-500 border-slate-200 hover:text-teal-800 hover:border-teal-300'
+                                }`}
+                              >
+                                <GitMerge className="w-2.5 h-2.5" />
+                                Merge
+                              </button>
+                            )}
                           </div>
+                          <div className="text-[10px] text-slate-400 mt-0.5 font-mono tabular-nums leading-tight break-words">
+                            {isCategoryMode ? (
+                              <>
+                                {s.transactionCount} {s.transactionCount === 1 ? 'txn' : 'txns'}
+                                {s.subStreamCount
+                                  ? ` · ${s.subStreamCount} ${
+                                      s.subStreamCount === 1 ? 'payee' : 'payees'
+                                    }`
+                                  : ''}
+                                {' · '}last {s.latestDate}
+                              </>
+                            ) : (
+                              <>
+                                {s.transactionCount} {s.transactionCount === 1 ? 'txn' : 'txns'} ·{' '}
+                                {s.latestDate}
+                                {s.sourceAccounts.length > 0 ? ` · ${s.sourceAccounts.join(', ')}` : ''}
+                              </>
+                            )}
+                          </div>
+                          {isCategoryMode && s.mergedRawVendors.length > 0 && (
+                            <div className="text-[10px] text-slate-400 mt-0.5 leading-tight break-words line-clamp-2">
+                              {s.mergedRawVendors.slice(0, 3).join(', ')}
+                              {s.mergedRawVendors.length > 3
+                                ? ` +${s.mergedRawVendors.length - 3} more`
+                                : ''}
+                            </div>
+                          )}
+                          {!isCategoryMode && s.isAliased && (
+                            <div className="text-[10px] text-teal-800 mt-0.5 flex items-start gap-1 break-words">
+                              <GitMerge className="w-3 h-3 shrink-0 mt-0.5" />
+                              <span className="leading-tight">
+                                Aliased ({s.appliedAliasCount}{' '}
+                                {s.appliedAliasCount === 1 ? 'txn' : 'txns'}
+                                {s.mergedRawVendors.length > 1
+                                  ? ` · merged: ${s.mergedRawVendors.join(', ')}`
+                                  : s.mergedRawVendors.length === 1 &&
+                                      s.mergedRawVendors[0].toLowerCase() !==
+                                        s.vendor.toLowerCase()
+                                    ? ` · from: ${s.mergedRawVendors[0]}`
+                                    : ''}
+                                )
+                              </span>
+                            </div>
+                          )}
                           {s.hasTransferFlag && s.flaggedTransferNote && (
-                            <div className="text-[11px] text-amber-700 mt-0.5 flex items-center gap-1">
-                              <AlertTriangle className="w-3 h-3 shrink-0" />
+                            <div className="text-[10px] text-amber-700 mt-0.5 flex items-start gap-1 leading-tight break-words">
+                              <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
                               <span>{s.flaggedTransferNote}</span>
                             </div>
                           )}
+                          {!isCategoryMode && isQuickMergeOpen && (
+                            <div className="mt-2 p-2.5 bg-slate-50 border border-teal-200 rounded-md space-y-2">
+                              <div className="flex items-center justify-between gap-2 text-[10px] font-semibold text-teal-900">
+                                <span>Merge &ldquo;{s.vendor}&rdquo; into canonical payee</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setQuickMergeStreamKey(null)}
+                                  className="text-slate-400 hover:text-slate-700"
+                                  aria-label="Close merge editor"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              </div>
+
+                              {sameLinePeers.length > 0 && (
+                                <div className="space-y-1">
+                                  <div className="text-[10px] text-slate-500">
+                                    1-click merge into stream on {targetLabel}:
+                                  </div>
+                                  <div className="flex flex-wrap gap-1">
+                                    {sameLinePeers.map((peer) => (
+                                      <button
+                                        key={peer.streamKey}
+                                        type="button"
+                                        onClick={() =>
+                                          handleApplyQuickMerge(
+                                            quickMergePattern || s.vendor,
+                                            peer.vendor,
+                                            quickMergeMatchType
+                                          )
+                                        }
+                                        className="px-2 py-0.5 text-[10px] font-medium text-teal-900 bg-white border border-teal-200 rounded hover:bg-teal-50 transition-colors"
+                                      >
+                                        → {peer.vendor}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <input
+                                  type="text"
+                                  value={quickMergePattern}
+                                  onChange={(e) => setQuickMergePattern(e.target.value)}
+                                  placeholder="Match text"
+                                  className="w-28 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded text-slate-800 focus:outline-none focus:border-teal-700"
+                                />
+                                <select
+                                  value={quickMergeMatchType}
+                                  onChange={(e) =>
+                                    setQuickMergeMatchType(e.target.value as PayeeAliasMatchType)
+                                  }
+                                  className="px-1.5 py-1 text-[11px] bg-white border border-slate-200 rounded text-slate-700 focus:outline-none focus:border-teal-700"
+                                >
+                                  <option value="contains">Contains</option>
+                                  <option value="exact">Exact</option>
+                                </select>
+                                <span className="text-[11px] text-slate-400">→</span>
+                                <input
+                                  type="text"
+                                  list="canonical-payee-suggestions"
+                                  value={quickMergeCanonical}
+                                  onChange={(e) => setQuickMergeCanonical(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      handleApplyQuickMerge(
+                                        quickMergePattern,
+                                        quickMergeCanonical,
+                                        quickMergeMatchType
+                                      );
+                                    } else if (e.key === 'Escape') {
+                                      setQuickMergeStreamKey(null);
+                                    }
+                                  }}
+                                  placeholder="Canonical payee name..."
+                                  className="flex-1 min-w-[140px] px-2 py-1 text-[11px] bg-white border border-slate-200 rounded text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-teal-700"
+                                />
+                                <button
+                                  type="button"
+                                  disabled={!quickMergePattern.trim() || !quickMergeCanonical.trim()}
+                                  onClick={() =>
+                                    handleApplyQuickMerge(
+                                      quickMergePattern,
+                                      quickMergeCanonical,
+                                      quickMergeMatchType
+                                    )
+                                  }
+                                  className="px-2.5 py-1 text-[11px] font-medium text-white bg-teal-800 rounded hover:bg-teal-900 disabled:opacity-40 transition-colors whitespace-nowrap"
+                                >
+                                  Apply
+                                </button>
+                              </div>
+                            </div>
+                          )}
                         </td>
-                        <td className="py-2 px-3 align-top text-slate-700 whitespace-nowrap">
-                          {targetLabel}
+                        <td className="py-2 px-2 align-top text-[11px] text-slate-700 leading-snug break-words">
+                          <div>{targetLabel}</div>
+                          {isCategoryMode && taxRuleTag && (
+                            <span
+                              className={`inline-block mt-0.5 px-1.5 py-0.2 text-[10px] font-medium rounded border whitespace-nowrap ${taxRuleTag.cls}`}
+                            >
+                              {taxRuleTag.label}
+                            </span>
+                          )}
                         </td>
                         <td
-                          className={`py-2 px-3 align-top text-[11px] font-mono ${cadenceTone}`}
+                          className={`py-2 px-2 align-top text-[11px] font-mono leading-snug break-words ${cadenceTone}`}
                           title={monthlyTooltip}
                         >
                           {s.activeMode === 'exp_smooth' ? (
                             <div>
                               <div>
                                 Exp. Smooth (α={forecast.expSmoothAlpha.toFixed(2)}) ·{' '}
-                                {s.monthlySeries.length} mos
+                                {s.monthlySeries.length}m
                               </div>
                               <div className="text-[10px] text-slate-500 font-normal tabular-nums mt-0.5">
                                 {latestMonthShort} {formatCurrencyExact(s.latestMonthActual)} → S
@@ -1353,28 +2359,33 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                           ) : (
                             <div>
                               <div>{s.cadenceLabel}</div>
-                              {s.activeMonthCount >= 2 && s.detectedMode === 'run_rate' && (
-                                <div className="text-[10px] text-slate-400 font-normal tabular-nums mt-0.5">
-                                  SES (α={forecast.expSmoothAlpha.toFixed(2)}):{' '}
-                                  {formatCurrencyExact(s.expSmoothRemainingAmount)}
-                                </div>
-                              )}
+                              {s.activeMonthCount >= 2 &&
+                                (isCategoryMode || s.detectedMode === 'run_rate') && (
+                                  <div className="text-[10px] text-slate-400 font-normal tabular-nums mt-0.5">
+                                    SES ({forecast.expSmoothAlpha.toFixed(2)}):{' '}
+                                    {formatCurrencyExact(s.expSmoothRemainingAmount)}
+                                  </div>
+                                )}
                             </div>
                           )}
                         </td>
-                        <td className="py-2 px-3 align-top text-right font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                        <td className="py-2 px-2 align-top text-right font-mono tabular-nums text-[11px] text-slate-700 whitespace-nowrap">
                           {formatCurrencyExact(s.ytdAmount)}
                         </td>
-                        <td className="py-2 px-3 align-top text-right font-mono tabular-nums text-slate-600 whitespace-nowrap">
-                          {formatCurrencyExact(s.latestAmount)}
-                        </td>
-                        <td
-                          className="py-2 px-3 align-top text-right font-mono tabular-nums text-slate-600 whitespace-nowrap"
-                          title={monthlyTooltip}
-                        >
-                          {remCountDisplay}
-                        </td>
-                        <td className="py-2 px-3 align-top text-right bg-teal-50/15">
+                        {!isCategoryMode && (
+                          <>
+                            <td className="py-2 px-1.5 align-top text-right font-mono tabular-nums text-[11px] text-slate-600 whitespace-nowrap">
+                              {formatCurrencyExact(s.latestAmount)}
+                            </td>
+                            <td
+                              className="py-2 px-1.5 align-top text-right font-mono tabular-nums text-[11px] text-slate-600 whitespace-nowrap"
+                              title={monthlyTooltip}
+                            >
+                              {remCountDisplay}
+                            </td>
+                          </>
+                        )}
+                        <td className="py-2 px-2 align-top text-right bg-teal-50/15">
                           {renderEditableCell(
                             `stream:${s.streamKey}`,
                             s.effectiveRemainingAmount,
@@ -1385,64 +2396,174 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                             }
                           )}
                         </td>
-                        <td className="py-2 px-4 align-top text-right whitespace-nowrap">
-                          <div className="inline-flex items-center gap-1.5">
-                            <div
-                              role="group"
-                              aria-label={`Forecast mode for ${s.vendor}`}
-                              className="inline-flex items-center bg-slate-100 p-0.5 rounded border border-slate-200/80"
-                            >
-                              {(
-                                [
-                                  ['cadence', 'Cadence'],
-                                  ['exp_smooth', 'Exp. Smooth'],
-                                  ['run_rate', 'Run-Rate'],
-                                  ['manual', 'Manual'],
-                                  ['one_time', 'Exclude $0'],
-                                ] as const
-                              ).map(([modeKey, modeLabel]) => {
-                                const isActive = s.activeMode === modeKey;
-                                return (
+                        {isCategoryMode && (
+                          <td className="py-2 px-2 align-top text-right font-mono tabular-nums text-[11px] font-semibold text-slate-900 whitespace-nowrap">
+                            {formatCurrencyExact(projectedYearEnd)}
+                          </td>
+                        )}
+                        <td className="py-2 px-2 align-top text-right">
+                          {isCategoryMode ? (
+                            <div className="flex flex-col items-end gap-1">
+                              <div
+                                role="group"
+                                aria-label={`Forecast mode for ${s.vendor}`}
+                                className="inline-flex flex-wrap justify-end items-center bg-slate-100 p-0.5 rounded border border-slate-200/80"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleStreamModeChange(
+                                      s.streamKey,
+                                      'cadence',
+                                      s.effectiveRemainingAmount
+                                    )
+                                  }
+                                  className={`px-1.5 py-0.5 text-[10px] font-medium rounded transition-colors whitespace-nowrap ${
+                                    s.activeMode === 'cadence'
+                                      ? 'bg-teal-800 text-white shadow-xs'
+                                      : 'text-slate-600 hover:text-slate-900'
+                                  }`}
+                                >
+                                  Cadence
+                                </button>
+                                <ExpSmoothHoverTooltip>
                                   <button
-                                    key={modeKey}
                                     type="button"
+                                    role="switch"
+                                    aria-checked={s.activeMode === 'exp_smooth'}
                                     onClick={() =>
-                                      handleStreamModeChange(
+                                      handleToggleCategoryExpSmooth(
                                         s.streamKey,
-                                        modeKey,
-                                        s.effectiveRemainingAmount
+                                        s.activeMode,
+                                        s.detectedMode
                                       )
                                     }
-                                    className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors whitespace-nowrap ${
-                                      isActive
-                                        ? modeKey === 'cadence'
-                                          ? 'bg-teal-800 text-white shadow-xs'
-                                          : modeKey === 'exp_smooth'
-                                          ? 'bg-sky-700 text-white shadow-xs'
-                                          : modeKey === 'manual'
-                                          ? 'bg-amber-700 text-white shadow-xs'
-                                          : modeKey === 'one_time'
-                                          ? 'bg-slate-700 text-white shadow-xs'
-                                          : 'bg-white text-slate-900 shadow-xs'
-                                        : 'text-slate-600 hover:text-slate-900'
+                                    className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-medium rounded transition-colors whitespace-nowrap ${
+                                      s.activeMode === 'exp_smooth'
+                                        ? 'bg-sky-700 text-white shadow-xs'
+                                        : 'text-slate-600 hover:text-sky-800'
                                     }`}
                                   >
-                                    {modeLabel}
+                                    <span>Smooth</span>
                                   </button>
-                                );
-                              })}
+                                </ExpSmoothHoverTooltip>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleStreamModeChange(
+                                      s.streamKey,
+                                      'one_time',
+                                      s.effectiveRemainingAmount
+                                    )
+                                  }
+                                  title="Set remaining forecast to $0"
+                                  className={`px-1.5 py-0.5 text-[10px] font-medium rounded transition-colors whitespace-nowrap ${
+                                    s.activeMode === 'one_time'
+                                      ? 'bg-slate-700 text-white shadow-xs'
+                                      : 'text-slate-600 hover:text-slate-900'
+                                  }`}
+                                >
+                                  Set $0
+                                </button>
+                              </div>
+
+                              {(s.activeMode === 'manual' || s.isOverridden) && (
+                                <div className="inline-flex items-center gap-1.5">
+                                  {s.activeMode === 'manual' && (
+                                    <span className="px-1.5 py-0.2 text-[10px] font-medium rounded bg-amber-100 text-amber-800 border border-amber-200">
+                                      Manual
+                                    </span>
+                                  )}
+                                  {s.isOverridden && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleResetStreamOverride(s.streamKey)}
+                                      title="Reset category to default Cadence baseline"
+                                      className="text-[10px] font-medium text-teal-700 hover:text-teal-900 underline whitespace-nowrap"
+                                    >
+                                      Reset
+                                    </button>
+                                  )}
+                                </div>
+                              )}
                             </div>
-                            {s.isOverridden && (
-                              <button
-                                type="button"
-                                onClick={() => handleResetStreamOverride(s.streamKey)}
-                                title="Reset to auto-detected cadence"
-                                className="text-[10px] text-teal-700 hover:text-teal-900 underline"
+                          ) : (
+                            <div className="flex flex-col items-end gap-1">
+                              <div
+                                role="group"
+                                aria-label={`Forecast mode for ${s.vendor}`}
+                                className="inline-flex flex-wrap justify-end items-center gap-0.5 bg-slate-100 p-0.5 rounded border border-slate-200/80"
                               >
-                                Reset
-                              </button>
-                            )}
-                          </div>
+                                {(
+                                  [
+                                    ['cadence', 'Cad'],
+                                    ['exp_smooth', 'Smooth'],
+                                    ['run_rate', 'Rate'],
+                                    ['manual', 'Man'],
+                                    ['one_time', 'Set $0'],
+                                  ] as const
+                                ).map(([modeKey, modeLabel]) => {
+                                  const isActive = s.activeMode === modeKey;
+                                  const modeButton = (
+                                    <button
+                                      key={modeKey}
+                                      type="button"
+                                      onClick={() =>
+                                        handleStreamModeChange(
+                                          s.streamKey,
+                                          modeKey,
+                                          s.effectiveRemainingAmount
+                                        )
+                                      }
+                                      title={
+                                        modeKey === 'cadence'
+                                          ? 'Calendar Cadence'
+                                          : modeKey === 'exp_smooth'
+                                          ? 'Monthly Exponential Smoothing'
+                                          : modeKey === 'run_rate'
+                                          ? 'Variable Run-Rate'
+                                          : modeKey === 'manual'
+                                          ? 'Manual Override'
+                                          : 'Set remaining forecast to $0'
+                                      }
+                                      className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded transition-colors whitespace-nowrap ${
+                                        isActive
+                                          ? modeKey === 'cadence'
+                                            ? 'bg-teal-800 text-white shadow-xs'
+                                            : modeKey === 'exp_smooth'
+                                            ? 'bg-sky-700 text-white shadow-xs'
+                                            : modeKey === 'manual'
+                                            ? 'bg-amber-700 text-white shadow-xs'
+                                            : modeKey === 'one_time'
+                                            ? 'bg-slate-700 text-white shadow-xs'
+                                            : 'bg-white text-slate-900 shadow-xs'
+                                          : 'text-slate-600 hover:text-slate-900'
+                                      }`}
+                                    >
+                                      <span>{modeLabel}</span>
+                                    </button>
+                                  );
+                                  return modeKey === 'exp_smooth' ? (
+                                    <ExpSmoothHoverTooltip key={modeKey}>
+                                      {modeButton}
+                                    </ExpSmoothHoverTooltip>
+                                  ) : (
+                                    modeButton
+                                  );
+                                })}
+                              </div>
+                              {s.isOverridden && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleResetStreamOverride(s.streamKey)}
+                                  title="Reset to auto-detected cadence"
+                                  className="text-[10px] font-medium text-teal-700 hover:text-teal-900 underline whitespace-nowrap"
+                                >
+                                  Reset
+                                </button>
+                              )}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );
@@ -1450,6 +2571,51 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                 </tbody>
               </table>
             )}
+          </div>
+        )}
+
+        {showCadenceDrawer && (
+          <div className="px-4 py-2.5 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
+            <div className="text-[11px] text-slate-600 flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span>
+                Proj. {pnlState.projection_year} Revenue:{' '}
+                <strong className="font-mono tabular-nums text-slate-900">
+                  {formatCurrencyExact(computed.totalRevenue.projected)}
+                </strong>
+              </span>
+              <span aria-hidden="true" className="text-slate-300">
+                ·
+              </span>
+              <span>
+                Proj. 1120-S Line 22 (K-1):{' '}
+                <strong className="font-mono tabular-nums text-teal-900">
+                  {formatCurrencyExact(computed.ordinaryBusinessIncome.projected)}
+                </strong>
+              </span>
+              <span aria-hidden="true" className="text-slate-300">
+                ·
+              </span>
+              <span>
+                Draws:{' '}
+                <strong className="font-mono tabular-nums text-slate-900">
+                  {formatCurrencyExact(computed.projectedDrawsTotal)}
+                </strong>
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={handlePush}
+              disabled={!canPushForecast}
+              title={
+                canPushForecast
+                  ? `Push projected ${pnlState.projection_year} forecast to the Six-Year Horizon schedule`
+                  : 'Import QBO transactions or enter projected figures before pushing to the 6-Year Horizon'
+              }
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-teal-800 rounded-md hover:bg-teal-900 disabled:opacity-45 disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0"
+            >
+              <Send className="w-3.5 h-3.5 shrink-0" />
+              <span>Push Forecast to 6-Year Horizon</span>
+            </button>
           </div>
         )}
       </section>
@@ -1469,15 +2635,15 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           </div>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse min-w-[760px]">
+        <div>
+          <table className="w-full table-fixed text-left border-collapse">
             <thead>
               <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600">
-                <th className="py-2.5 px-4 w-[38%]">Line Item</th>
-                <th className="py-2.5 px-3 text-right">YTD Actuals (QBO)</th>
-                <th className="py-2.5 px-3 text-right">Remaining Forecast</th>
-                <th className="py-2.5 px-3 text-right">Projected Full Year</th>
-                <th className="py-2.5 px-4 text-right text-slate-500">2025 Filed Actuals</th>
+                <th className="py-2.5 px-3 w-[40%]">Line Item</th>
+                <th className="py-2.5 px-2.5 text-right w-[15%]">YTD Actuals</th>
+                <th className="py-2.5 px-2.5 text-right w-[15%]">Remaining</th>
+                <th className="py-2.5 px-2.5 text-right w-[15%]">Projected Full Yr</th>
+                <th className="py-2.5 px-3 text-right w-[15%] text-slate-500">{priorYearLabel}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs">
@@ -1537,7 +2703,14 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                                 vals.remaining,
                                 (d) => commitPnlEdit(item.id, 'remaining', d),
                                 {
-                                  subLabel: hasRemOv ? 'Manual' : undefined,
+                                  subLabel: hasRemOv
+                                    ? 'Manual'
+                                    : (item.id === 'dbp_contribution' ||
+                                        item.id === 'employer_401k') &&
+                                      Boolean(year2026Computed) &&
+                                      (vals.remaining > 0 || vals.projected > 0)
+                                    ? 'Horizon Plan'
+                                    : undefined,
                                   resetAction: hasRemOv
                                     ? () => resetPnlLineOverride(item.id)
                                     : undefined,
@@ -1606,40 +2779,50 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                         <td className="py-2.5 px-4 align-top">
                           <div className="text-slate-900">Total Gross Receipts</div>
                           <div className="text-[11px] font-normal text-slate-500">
-                            Auto-summed CA + AZ revenue · Live state apportionment split
+                            {setup.multi_state_active
+                              ? `Auto-summed ${pCode} + ${sCode} revenue · Live state apportionment split`
+                              : 'Auto-summed gross receipts'}
                           </div>
                         </td>
                         <td className="py-2.5 px-3 text-right align-top">
                           <div className="font-mono tabular-nums text-slate-900">
                             {formatCurrencyExact(computed.totalRevenue.ytd)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
-                            CA {computed.caPct.ytd}% / AZ {computed.azPct.ytd}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
+                              {pCode} {computed.caPct.ytd}% / {sCode} {computed.azPct.ytd}%
+                            </div>
+                          )}
                         </td>
                         <td className="py-2.5 px-3 text-right align-top">
                           <div className="font-mono tabular-nums text-slate-900">
                             {formatCurrencyExact(computed.totalRevenue.remaining)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
-                            CA {computed.caPct.remaining}% / AZ {computed.azPct.remaining}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-normal text-teal-800 mt-0.5">
+                              {pCode} {computed.caPct.remaining}% / {sCode} {computed.azPct.remaining}%
+                            </div>
+                          )}
                         </td>
                         <td className="py-2.5 px-3 text-right align-top">
                           <div className="font-mono tabular-nums text-teal-900">
                             {formatCurrencyExact(computed.totalRevenue.projected)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-medium text-teal-800 mt-0.5">
-                            CA {computed.caPct.projected}% / AZ {computed.azPct.projected}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-medium text-teal-800 mt-0.5">
+                              {pCode} {computed.caPct.projected}% / {sCode} {computed.azPct.projected}%
+                            </div>
+                          )}
                         </td>
                         <td className="py-2.5 px-4 text-right align-top">
                           <div className="font-mono tabular-nums text-slate-600">
                             {formatCurrencyExact(computed.totalRevenue.filed2025)}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums font-normal text-slate-500 mt-0.5">
-                            CA {computed.caPct.filed2025}% / AZ {computed.azPct.filed2025}%
-                          </div>
+                          {setup.multi_state_active && (
+                            <div className="text-[10px] font-mono tabular-nums font-normal text-slate-500 mt-0.5">
+                              {pCode} {computed.caPct.filed2025}% / {sCode} {computed.azPct.filed2025}%
+                            </div>
+                          )}
                         </td>
                       </tr>
                     )}
@@ -1685,7 +2868,11 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                         <td className="py-2.5 px-4 align-top">
                           <div>Total Operating Expenses (Excl. W-2 &amp; Retirement)</div>
                           <div className="text-[11px] font-normal text-slate-500 mt-0.5">
-                            Tax-deductible total (includes 50% Meals) · Book total w/ 100% Meals:{' '}
+                            Excl. Payroll Taxes (1120-S / Horizon OpEx):{' '}
+                            <span className="font-mono tabular-nums font-medium text-slate-700">
+                              {formatCurrencyExact(computed.totalOperatingExpensesExclPayroll.projected)}
+                            </span>{' '}
+                            · Book total w/ 100% Meals:{' '}
                             <span className="font-mono tabular-nums">
                               {formatCurrencyExact(computed.totalOperatingExpensesBook.projected)}
                             </span>
@@ -1795,7 +2982,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       {/* 3. Balance Sheet (Schedule L) & Form 7203 Shareholder Stock Basis */}
       {/* ================================================================= */}
       <section className="no-print space-y-4">
-        {computed.drawsExceedBasis ? (
+        {showStockBasis && (computed.drawsExceedBasis ? (
           <div className="bg-red-50 border border-red-200 rounded-lg px-5 py-3.5 flex items-start gap-2.5 text-xs text-red-900 leading-relaxed">
             <AlertTriangle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
             <div>
@@ -1806,7 +2993,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                 </span>
                 :
               </span>{' '}
-              Projected 2026 distributions ({formatCurrencyExact(computed.projectedDrawsTotal)}) exceed
+              Projected {pnlState.projection_year} distributions ({formatCurrencyExact(computed.projectedDrawsTotal)}) exceed
               available Form 7203 stock basis ({formatCurrencyExact(computed.basisAvailableBeforeDraws)}),
               triggering a{' '}
               <span className="font-mono font-semibold tabular-nums">
@@ -1819,7 +3006,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           <div className="bg-emerald-50/70 border border-emerald-200 rounded-lg px-5 py-3 flex items-center gap-2.5 text-xs text-emerald-900">
             <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
             <span>
-              <span className="font-semibold">Stock Basis Clear:</span> Projected 2026 member draws (
+              <span className="font-semibold">Stock Basis Clear:</span> Projected {pnlState.projection_year} member draws (
               <span className="font-mono tabular-nums">
                 {formatCurrencyExact(computed.projectedDrawsTotal)}
               </span>
@@ -1834,9 +3021,9 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
               in projected ending stock basis after 50% nondeductible meals.
             </span>
           </div>
-        )}
+        ))}
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
+        <div className={`grid grid-cols-1 ${showStockBasis ? 'lg:grid-cols-2' : ''} gap-6 items-stretch`}>
           {/* Left: Schedule L */}
           <div className="bg-white border border-slate-200 rounded-lg overflow-hidden flex flex-col">
             <div className="px-5 py-3.5 border-b border-slate-200">
@@ -1844,25 +3031,25 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                 3A. Balance Sheet Projection (Schedule L)
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                BlueVine Checking cash, accrued pension liabilities &amp; credit card balances.
+                Operating checking cash, accrued pension liabilities &amp; credit card balances.
               </p>
             </div>
 
-            <div className="overflow-x-auto flex-1">
-              <table className="w-full text-left border-collapse min-w-[460px]">
+            <div className="flex-1">
+              <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600">
-                    <th className="py-2.5 px-4">Account</th>
-                    <th className="py-2.5 px-2.5 text-right">Beg of Year (2026)</th>
-                    <th className="py-2.5 px-2.5 text-right">Current YTD (QBO)</th>
-                    <th className="py-2.5 px-4 text-right">Projected YE (12/31)</th>
+                    <th className="py-2 px-3">Account</th>
+                    <th className="py-2 px-2 text-right">Beg (1/1)</th>
+                    <th className="py-2 px-2 text-right">YTD</th>
+                    <th className="py-2 px-3 text-right">Proj. 12/31</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-xs">
                   <tr className="hover:bg-slate-50/60">
                     <td className="py-2.5 px-4 align-top">
                       <div className="font-medium text-slate-800">Operating Cash</div>
-                      <div className="text-[11px] text-slate-400">QBO: BlueVine Checking</div>
+                      <div className="text-[11px] text-slate-400">QBO: Business Operating Checking / Cash</div>
                     </td>
                     <td className="py-2.5 px-2.5 text-right align-top">
                       {renderEditableCell('bs:cash_beg', bs.operating_cash_beg, (d) =>
@@ -1885,6 +3072,8 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                           subLabel:
                             bs.operating_cash_ye_override !== null
                               ? 'Override'
+                              : computed.subsequentYearRetirementAddback > 0
+                              ? 'Auto · excl. §404(a)(6)'
                               : 'Auto cash flow',
                           resetAction:
                             bs.operating_cash_ye_override !== null
@@ -1906,7 +3095,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                     <td className="py-2.5 px-4 align-top">
                       <div className="font-medium text-slate-800">Pension Expense Payable</div>
                       <div className="text-[11px] text-slate-400">
-                        QBO: Defined Benefit Plan Payable + OSS 401K Plan Payable
+                        QBO: Defined Benefit Plan Payable + Employer 401(k) Payable
                       </div>
                     </td>
                     <td className="py-2.5 px-2.5 text-right align-top">
@@ -1924,7 +3113,16 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                         'bs:pension_ye',
                         bs.pension_payable_ye,
                         (d) => commitBsField('pension_payable_ye', d),
-                        { bold: true }
+                        {
+                          bold: true,
+                          subLabel:
+                            bs.pension_payable_ye === 0 &&
+                            computed.lines.dbp_contribution.projected +
+                              computed.lines.employer_401k.projected >
+                              0
+                              ? 'IRC §404(a)(6) / cash-basis'
+                              : undefined,
+                        }
                       )}
                     </td>
                   </tr>
@@ -1935,7 +3133,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                         Credit Card / Accounts Payable
                       </div>
                       <div className="text-[11px] text-slate-400">
-                        QBO: Amazon CC, Cap One CC, AMX CC, Amtrak
+                        QBO: Business Credit Cards &amp; Accounts Payable
                       </div>
                     </td>
                     <td className="py-2.5 px-2.5 text-right align-top">
@@ -1985,6 +3183,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           </div>
 
           {/* Right: Form 7203 Basis */}
+          {showStockBasis && (
           <div className="bg-white border border-slate-200 rounded-lg overflow-hidden flex flex-col">
             <div className="px-5 py-3.5 border-b border-slate-200">
               <h2 className="text-sm font-semibold text-slate-900">
@@ -1995,14 +3194,14 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
               </p>
             </div>
 
-            <div className="overflow-x-auto flex-1">
-              <table className="w-full text-left border-collapse min-w-[460px]">
+            <div className="flex-1">
+              <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-600">
-                    <th className="py-2.5 px-4">Form 7203 Line Item</th>
-                    <th className="py-2.5 px-2.5 text-right">YTD (QBO)</th>
-                    <th className="py-2.5 px-2.5 text-right">Planned Rem.</th>
-                    <th className="py-2.5 px-4 text-right">Projected YE (12/31)</th>
+                    <th className="py-2 px-3">Form 7203 Line Item</th>
+                    <th className="py-2 px-2 text-right">YTD</th>
+                    <th className="py-2 px-2 text-right">Rem.</th>
+                    <th className="py-2 px-3 text-right">Proj. 12/31</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-xs">
@@ -2177,6 +3376,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
               </table>
             </div>
           </div>
+          )}
         </div>
       </section>
 
@@ -2184,17 +3384,71 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       <footer className="bg-white border border-slate-200 rounded-lg px-5 py-3.5 text-[11px] leading-relaxed text-slate-600 space-y-1">
         <div>
           <span className="font-semibold text-slate-800">Prepared by:</span>{' '}
-          {CPA_DISCLOSURE_METADATA.preparedBy}
+          {cpaDisclosure.preparedBy}
         </div>
         <div>
           <span className="font-semibold text-slate-800">Purpose:</span>{' '}
-          {CPA_DISCLOSURE_METADATA.purpose}
+          {cpaDisclosure.purpose}
         </div>
         <div>
           <span className="font-semibold text-slate-800">Disclaimer:</span>{' '}
-          {CPA_DISCLOSURE_METADATA.disclaimer}
+          {cpaDisclosure.disclaimer}
         </div>
       </footer>
+
+      {/* Brief confirmation toast after pushing forecast to 6-Year Horizon */}
+      {pushToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-5 right-5 z-40 max-w-md bg-slate-900 text-white border border-teal-700/60 rounded-lg shadow-xl px-4 py-3 text-xs"
+        >
+          <div className="flex items-start gap-2.5">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+            <div className="min-w-0 flex-1 space-y-1">
+              <div className="font-semibold text-white">
+                {pushToast.taxYear} Forecast Pushed to 6-Year Horizon
+              </div>
+              <div className="text-[11px] text-slate-200 font-mono tabular-nums leading-relaxed">
+                K-1: {formatCurrency(pushToast.newK1)} ({formatSignedDelta(pushToast.k1Delta)})
+                <span className="mx-1.5 text-slate-500">·</span>
+                Total Tax: {formatCurrency(pushToast.newAllInTax)} (
+                {formatSignedDelta(pushToast.taxDelta)})
+              </div>
+              <div className="flex items-center gap-3 pt-0.5">
+                {onNavigate && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPushToast(null);
+                      onNavigate('horizon');
+                    }}
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-300 hover:text-teal-200 transition-colors"
+                  >
+                    <span>View 6-Year Horizon</span>
+                    <ArrowRight className="w-3 h-3" />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setPushToast(null)}
+                  className="text-[11px] text-slate-400 hover:text-white transition-colors"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPushToast(null)}
+              aria-label="Dismiss push notification"
+              className="text-slate-400 hover:text-white shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* CPA Print Package Modal */}
       {showPrintModal && (
@@ -2205,6 +3459,8 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           entityName={entityName}
           entityEin={entityEin}
           reportMeta={cpaReportMeta}
+          issues={issues}
+          guardrailAcknowledgments={guardrailAcknowledgments}
           onDownloadCsv={handleDownloadCsv}
           onClose={() => setShowPrintModal(false)}
         />

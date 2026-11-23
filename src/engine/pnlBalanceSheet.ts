@@ -7,7 +7,16 @@ import type {
   SetupConfig,
   TaxYearRecord,
 } from '../types/tax';
+import type { EvaluatedPlanningGoal } from './planningGoals';
 import { getPersonNames } from './scheduleCatalog';
+import { getSetupBusinessIdentity, getSetupStates, getStateFullName } from '../utils/setupHelpers';
+import {
+  buildTestPersonaPnl,
+  DEFAULT_PROFILE_SEED,
+  isDefaultSeedSetup,
+  SAMPLE_TEST_PERSONA_QBO_BS,
+  SAMPLE_TEST_PERSONA_QBO_PNL,
+} from '../data/profiles';
 
 export type PnlSectionId =
   | 'revenue'
@@ -54,69 +63,72 @@ export const SCHEDULE_K_LINE_META: PnlLineMeta = {
   section: 'schedule_k',
   label: 'Schedule K Interest Income (Portfolio)',
   form1120sRef: 'Sch K Line 4',
-  filed2025: 619,
+  filed2025: 0,
   note: 'Excluded from Line 22 Ordinary Income · Included in Form 7203 stock basis',
 };
 
 /**
- * Canonical Form 1120-S P&L catalog with exact 2025 Filed Actuals reference figures:
- * Revenue: $136,770 CA + $242,815 AZ = $379,585
- * Compensation: $42,000 Bill + $33,550 Debra = $75,550
- * Retirement & Benefits: $140,000 DBP + $4,540 401(k) + $0 SEHI = $144,540
- * Operating Expenses: Rents $35,447 + Payroll Taxes $6,130 + CA FTB $2,891
- *   + Meals 50% Deductible $1,910 (from $3,820 Gross; $1,910 Sch M-1 Nondeductible)
- *   + Other Deductions $21,619 = $67,997
- * 2025 Filed Ordinary Business Income (Line 22): $379,585 - $75,550 - $144,540 - $67,997 = $91,498
- * 2025 Filed Schedule K Line 4 Interest Income: $619 (Bill $316 / Debra $303)
+ * Canonical Form 1120-S P&L catalog. Prior-year filed comparison figures are derived
+ * dynamically from the active household's Year 1 TaxYearRecord rather than hardcoded here.
  */
 export const PNL_LINE_ITEMS: PnlLineMeta[] = [
   {
     id: 'ca_revenue',
     section: 'revenue',
-    label: 'California S-Corp Revenue',
-    form1120sRef: 'Line 1a · CA Sch R',
-    filed2025: 136770,
-    note: 'QBO: Consulting - Debra (CA)',
+    label: 'Primary State S-Corp Revenue',
+    getLabel: (s) => {
+      const { primaryStateName, hasPrimaryState } = getSetupStates(s);
+      return hasPrimaryState ? `${primaryStateName} S-Corp Revenue` : 'Primary S-Corp Revenue';
+    },
+    form1120sRef: 'Line 1a',
+    filed2025: 0,
+    note: 'Primary-state sourced gross receipts',
   },
   {
     id: 'az_revenue',
     section: 'revenue',
-    label: 'Arizona S-Corp Revenue',
-    form1120sRef: 'Line 1a · AZ Sch A',
-    filed2025: 242815,
-    note: 'QBO: Consulting - Bill (AZ) + Services - Bill (AZ) + Services Income',
+    label: 'Secondary State S-Corp Revenue',
+    getLabel: (s) => {
+      const { secondaryStateName, hasSecondaryState } = getSetupStates(s);
+      return hasSecondaryState
+        ? `${secondaryStateName} S-Corp Revenue`
+        : 'Secondary / Other State Revenue';
+    },
+    form1120sRef: 'Line 1a',
+    filed2025: 0,
+    note: 'Secondary-state sourced gross receipts',
   },
   {
     id: 'bill_officer_w2',
     section: 'compensation',
-    label: 'Bill Officer W-2 Compensation',
+    label: 'Primary Officer W-2 Compensation',
     getLabel: (s) => `${getPersonNames(s).primaryName} Officer W-2 Compensation`,
     form1120sRef: 'Line 7',
-    filed2025: 42000,
-    note: 'QBO: Salary → Bill',
+    filed2025: 0,
+    note: 'Officer salary (Form 1120-S Line 7)',
   },
   {
     id: 'debra_salaries_wages',
     section: 'compensation',
-    label: 'Debra Salaries & Wages',
+    label: 'Spouse Salaries & Wages',
     getLabel: (s) => `${getPersonNames(s).spouseName} Salaries & Wages`,
     form1120sRef: 'Line 8',
-    filed2025: 33550,
-    note: 'QBO: Salary → Debra',
+    filed2025: 0,
+    note: 'Salaries & wages (Form 1120-S Line 8)',
   },
   {
     id: 'dbp_contribution',
     section: 'retirement',
     label: 'Defined Benefit Plan (DBP) Contribution',
     form1120sRef: 'Line 17',
-    filed2025: 140000,
+    filed2025: 0,
   },
   {
     id: 'employer_401k',
     section: 'retirement',
     label: 'Employer 401(k) Profit Sharing / Match',
     form1120sRef: 'Line 17',
-    filed2025: 4540,
+    filed2025: 0,
   },
   {
     id: 'sehi_medicare',
@@ -124,30 +136,36 @@ export const PNL_LINE_ITEMS: PnlLineMeta[] = [
     label: 'SEHI Medicare Premiums',
     form1120sRef: 'Line 18 / Sch 1 Ln 17',
     filed2025: 0,
-    note: 'QBO: Shareholder Health Insurance (Bill + Debra)',
+    note: 'QBO: >2% Shareholder Health Insurance premiums',
   },
   {
     id: 'rents',
     section: 'operating_expenses',
     label: 'Rents',
     form1120sRef: 'Line 11',
-    filed2025: 35447,
+    filed2025: 0,
   },
   {
     id: 'payroll_taxes',
     section: 'operating_expenses',
     label: 'Taxes & Licenses — Payroll Taxes',
     form1120sRef: 'Line 12',
-    filed2025: 6130,
-    note: 'QBO: CA SDI, CA SUI-ER, Fed, MedCare, AZ SUI-ER',
+    filed2025: 0,
+    note: 'Employer federal & state payroll taxes',
   },
   {
     id: 'ca_ftb_tax',
     section: 'operating_expenses',
-    label: 'Taxes & Licenses — CA FTB / State Tax',
+    label: 'Taxes & Licenses — State Entity / Franchise Tax',
+    getLabel: (s) => {
+      const { primaryStateCode } = getSetupStates(s);
+      return primaryStateCode
+        ? `Taxes & Licenses — ${primaryStateCode} Entity / State Tax`
+        : 'Taxes & Licenses — State Entity / Franchise Tax';
+    },
     form1120sRef: 'Line 12',
-    filed2025: 2891,
-    note: 'QBO: State (allows refunds/credits e.g. -$466.84)',
+    filed2025: 0,
+    note: 'State business taxes, franchise taxes, and prior-year refunds/credits',
   },
   {
     id: 'professional_fees',
@@ -185,7 +203,7 @@ export const PNL_LINE_ITEMS: PnlLineMeta[] = [
     section: 'operating_expenses',
     label: 'Meals (100% Gross)',
     form1120sRef: 'Line 19 / Sch M-1',
-    filed2025: 3820,
+    filed2025: 0,
     note: 'QBO: Meals at Restaurant + Travel Business/Individual Meals (50/50 split)',
   },
   {
@@ -223,7 +241,7 @@ export const PNL_LINE_ITEMS: PnlLineMeta[] = [
     section: 'operating_expenses',
     label: 'Other Deductions',
     form1120sRef: 'Line 19',
-    filed2025: 21619,
+    filed2025: 0,
     note: 'QBO: Continuing Education + Interest Expense + Petty Cash + Shipping',
   },
   SCHEDULE_K_LINE_META,
@@ -241,78 +259,207 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+export interface HorizonRetirementTargets {
+  dbpAnnual: number;
+  employer401kAnnual: number;
+}
+
 /**
- * Creates the preloaded 2026 P&L & Balance Sheet projection using Operating Support
- * Services, LLC's actual 11/21/2026 YTD figures and 40-day remaining forecast.
+ * Extracts annual Form 1120-S Line 17 DBP and Employer 401(k) retirement targets
+ * directly from the active projected tax year's Horizon/Setup computation.
+ * Completely decoupled from Schedule L 12/31 Pension Expense Payable.
+ */
+export function resolveHorizonRetirementTargets(
+  yearProjectedComputed?: ComputedTaxYear,
+  setup?: SetupConfig
+): HorizonRetirementTargets {
+  if (!yearProjectedComputed) {
+    return { dbpAnnual: 0, employer401kAnnual: 0 };
+  }
+  const hasDbp = setup ? setup.has_dbp !== false : true;
+  const has401k = setup ? setup.has_401k_or_ira !== false : true;
+  const rawDbp = hasDbp
+    ? Math.max(0, yearProjectedComputed.dbp_in.dbp_actual_contribution ?? 0)
+    : 0;
+  const raw401k = has401k
+    ? Math.max(0, yearProjectedComputed.form_1040_out.employer_401k_total ?? 0)
+    : 0;
+  return {
+    dbpAnnual: round2(rawDbp),
+    employer401kAnnual: round2(raw401k),
+  };
+}
+
+/**
+ * Computes Remaining Forecast for a Form 1120-S Line 17 retirement deduction from
+ * the active Horizon/Setup annual plan minus any YTD actuals already posted.
+ */
+export function computeRemainingRetirementFromHorizon(
+  plannedAnnual: number,
+  ytdActual: number
+): number {
+  return round2(Math.max(0, Math.max(0, plannedAnnual) - Math.max(0, ytdActual)));
+}
+
+/**
+ * Creates an initial P&L & Balance Sheet projection state for the active household.
+ * - Default seed profile ("My Profile"): loads isolated DEFAULT_PROFILE_SEED 2026 baseline.
+ * - Synthetic Test Persona: loads isolated TX Test Persona baseline.
+ * - Blank User / Custom Household: derives neutral $0-YTD projection from the active year record.
  */
 export function createInitialPnlBalanceSheetState(
-  _year2026?: TaxYearRecord,
-  year2025EndingBasis = 0
+  year2026?: TaxYearRecord,
+  year2025EndingBasis = 0,
+  setup?: SetupConfig | null
 ): PnlBalanceSheetState {
-  const pnl: Record<PnlLineId, PnlLineAmounts> = {
-    ca_revenue: { ytd: 127340.0, remaining: 15672.62 },
-    az_revenue: { ytd: 191943.71, remaining: 23623.84 },
-    bill_officer_w2: { ytd: 20534.52, remaining: 9223.48 },
-    debra_salaries_wages: { ytd: 20257.99, remaining: 9501.01 },
-    dbp_contribution: { ytd: 0, remaining: 61000.0 },
-    employer_401k: { ytd: 0, remaining: 3571.0 },
-    sehi_medicare: { ytd: 6167.85, remaining: 835.25 },
-    rents: { ytd: 10487.0, remaining: 1290.71 },
-    payroll_taxes: { ytd: 4162.86, remaining: 512.35 },
-    ca_ftb_tax: { ytd: -466.84, remaining: 0 },
-    professional_fees: { ytd: 6556.0, remaining: 806.89 },
-    subscriptions_software: { ytd: 3797.3, remaining: 467.36 },
-    telephone_internet: { ytd: 2382.57, remaining: 293.24 },
-    travel: { ytd: 405.34, remaining: 49.89 },
-    meals_gross: { ytd: 1806.58, remaining: 222.35 },
-    office_expense: { ytd: 7862.31, remaining: 967.67 },
-    insurance: { ytd: 1190.92, remaining: 146.57 },
-    utilities: { ytd: 149.45, remaining: 18.39 },
-    bank_payroll_fees: { ytd: 1032.99, remaining: 127.14 },
-    other_deductions: { ytd: 1470.07, remaining: 180.93 },
-    schedule_k_interest: { ytd: 609.18, remaining: 75.0 },
-  };
+  const projectionYear = year2026?.tax_year ?? setup?.current_tax_year ?? 2026;
 
-  const balance_sheet: BalanceSheetProjectionInputs = {
-    as_of_date: '2026-11-21',
-    operating_cash_beg: 48500.0,
-    operating_cash_ytd: 42580.89,
-    operating_cash_ye_override: null,
-    pension_payable_beg: 144540.0,
-    pension_payable_ytd: 0,
-    pension_payable_ye: 64571.0, // Accrued 2026 DBP ($61,000) + Employer 401(k) ($3,571)
-    cc_ap_beg: 4200.0,
-    cc_ap_ytd: 2963.77,
-    cc_ap_ye: 2963.77,
-    member_draws_ytd: 121939.75,
-    member_draws_remaining: 0,
-    capital_contributions_ytd: 0,
-    capital_contributions_remaining: 0,
-    beginning_stock_basis_override: year2025EndingBasis,
-  };
+  if (setup?.workspace_profile_kind === 'test_persona') {
+    const personaPnl = buildTestPersonaPnl(projectionYear);
+    return {
+      ...personaPnl,
+      balance_sheet: {
+        ...personaPnl.balance_sheet,
+        beginning_stock_basis_override: year2025EndingBasis > 0 ? year2025EndingBasis : null,
+      },
+    };
+  }
+
+  const initialDbpRemaining = round2(
+    Math.max(0, year2026?.dbp_and_retirement?.dbp_actual_contribution ?? 0)
+  );
+  const initialEmployer401kRemaining = year2026
+    ? Math.round(
+        Math.max(
+          0,
+          year2026.dbp_and_retirement?.qualified_plan_contribution > 0
+            ? year2026.dbp_and_retirement.qualified_plan_contribution
+            : ((year2026.scorp_1120s.bill_w2_wages ?? 0) +
+                (year2026.scorp_1120s.debra_w2_wages ?? 0)) *
+                (setup?.post_dbp_profit_sharing_rate ?? 0.06)
+        )
+      )
+    : 0;
+
+  if (isDefaultSeedSetup(setup)) {
+    const seedPnl = DEFAULT_PROFILE_SEED.default_pnl_2026;
+    const seed2026 = DEFAULT_PROFILE_SEED.forecast_2026_2030_inputs[2026];
+    const billW2Ytd = seedPnl.bill_w2_ytd;
+    const debraW2Ytd = seedPnl.debra_w2_ytd;
+    const billW2Remaining = round2(Math.max(0, (seed2026?.bill_w2 ?? billW2Ytd) - billW2Ytd));
+    const debraW2Remaining = round2(Math.max(0, (seed2026?.debra_w2 ?? debraW2Ytd) - debraW2Ytd));
+
+    const fixed = seedPnl.pnl_fixed_lines;
+    const getFixed = (id: PnlLineId): PnlLineAmounts =>
+      fixed[id] ? { ytd: fixed[id]!.ytd, remaining: fixed[id]!.remaining } : { ytd: 0, remaining: 0 };
+
+    const pnl: Record<PnlLineId, PnlLineAmounts> = {
+      ca_revenue: getFixed('ca_revenue'),
+      az_revenue: getFixed('az_revenue'),
+      bill_officer_w2: { ytd: billW2Ytd, remaining: billW2Remaining },
+      debra_salaries_wages: { ytd: debraW2Ytd, remaining: debraW2Remaining },
+      dbp_contribution: { ytd: 0, remaining: initialDbpRemaining },
+      employer_401k: { ytd: 0, remaining: initialEmployer401kRemaining },
+      sehi_medicare: getFixed('sehi_medicare'),
+      rents: getFixed('rents'),
+      payroll_taxes: getFixed('payroll_taxes'),
+      ca_ftb_tax: getFixed('ca_ftb_tax'),
+      professional_fees: getFixed('professional_fees'),
+      subscriptions_software: getFixed('subscriptions_software'),
+      telephone_internet: getFixed('telephone_internet'),
+      travel: getFixed('travel'),
+      meals_gross: getFixed('meals_gross'),
+      office_expense: getFixed('office_expense'),
+      insurance: getFixed('insurance'),
+      utilities: getFixed('utilities'),
+      bank_payroll_fees: getFixed('bank_payroll_fees'),
+      other_deductions: getFixed('other_deductions'),
+      schedule_k_interest: getFixed('schedule_k_interest'),
+    };
+
+    const balance_sheet: BalanceSheetProjectionInputs = {
+      ...seedPnl.balance_sheet,
+      pension_payable_ye: DEFAULT_PROFILE_SEED.default_pension_payable_ye,
+      beginning_stock_basis_override: year2025EndingBasis,
+    };
+
+    return {
+      projection_year: projectionYear,
+      pnl,
+      balance_sheet,
+    };
+  }
+
+  // Neutral household P&L & Balance Sheet derived purely from the active profile's Horizon record
+  const pnl = {} as Record<PnlLineId, PnlLineAmounts>;
+  for (const item of PNL_LINE_ITEMS) {
+    pnl[item.id] = { ytd: 0, remaining: 0 };
+  }
+  if (year2026) {
+    pnl.ca_revenue = { ytd: 0, remaining: round2(Math.max(0, year2026.scorp_1120s.ca_revenue ?? 0)) };
+    pnl.az_revenue = { ytd: 0, remaining: round2(Math.max(0, year2026.scorp_1120s.az_revenue ?? 0)) };
+    pnl.bill_officer_w2 = { ytd: 0, remaining: round2(Math.max(0, year2026.scorp_1120s.bill_w2_wages ?? 0)) };
+    pnl.debra_salaries_wages = { ytd: 0, remaining: round2(Math.max(0, year2026.scorp_1120s.debra_w2_wages ?? 0)) };
+    pnl.dbp_contribution = { ytd: 0, remaining: initialDbpRemaining };
+    pnl.employer_401k = { ytd: 0, remaining: initialEmployer401kRemaining };
+    pnl.sehi_medicare = {
+      ytd: 0,
+      remaining: round2(Math.max(0, year2026.form_1040.health_insurance_premiums ?? 0)),
+    };
+    pnl.other_deductions = {
+      ytd: 0,
+      remaining: round2(Math.max(0, year2026.scorp_1120s.operating_expenses ?? 0)),
+    };
+    pnl.schedule_k_interest = {
+      ytd: 0,
+      remaining: round2(Math.max(0, year2026.scorp_1120s.schedule_k_interest_income ?? 0)),
+    };
+  }
 
   return {
-    projection_year: 2026,
+    projection_year: projectionYear,
     pnl,
-    balance_sheet,
+    balance_sheet: {
+      as_of_date: `${projectionYear}-12-31`,
+      operating_cash_beg: 0,
+      operating_cash_ytd: 0,
+      operating_cash_ye_override: null,
+      pension_payable_beg: 0,
+      pension_payable_ytd: 0,
+      pension_payable_ye: 0,
+      cc_ap_beg: 0,
+      cc_ap_ytd: 0,
+      cc_ap_ye: 0,
+      member_draws_ytd: 0,
+      member_draws_remaining: round2(Math.max(0, year2026?.scorp_1120s.scorp_distributions_total ?? 0)),
+      capital_contributions_ytd: 0,
+      capital_contributions_remaining: round2(Math.max(0, year2026?.scorp_1120s.capital_contributions ?? 0)),
+      beginning_stock_basis_override: year2025EndingBasis > 0 ? year2025EndingBasis : null,
+    },
   };
 }
 
 export function normalizePnlBalanceSheetState(
   raw: PnlBalanceSheetState | undefined,
-  year2026?: TaxYearRecord
+  year2026?: TaxYearRecord,
+  setup?: SetupConfig | null
 ): PnlBalanceSheetState {
-  const defaults = createInitialPnlBalanceSheetState(year2026, 0);
+  const defaults = createInitialPnlBalanceSheetState(year2026, 0, setup);
   if (!raw || !raw.pnl || !raw.balance_sheet) return defaults;
 
-  // Seamlessly upgrade the earlier generic 2026-09-30 placeholder seed to the actual 2026-11-21 QBO preload
-  const isLegacyPlaceholderSeed =
-    raw.balance_sheet.as_of_date === '2026-09-30' &&
-    raw.balance_sheet.operating_cash_ytd === 72400 &&
-    raw.balance_sheet.member_draws_ytd === 90000 &&
-    raw.pnl.ca_revenue?.ytd === 127125;
-  if (isLegacyPlaceholderSeed) {
-    return defaults;
+  const isDefaultProfile = isDefaultSeedSetup(setup);
+
+  // Seamlessly upgrade earlier placeholder seed strictly for saved default-profile records
+  if (isDefaultProfile) {
+    const legacyPl = DEFAULT_PROFILE_SEED.default_pnl_2026.legacy_2026_09_30_placeholder;
+    const isLegacyPlaceholderSeed =
+      raw.balance_sheet.as_of_date === legacyPl.as_of_date &&
+      raw.balance_sheet.operating_cash_ytd === legacyPl.operating_cash_ytd &&
+      raw.balance_sheet.member_draws_ytd === legacyPl.member_draws_ytd &&
+      raw.pnl.ca_revenue?.ytd === legacyPl.ca_revenue_ytd;
+    if (isLegacyPlaceholderSeed) {
+      return defaults;
+    }
   }
 
   const pnl = { ...defaults.pnl };
@@ -324,6 +471,28 @@ export function normalizePnlBalanceSheetState(
         remaining: Number.isFinite(entry.remaining)
           ? round2(entry.remaining)
           : defaults.pnl[item.id].remaining,
+      };
+    }
+  }
+
+  // One-time migration for saved default-profile 2026 P&L records whose W-2 remaining still baked SEHI into cash W-2
+  if (isDefaultProfile) {
+    const legacyW2 = DEFAULT_PROFILE_SEED.legacy_2026_w2_with_sehi;
+    const seed2026 = DEFAULT_PROFILE_SEED.forecast_2026_2030_inputs[2026];
+    if (
+      seed2026 &&
+      Math.abs(pnl.bill_officer_w2.ytd + pnl.bill_officer_w2.remaining - legacyW2.bill_w2) < 0.05 &&
+      Math.abs(pnl.debra_salaries_wages.ytd + pnl.debra_salaries_wages.remaining - legacyW2.debra_w2) <
+        0.05 &&
+      pnl.sehi_medicare.ytd > 0
+    ) {
+      pnl.bill_officer_w2 = {
+        ytd: pnl.bill_officer_w2.ytd,
+        remaining: round2(Math.max(0, seed2026.bill_w2 - pnl.bill_officer_w2.ytd)),
+      };
+      pnl.debra_salaries_wages = {
+        ytd: pnl.debra_salaries_wages.ytd,
+        remaining: round2(Math.max(0, seed2026.debra_w2 - pnl.debra_salaries_wages.ytd)),
       };
     }
   }
@@ -352,7 +521,10 @@ export function normalizePnlBalanceSheetState(
       bsRaw.pension_payable_ytd,
       defaults.balance_sheet.pension_payable_ytd
     ),
-    pension_payable_ye: numOr(bsRaw.pension_payable_ye, defaults.balance_sheet.pension_payable_ye),
+    pension_payable_ye:
+      bsRaw.pension_payable_ye === DEFAULT_PROFILE_SEED.legacy_2026_pension_payable_ye
+        ? DEFAULT_PROFILE_SEED.default_pension_payable_ye
+        : numOr(bsRaw.pension_payable_ye, defaults.balance_sheet.pension_payable_ye),
     cc_ap_beg: numOr(bsRaw.cc_ap_beg, defaults.balance_sheet.cc_ap_beg),
     cc_ap_ytd: numOr(bsRaw.cc_ap_ytd, defaults.balance_sheet.cc_ap_ytd),
     cc_ap_ye: numOr(bsRaw.cc_ap_ye, defaults.balance_sheet.cc_ap_ye),
@@ -376,6 +548,15 @@ export function normalizePnlBalanceSheetState(
         : null,
   };
 
+  const rawRetManual = raw.retirement_line17_manual_overrides;
+  const retirement_line17_manual_overrides =
+    rawRetManual && (rawRetManual.dbp_contribution || rawRetManual.employer_401k)
+      ? {
+          ...(rawRetManual.dbp_contribution ? { dbp_contribution: true } : {}),
+          ...(rawRetManual.employer_401k ? { employer_401k: true } : {}),
+        }
+      : undefined;
+
   return {
     projection_year:
       typeof raw.projection_year === 'number' && Number.isFinite(raw.projection_year)
@@ -383,6 +564,7 @@ export function normalizePnlBalanceSheetState(
         : 2026,
     pnl,
     balance_sheet,
+    ...(retirement_line17_manual_overrides ? { retirement_line17_manual_overrides } : {}),
     last_pushed_at: raw.last_pushed_at,
   };
 }
@@ -404,7 +586,8 @@ export interface ComputedPnlBalanceSheet {
   taxesAndLicensesTotal: ComputedColumnTriple;
   mealsDeductible50: ComputedColumnTriple;
   mealsNondeductible50: ComputedColumnTriple;
-  totalOperatingExpensesDeductible: ComputedColumnTriple; // Excl. W-2 & Retirement, includes 50% deductible meals
+  totalOperatingExpensesDeductible: ComputedColumnTriple; // Excl. W-2 & Retirement, includes Payroll Taxes & 50% deductible meals
+  totalOperatingExpensesExclPayroll: ComputedColumnTriple; // Excl. W-2, Employer Payroll Taxes, SEHI & Retirement (matches Horizon/1120-S OpEx)
   totalOperatingExpensesBook: ComputedColumnTriple; // Excl. W-2 & Retirement, 100% gross meals
   ordinaryBusinessIncome: ComputedColumnTriple; // Form 1120-S Line 22 (Excl. Sch K Interest)
   scheduleKInterest: ComputedColumnTriple; // Form 1120-S Sch K Line 4
@@ -426,6 +609,7 @@ export interface ComputedPnlBalanceSheet {
   billExcessGain: number;
   debraExcessGain: number;
   // Balance Sheet Schedule L computed year-end cash & net working capital
+  subsequentYearRetirementAddback: number;
   autoProjectedCashYe: number;
   projectedCashYe: number;
   netCashPositionBeg: number;
@@ -433,18 +617,116 @@ export interface ComputedPnlBalanceSheet {
   netCashPositionYe: number;
 }
 
+export interface CalculatePnlBalanceSheetOptions {
+  /**
+   * When true, `state.pnl.dbp_contribution.remaining` and `state.pnl.employer_401k.remaining`
+   * have already been resolved by the caller (e.g., Cadence Forecaster merging Horizon targets
+   * with explicit inline overrides) and should be used as-is.
+   */
+  respectStateRetirementRemaining?: boolean;
+}
+
 export function calculatePnlBalanceSheet(
   state: PnlBalanceSheetState,
-  year2025Computed?: ComputedTaxYear
+  year2025Computed?: ComputedTaxYear,
+  yearProjectedComputed?: ComputedTaxYear,
+  setup?: SetupConfig,
+  options?: CalculatePnlBalanceSheetOptions
 ): ComputedPnlBalanceSheet {
+  const filedByLine = (id: PnlLineId): number => {
+    if (!year2025Computed) return 0;
+    const sc = year2025Computed.scorp_in;
+    const dbp = year2025Computed.dbp_in;
+    const f1040Out = year2025Computed.form_1040_out;
+    const nondeductibleMeals = sc.schedule_k_nondeductible_expenses ?? 0;
+    switch (id) {
+      case 'ca_revenue':
+        return round2(sc.ca_revenue ?? 0);
+      case 'az_revenue':
+        return round2(sc.az_revenue ?? 0);
+      case 'bill_officer_w2':
+        return round2(
+          sc.use_detailed_1120s_deductions
+            ? (sc.compensation_of_officers ?? sc.bill_w2_wages ?? 0)
+            : (sc.bill_w2_wages ?? 0)
+        );
+      case 'debra_salaries_wages':
+        return round2(
+          sc.use_detailed_1120s_deductions
+            ? (sc.salaries_and_wages ?? sc.debra_w2_wages ?? 0)
+            : (sc.debra_w2_wages ?? 0)
+        );
+      case 'dbp_contribution':
+        return round2(dbp.dbp_actual_contribution ?? 0);
+      case 'employer_401k':
+        if (sc.use_detailed_1120s_deductions && sc.pension_profit_sharing_input !== undefined) {
+          return round2(Math.max(0, sc.pension_profit_sharing_input - (dbp.dbp_actual_contribution ?? 0)));
+        }
+        return round2(f1040Out.employer_401k_total ?? 0);
+      case 'sehi_medicare':
+        // In Form 1120-S filed actuals, 2% shareholder health insurance is folded into
+        // W-2 officer/employee compensation (Lines 7-8) rather than a separate deduction line.
+        return 0;
+      case 'rents':
+        return round2(sc.rents ?? 0);
+      case 'payroll_taxes':
+        return round2(sc.payroll_taxes_input ?? year2025Computed.scorp_out.employer_payroll_taxes ?? 0);
+      case 'ca_ftb_tax':
+        return round2(sc.ftb_state_taxes_input ?? 0);
+      case 'meals_gross':
+        return round2(nondeductibleMeals * 2);
+      case 'other_deductions': {
+        if (sc.use_detailed_1120s_deductions) {
+          return round2(Math.max(0, (sc.other_deductions ?? 0) - nondeductibleMeals));
+        }
+        const itemized =
+          (sc.rents ?? 0) +
+          (sc.ftb_state_taxes_input ?? 0) +
+          nondeductibleMeals;
+        return round2(Math.max(0, (sc.operating_expenses ?? 0) - itemized));
+      }
+      case 'schedule_k_interest':
+        return round2(sc.schedule_k_interest_income ?? 0);
+      default:
+        return 0;
+    }
+  };
+
+  const horizonRetirement = yearProjectedComputed
+    ? resolveHorizonRetirementTargets(yearProjectedComputed, setup)
+    : null;
+
   const lines = {} as Record<PnlLineId, ComputedColumnTriple>;
   for (const meta of PNL_LINE_ITEMS) {
     const raw = state.pnl[meta.id] ?? { ytd: 0, remaining: 0 };
+    const ytd = round2(raw.ytd);
+    let remaining = round2(raw.remaining);
+
+    // Decouple Line 17 retirement deductions from Schedule L 12/31 Pension Payable:
+    // source Remaining directly from active Horizon/Setup plan figures minus any YTD actuals posted,
+    // unless the caller already resolved overrides or the user manually overrode this line.
+    if (horizonRetirement && !options?.respectStateRetirementRemaining) {
+      if (
+        meta.id === 'dbp_contribution' &&
+        !state.retirement_line17_manual_overrides?.dbp_contribution
+      ) {
+        remaining = computeRemainingRetirementFromHorizon(horizonRetirement.dbpAnnual, ytd);
+      } else if (
+        meta.id === 'employer_401k' &&
+        !state.retirement_line17_manual_overrides?.employer_401k
+      ) {
+        remaining = computeRemainingRetirementFromHorizon(
+          horizonRetirement.employer401kAnnual,
+          ytd
+        );
+      }
+    }
+
     lines[meta.id] = {
-      ytd: round2(raw.ytd),
-      remaining: round2(raw.remaining),
-      projected: round2(raw.ytd + raw.remaining),
-      filed2025: meta.filed2025,
+      ytd,
+      remaining,
+      projected: round2(ytd + remaining),
+      filed2025: filedByLine(meta.id),
     };
   }
 
@@ -519,6 +801,14 @@ export function calculatePnlBalanceSheet(
     remaining: round2(nonMealOpEx.remaining + mealsDeductible50.remaining),
     projected: round2(nonMealOpEx.projected + mealsDeductible50.projected),
     filed2025: round2(nonMealOpEx.filed2025 + mealsDeductible50.filed2025),
+  };
+
+  // Non-payroll, non-W2, non-SEHI, non-retirement tax-deductible OpEx (reconciles 1:1 with Horizon & 1120-S OpEx)
+  const totalOperatingExpensesExclPayroll: ComputedColumnTriple = {
+    ytd: round2(totalOperatingExpensesDeductible.ytd - lines.payroll_taxes.ytd),
+    remaining: round2(totalOperatingExpensesDeductible.remaining - lines.payroll_taxes.remaining),
+    projected: round2(totalOperatingExpensesDeductible.projected - lines.payroll_taxes.projected),
+    filed2025: round2(totalOperatingExpensesDeductible.filed2025 - lines.payroll_taxes.filed2025),
   };
 
   const totalOperatingExpensesBook: ComputedColumnTriple = {
@@ -613,8 +903,8 @@ export function calculatePnlBalanceSheet(
   const drawsExceedBasis = projectedExcessDistributionGain > 0;
   const basisShortfall = projectedExcessDistributionGain;
 
-  const billSharePct = (year2025Computed?.scorp_in.bill_ownership_pct ?? 51) / 100;
-  const debraSharePct = (year2025Computed?.scorp_in.debra_ownership_pct ?? 49) / 100;
+  const billSharePct = (year2025Computed?.scorp_in.bill_ownership_pct ?? 50) / 100;
+  const debraSharePct = (year2025Computed?.scorp_in.debra_ownership_pct ?? 50) / 100;
 
   const billBeg = round2(beginningStockBasis * billSharePct);
   const debraBeg = round2(beginningStockBasis - billBeg);
@@ -642,13 +932,24 @@ export function calculatePnlBalanceSheet(
 
   // Projected Year-End Cash estimate:
   // Current YTD Cash + Remaining Book Net Income (includes Remaining Sch K Interest & 100% Meals)
+  // + Subsequent-Year IRC §404(a)(6) Retirement Addback (when 12/31 Pension Payable is $0,
+  //   unpaid Remaining Line 17 DBP & Employer 401(k) deductions are funded next year rather than
+  //   before 12/31; any YTD retirement cash outflows remain reflected in operating_cash_ytd)
   // + Change in Pension Payable (YE - YTD) + Change in CC/AP (YE - YTD)
   // + Remaining Capital Contributions - Remaining Member Draws
+  const remainingRetirementLine17 = round2(
+    Math.max(0, lines.dbp_contribution.remaining) + Math.max(0, lines.employer_401k.remaining)
+  );
+  const subsequentYearRetirementAddback =
+    bs.pension_payable_ye === 0 && remainingRetirementLine17 > 0
+      ? remainingRetirementLine17
+      : 0;
   const pensionAccrualDelta = round2(bs.pension_payable_ye - bs.pension_payable_ytd);
   const ccApDelta = round2(bs.cc_ap_ye - bs.cc_ap_ytd);
   const autoProjectedCashYe = round2(
     bs.operating_cash_ytd +
       bookNetIncome.remaining +
+      subsequentYearRetirementAddback +
       pensionAccrualDelta +
       ccApDelta +
       bs.capital_contributions_remaining -
@@ -678,6 +979,7 @@ export function calculatePnlBalanceSheet(
     mealsDeductible50,
     mealsNondeductible50,
     totalOperatingExpensesDeductible,
+    totalOperatingExpensesExclPayroll,
     totalOperatingExpensesBook,
     ordinaryBusinessIncome,
     scheduleKInterest,
@@ -696,6 +998,7 @@ export function calculatePnlBalanceSheet(
     debraProjectedBasisEnding,
     billExcessGain,
     debraExcessGain,
+    subsequentYearRetirementAddback,
     autoProjectedCashYe,
     projectedCashYe,
     netCashPositionBeg,
@@ -705,7 +1008,7 @@ export function calculatePnlBalanceSheet(
 }
 
 // ============================================================================
-// QuickBooks Online (QBO) Paste & CSV Parser — Operating Support Services, LLC
+// Accounting / QuickBooks Online (QBO) Paste & CSV Parser
 // ============================================================================
 
 export type QboTargetField =
@@ -830,24 +1133,60 @@ function extractLabelAndAmount(line: string): { label: string; amount: number | 
   return { label: trimmed.replace(/^["']|["']$/g, '').trim(), amount: null };
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getDynamicNameTokens(setup?: SetupConfig | null): {
+  primaryFirst: string;
+  spouseFirst: string;
+  primaryStateCode: string;
+  primaryStateName: string;
+  secondaryStateCode: string;
+  secondaryStateName: string;
+} {
+  const primaryFirst = (setup?.primary_name ?? '').trim().split(/\s+/)[0] ?? '';
+  const spouseFirst = (setup?.spouse_name ?? '').trim().split(/\s+/)[0] ?? '';
+  const primaryStateCode = (setup?.home_state ?? '').trim().toUpperCase();
+  const secondaryStateCode = (setup?.secondary_state ?? '').trim().toUpperCase();
+  return {
+    primaryFirst: primaryFirst.length >= 2 ? primaryFirst : '',
+    spouseFirst: spouseFirst.length >= 2 ? spouseFirst : '',
+    primaryStateCode,
+    primaryStateName: primaryStateCode ? getStateFullName(primaryStateCode) : '',
+    secondaryStateCode,
+    secondaryStateName: secondaryStateCode ? getStateFullName(secondaryStateCode) : '',
+  };
+}
+
 function classifyPnlLabel(
   label: string,
-  parentSection: string
+  parentSection: string,
+  setup?: SetupConfig | null
 ): { target: QboTargetField; confidence: ParsedQboRow['confidence']; isTravelMealChild?: boolean } {
   const l = label.toLowerCase().trim();
   const p = parentSection.toLowerCase().trim();
+  const dyn = getDynamicNameTokens(setup);
 
-  // 1. Exact Operating Support Services, LLC Revenue accounts
-  if (/consulting\s*[-–—:]?\s*debra\s*\(?ca\)?/i.test(l) || /(california|\bca\b).*(rev|sales|income|consult|fee)/i.test(l)) {
+  const matchesStateCodeOrName = (code: string, name: string): boolean => {
+    if (!code) return false;
+    const parts = [escapeRegExp(code)];
+    if (name && name.toLowerCase() !== code.toLowerCase()) parts.push(escapeRegExp(name));
+    const re = new RegExp(`\\b(${parts.join('|')})\\b`, 'i');
+    return re.test(l);
+  };
+
+  // 1. State-sourced Revenue accounts (dynamically matched against active profile states)
+  const isRevLike = /(rev|sales|income|consult|service|retainer|advisory|fee|billing)/i.test(l) &&
+    !/tax|expense|interest|payroll|bank|legal|professional/i.test(l);
+  if (isRevLike && dyn.primaryStateCode && matchesStateCodeOrName(dyn.primaryStateCode, dyn.primaryStateName)) {
     return { target: 'ca_revenue', confidence: 'high' };
   }
   if (
-    /consulting\s*[-–—:]?\s*bill\s*\(?az\)?/i.test(l) ||
-    /services\s*[-–—:]?\s*bill\s*\(?az\)?/i.test(l) ||
-    /^services income$/i.test(l) ||
-    /(arizona|\baz\b).*(rev|sales|income|consult|fee)/i.test(l)
+    (isRevLike && dyn.secondaryStateCode && matchesStateCodeOrName(dyn.secondaryStateCode, dyn.secondaryStateName)) ||
+    /^services income$/i.test(l)
   ) {
-    return { target: 'az_revenue', confidence: 'high' };
+    return { target: dyn.secondaryStateCode ? 'az_revenue' : 'ca_revenue', confidence: 'high' };
   }
 
   // 2. Schedule K Line 4 Interest Income (must be checked BEFORE generic income or interest expense)
@@ -855,18 +1194,20 @@ function classifyPnlLabel(
     return { target: 'schedule_k_interest', confidence: 'high' };
   }
 
-  // 3. Compensation: Salary -> Bill / Salary -> Debra (supports nested or inline arrow/colon)
+  // 3. Compensation: Officer / Spouse salaries (dynamically matched against active household names)
+  const primaryRe = dyn.primaryFirst ? new RegExp(`\\b${escapeRegExp(dyn.primaryFirst)}\\b`, 'i') : null;
+  const spouseRe = dyn.spouseFirst ? new RegExp(`\\b${escapeRegExp(dyn.spouseFirst)}\\b`, 'i') : null;
+  const isPayrollContext = /salary|payroll|wage|comp|officer/i.test(p) || /salary|payroll|wage|comp|officer|w-?2/i.test(l);
+
   if (
-    /salary\s*(?:->|→|:|-|\/)\s*bill/i.test(l) ||
-    (/^bill$/i.test(l) && /salary|payroll|wage|comp/i.test(p)) ||
-    /(officer.*comp|bill.*(w2|w-2|wage|sal|comp))/i.test(l)
+    (primaryRe && isPayrollContext && primaryRe.test(l)) ||
+    /officer.*comp|officer.*w-?2/i.test(l)
   ) {
     return { target: 'bill_officer_w2', confidence: 'high' };
   }
   if (
-    /salary\s*(?:->|→|:|-|\/)\s*debra/i.test(l) ||
-    (/^debra$/i.test(l) && /salary|payroll|wage|comp/i.test(p)) ||
-    /(debra.*(w2|w-2|wage|sal|comp)|salaries.*wages)/i.test(l)
+    (spouseRe && isPayrollContext && spouseRe.test(l)) ||
+    /salaries\s*(&|and)\s*wages/i.test(l)
   ) {
     return { target: 'debra_salaries_wages', confidence: 'high' };
   }
@@ -900,20 +1241,17 @@ function classifyPnlLabel(
     return { target: 'travel', confidence: 'high' };
   }
 
-  // 8. Taxes & Licenses: Payroll Taxes vs State / CA FTB
+  // 8. Taxes & Licenses: Payroll Taxes vs State Entity / Franchise Tax
   if (
-    /^ca sdi$/i.test(l) ||
-    /^ca sui[- ]?er$/i.test(l) ||
-    /^az sui[- ]?er$/i.test(l) ||
     /^fed$/i.test(l) ||
     /^medcare$/i.test(l) ||
-    /(payroll tax|fica|futa|suta|edd|sdi|sui-er)/i.test(l)
+    /(payroll tax|fica|futa|suta|edd|\bsdi\b|sui[- ]?er)/i.test(l)
   ) {
     return { target: 'payroll_taxes', confidence: 'high' };
   }
   if (
     /^state$/i.test(l) ||
-    /(\bftb\b|franchise tax|california.*tax|ca.*tax|state.*tax|100s)/i.test(l)
+    /(\bftb\b|franchise tax|state.*tax|100s)/i.test(l)
   ) {
     return { target: 'ca_ftb_tax', confidence: 'high' };
   }
@@ -974,39 +1312,42 @@ function classifyPnlLabel(
   }
 
   // Fallback generic revenue
-  if (/(gross receipt|sales|revenue|income|billings)/i.test(l) && !/tax|expense|fee/i.test(l)) {
-    return { target: 'split_revenue_ca_az', confidence: 'medium' };
+  if (/(gross receipt|sales|revenue|income|billings|retainer|consulting)/i.test(l) && !/tax|expense|fee/i.test(l)) {
+    return { target: dyn.secondaryStateCode ? 'split_revenue_ca_az' : 'ca_revenue', confidence: 'medium' };
   }
 
   return { target: 'other_deductions', confidence: 'unmatched' };
 }
 
 function classifyBalanceSheetLabel(
-  label: string
+  label: string,
+  setup?: SetupConfig | null
 ): { target: QboTargetField; confidence: ParsedQboRow['confidence'] } {
   const l = label.toLowerCase().trim();
 
-  // Operating Cash: BlueVine Checking (or generic checking/savings)
+  // Operating Cash: Checking / Savings / Operating Cash accounts
   if (
-    /bluevine checking/i.test(l) ||
-    (/(checking|savings|operating.*cash|cash.*bank|bank|money market)/i.test(l) &&
-      !/credit card|\bcc\b/i.test(l))
+    /(checking|savings|operating.*cash|cash.*bank|bank|money market)/i.test(l) &&
+    !/credit card|\bcc\b/i.test(l)
   ) {
     return { target: 'operating_cash_ytd', confidence: 'high' };
   }
 
-  // Pension Expense Payable: Defined Benefit Plan Payable + OSS 401K Plan Payable
+  // Pension / Retirement Expense Payable
   if (
-    /defined benefit plan payable|oss 401k plan payable/i.test(l) ||
-    /(pension.*pay|dbp.*pay|401\(?k\)?.*pay|retirement.*pay|accrued.*pension)/i.test(l)
+    /(defined benefit.*payable|pension.*pay|dbp.*pay|401\(?k\)?.*pay|retirement.*pay|accrued.*pension)/i.test(l)
   ) {
     return { target: 'pension_payable_ytd', confidence: 'high' };
   }
 
-  // Credit Card / Accounts Payable: Amazon CC + Amtrak + AMX CC + Cap One CC
+  // Credit Card / Accounts Payable
+  const extraCards = isDefaultSeedSetup(setup)
+    ? DEFAULT_PROFILE_SEED.default_cadence_2026.extra_card_account_names
+    : [];
+  const matchesExtraCard = extraCards.some((name) => l.includes(name));
   if (
-    /amazon\s*cc|amtrak|amx\s*cc|amex|cap\s*one\s*cc|capital\s*one/i.test(l) ||
-    /(credit card|accounts payable|\ba\/p\b|visa|mastercard|chase ink|payable)/i.test(l)
+    matchesExtraCard ||
+    /(\bcc\b|credit card|accounts payable|\ba\/p\b|visa|mastercard|amex|capital\s*one|chase ink|payable)/i.test(l)
   ) {
     return { target: 'cc_ap_ytd', confidence: 'high' };
   }
@@ -1026,7 +1367,8 @@ function classifyBalanceSheetLabel(
 
 export function parseQboReportText(
   rawText: string,
-  reportType: 'pnl' | 'balance_sheet'
+  reportType: 'pnl' | 'balance_sheet',
+  setup?: SetupConfig | null
 ): ParsedQboRow[] {
   const rawLines = rawText.split(/\r?\n/);
 
@@ -1076,7 +1418,7 @@ export function parseQboReportText(
     const rows: ParsedQboRow[] = [];
     for (const e of entries) {
       if (e.isTotal) continue;
-      const cls = classifyBalanceSheetLabel(e.label);
+      const cls = classifyBalanceSheetLabel(e.label, setup);
       const isDraws = cls.target === 'member_draws_ytd';
       rows.push({
         id: `qbo-${e.idx}-${e.label.slice(0, 16)}`,
@@ -1090,9 +1432,20 @@ export function parseQboReportText(
     return rows;
   }
 
+  const dynTokens = getDynamicNameTokens(setup);
+  const memberNameList = [dynTokens.primaryFirst, dynTokens.spouseFirst].filter(Boolean);
+  const memberHealthChildRe =
+    memberNameList.length > 0
+      ? new RegExp(`shareholder health\\s*[-–—:]\\s*(${memberNameList.map(escapeRegExp).join('|')})`, 'i')
+      : /shareholder health\s*[-–—:]\s*\w+/i;
+  const bareMemberLeafRe =
+    memberNameList.length > 0
+      ? new RegExp(`^(${memberNameList.map(escapeRegExp).join('|')})$`, 'i')
+      : null;
+
   // P&L pass: detect whether Shareholder Health children or non-meal Travel children exist
   const hasShareholderHealthChildren = entries.some(
-    (e) => !e.isTotal && /shareholder health\s*[-–—:]\s*(bill|debra)/i.test(e.label)
+    (e) => !e.isTotal && memberHealthChildRe.test(e.label)
   );
   const hasNonMealTravelChildren = entries.some(
     (e) => !e.isTotal && /ground transportation|lodging|airfare|hotel|flight/i.test(e.label)
@@ -1163,9 +1516,9 @@ export function parseQboReportText(
       continue;
     }
 
-    const cls = classifyPnlLabel(e.label, e.parent);
+    const cls = classifyPnlLabel(e.label, e.parent, setup);
     const displayLabel =
-      e.parent && (/^bill$/i.test(e.label) || /^debra$/i.test(e.label))
+      e.parent && bareMemberLeafRe?.test(e.label)
         ? `${e.parent} → ${e.label}`
         : e.label;
 
@@ -1182,60 +1535,9 @@ export function parseQboReportText(
   return rows;
 }
 
-export const SAMPLE_QBO_PNL_TEXT = `Consulting - Debra (CA)\t127,340.00
-Consulting - Bill (AZ)\t165,443.71
-Services - Bill (AZ)\t21,500.00
-Services Income\t5,000.00
-Salary
-Bill\t20,534.52
-Debra\t20,257.99
-Total for Salary\t40,792.51
-Shareholder Health Insurance
-Shareholder Health - Bill\t3,083.93
-Shareholder Health - Debra\t3,083.92
-Total for Shareholder Health Insurance\t6,167.85
-Rents\t10,487.00
-Payroll Taxes
-CA SDI\t498.12
-CA SUI-ER\t340.00
-Fed\t2,540.22
-MedCare\t591.52
-AZ SUI-ER\t193.00
-Total for Payroll Taxes\t4,162.86
-State\t-466.84
-Professional Fees\t5,806.00
-legal fees\t750.00
-Subscriptions & Software\t3,797.30
-Telephone Expense\t940.00
-Internet\t842.57
-Computer and Internet Expenses\t600.00
-Travel Expense
-Ground Transportation\t145.34
-Lodging\t260.00
-Business Meals\t890.00
-Individual Meals\t216.58
-Total for Travel Expense\t1,511.92
-Meals at Restaurant\t700.00
-Office Equipment\t4,912.31
-Office Supplies\t2,950.00
-Insurance\t1,190.92
-Utilities\t149.45
-Bank Service Charges\t182.99
-Payroll Expenses\t850.00
-Continuing Education\t620.00
-Interest Expense\t185.07
-Petty Cash\t340.00
-Shipping\t325.00
-Interest Income\t609.18`;
+export const SAMPLE_QBO_PNL_TEXT = SAMPLE_TEST_PERSONA_QBO_PNL;
 
-export const SAMPLE_QBO_BS_TEXT = `BlueVine Checking\t42,580.89
-Amazon CC\t842.15
-Amtrak\t310.00
-AMX CC\t1,125.40
-Cap One CC\t686.22
-Defined Benefit Plan Payable\t0.00
-OSS 401K Plan Payable\t0.00
-Member Draws\t(121,939.75)`;
+export const SAMPLE_QBO_BS_TEXT = SAMPLE_TEST_PERSONA_QBO_BS;
 
 // ============================================================================
 // CPA Projection Package CSV Builder
@@ -1249,19 +1551,33 @@ function csvEscape(v: string | number): string {
   return s;
 }
 
-export const CPA_DISCLOSURE_METADATA = {
-  preparedBy:
-    'Prepared by Operating Support Services, LLC (ossadvisorygroup.com) - Rolling Tax Planner / Transaction Cadence Forecaster',
-  purpose:
-    'Preliminary tax-planning projection for review with your CPA (does not replace professional CPA, tax, legal, or accounting advice)',
-  disclaimer:
-    'This report is a preliminary tax-planning projection for review with your CPA and does not replace professional CPA, tax, legal, or accounting advice. Year-to-date figures reflect imported accounting or bookkeeping records as of the report cutoff date, while remaining-year projections use automated cadence or smoothing rules and user assumptions that require CPA review before tax return preparation or filing. Generated by the Operating Support Services, LLC application (ossadvisorygroup.com).',
-  csvHeaderLines: [
-    '# Prepared by Operating Support Services, LLC (ossadvisorygroup.com) - Rolling Tax Planner / Transaction Cadence Forecaster',
-    '# Purpose: Preliminary tax-planning projection for review with your CPA (does not replace professional CPA, tax, legal, or accounting advice).',
-    '# Disclaimer: This report is a preliminary tax-planning projection for review with your CPA and does not replace professional CPA, tax, legal, or accounting advice. Year-to-date figures reflect imported accounting or bookkeeping records as of the report cutoff date, while remaining-year projections use automated cadence or smoothing rules and user assumptions that require CPA review before tax return preparation or filing. Generated by the Operating Support Services, LLC application (ossadvisorygroup.com).',
-  ] as const,
-};
+export function buildCpaDisclosureMetadata(setup?: SetupConfig | null, fallbackEntityName?: string) {
+  const { businessName, businessWebsite, preparedByLabel } = getSetupBusinessIdentity(
+    setup,
+    fallbackEntityName
+  );
+  const siteSuffix = businessWebsite ? ` (${businessWebsite})` : '';
+  const hasNamedBusiness = Boolean(businessName && businessName !== 'Business Entity');
+  const preparedByLine = hasNamedBusiness
+    ? `${preparedByLabel}${siteSuffix} - Rolling Tax Planner / Transaction Cadence Forecaster`
+    : 'Prepared via Rolling Tax Planner / Transaction Cadence Forecaster';
+  const generatedByClause = hasNamedBusiness
+    ? `Generated via Rolling Tax Planner for ${businessName}${siteSuffix}.`
+    : 'Generated via Rolling Tax Planner.';
+  const disclaimer = `This report is a preliminary tax-planning projection for review with your CPA and does not replace professional CPA, tax, legal, or accounting advice. Year-to-date figures reflect imported accounting or bookkeeping records as of the report cutoff date, while remaining-year projections use automated cadence or smoothing rules and user assumptions that require CPA review before tax return preparation or filing. ${generatedByClause}`;
+
+  return {
+    preparedBy: preparedByLine,
+    purpose:
+      'Preliminary tax-planning projection for review with your CPA (does not replace professional CPA, tax, legal, or accounting advice)',
+    disclaimer,
+    csvHeaderLines: [
+      `# ${preparedByLine}`,
+      '# Purpose: Preliminary tax-planning projection for review with your CPA (does not replace professional CPA, tax, legal, or accounting advice).',
+      `# Disclaimer: ${disclaimer}`,
+    ] as const,
+  };
+}
 
 export interface CpaReportMetadata {
   moduleName?: string;
@@ -1270,6 +1586,7 @@ export interface CpaReportMetadata {
   forecastAssumptions?: string;
   elapsedDays?: number;
   remainingDays?: number;
+  activeGoals?: EvaluatedPlanningGoal[];
 }
 
 export type CpaPackageMetaOptions = CpaReportMetadata;
@@ -1294,6 +1611,7 @@ export interface CpaPackageMetadata {
   totalYearDays: number;
   activeAssumptions: CpaPackageAssumptionItem[];
   activeAssumptionsSummary: string;
+  activeGoals: EvaluatedPlanningGoal[];
   disclaimerHeadline: string;
   disclaimerBody: string;
   csvCommentLines: string[];
@@ -1393,8 +1711,14 @@ export function buildCpaPackageMetadata(
       ? Math.max(0, Math.round(options.elapsedDays))
       : calendar.elapsedDays;
 
-  const preparedBy = 'Prepared by Operating Support Services, LLC';
-  const website = 'ossadvisorygroup.com';
+  const bizIdentity = getSetupBusinessIdentity(setup, entityName, entityEin);
+  const setupStates = getSetupStates(setup);
+  const state1Code = setupStates.primaryStateCode || 'State 1';
+  const state2Code = setupStates.secondaryStateCode || 'State 2';
+
+  const preparedBy = bizIdentity.preparedByLabel;
+  const website = bizIdentity.businessWebsite;
+  const websiteSuffix = website ? ` (${website})` : '';
   const moduleName =
     genericizeAccountingLabel(options?.moduleName) ||
     'Rolling Tax Planner / Transaction Cadence Forecaster';
@@ -1426,20 +1750,46 @@ export function buildCpaPackageMetadata(
         comp.lines.employer_401k.projected
       )} · SEHI ${fmtUsdExact(comp.lines.sehi_medicare.projected)} · YE Retirement Payable ${fmtUsdExact(
         bs.pension_payable_ye
-      )}`,
+      )}${
+        bs.pension_payable_ye === 0 &&
+        comp.lines.dbp_contribution.projected + comp.lines.employer_401k.projected > 0
+          ? ' (IRC §404(a)(6) / cash-basis funding)'
+          : ''
+      }`,
     },
+    ...(setup.has_stock_basis !== false
+      ? [
+          {
+            label: 'Tax & Basis Rules',
+            value: `50/50 Sch M-1 meals split · Sch K Interest excl. from Ln 22 · Beg. Basis ${fmtUsdExact(
+              comp.beginningStockBasis
+            )} (${
+              bs.beginning_stock_basis_override !== null ? 'Custom Override' : 'Prior-Year Rollover'
+            }) · Remaining Draws ${fmtUsdExact(bs.member_draws_remaining)}`,
+          },
+        ]
+      : [
+          {
+            label: 'Tax & Book Rules',
+            value: '50/50 Sch M-1 meals split · Sch K Interest excl. from Ln 22',
+          },
+        ]),
     {
-      label: 'Tax & Basis Rules',
-      value: `50/50 Sch M-1 meals split · Sch K Interest excl. from Ln 22 · Beg. Basis ${fmtUsdExact(
-        comp.beginningStockBasis
-      )} (${bs.beginning_stock_basis_override !== null ? 'Custom Override' : 'Prior-Year Rollover'}) · Remaining Draws ${fmtUsdExact(
-        bs.member_draws_remaining
-      )}`,
-    },
-    {
-      label: 'Apportionment & Cash',
-      value: `CA ${comp.caPct.projected}% / AZ ${comp.azPct.projected}% · Ownership ${primaryName} ${comp.billSharePct}% / ${spouseName} ${comp.debraSharePct}% · YE Cash ${
-        bs.operating_cash_ye_override !== null ? 'Manual Override' : 'Auto-Projected'
+      label: setup.multi_state_active ? 'Apportionment & Cash' : 'Ownership & Cash',
+      value: `${
+        setup.multi_state_active
+          ? `${state1Code} ${comp.caPct.projected}% / ${state2Code} ${comp.azPct.projected}% · `
+          : setupStates.hasPrimaryState
+          ? `${state1Code} (Single-State) · `
+          : ''
+      }Ownership ${primaryName} ${comp.billSharePct}% / ${spouseName} ${
+        comp.debraSharePct
+      }% · YE Cash ${
+        bs.operating_cash_ye_override !== null
+          ? 'Manual Override'
+          : comp.subsequentYearRetirementAddback > 0
+          ? 'Auto-Projected, excl. next-yr §404(a)(6) funding'
+          : 'Auto-Projected'
       } (${fmtUsdExact(comp.projectedCashYe)})`,
     },
   ];
@@ -1448,17 +1798,34 @@ export function buildCpaPackageMetadata(
     .map((item) => `${item.label}: ${item.value}`)
     .join(' | ');
 
+  const activeGoals = (options?.activeGoals ?? []).filter((g) => g.goal.enabled);
+  const activeGoalsBrief =
+    activeGoals.length > 0
+      ? activeGoals
+          .map(
+            (g) =>
+              `${g.goal.title} [Target ${g.targetDisplay} | Proj ${g.currentDisplay} | ${g.statusLabel}]`
+          )
+          .join(' ; ')
+      : '';
+
   const disclaimerHeadline = 'PRELIMINARY TAX-PLANNING PROJECTION — FOR REVIEW WITH YOUR CPA';
-  const disclaimerBody =
-    'This report is a preliminary tax-planning projection for review with your CPA and does not replace professional CPA, tax, legal, or accounting advice. Year-to-date figures reflect imported accounting or bookkeeping records as of the report cutoff date, while remaining-year projections use automated cadence or smoothing rules and user assumptions that require CPA review before tax return preparation or filing. Generated by the Operating Support Services, LLC application (ossadvisorygroup.com).';
+  const generatedClause =
+    bizIdentity.businessName && bizIdentity.businessName !== 'Business Entity'
+      ? `Prepared for ${bizIdentity.businessName}${websiteSuffix}.`
+      : 'Generated via Rolling Tax Planner.';
+  const disclaimerBody = `This report is a preliminary tax-planning projection for review with your CPA and does not replace professional CPA, tax, legal, or accounting advice. Year-to-date figures reflect imported accounting or bookkeeping records as of the report cutoff date, while remaining-year projections use automated cadence or smoothing rules and user assumptions that require CPA review before tax return preparation or filing. ${generatedClause}`;
 
   const csvCommentLines = [
-    `# ${preparedBy} (${website})`,
+    `# ${preparedBy}${websiteSuffix}`,
     `# Module: ${moduleName}`,
-    `# Entity: ${entityName} (EIN ${entityEin}) | Tax Year: ${year}`,
+    `# Entity: ${entityName}${entityEin ? ` (EIN ${entityEin})` : ''} | Tax Year: ${year}`,
     `# Report Cutoff / As-Of Date: ${asOfDateDisplay} (${bs.as_of_date}) | Remaining Days Through ${yearEndDisplay}: ${remainingDays} days (${elapsedDays} of ${totalYearDays} YTD days elapsed)`,
     `# Accounting Records Source: ${sourceMode}`,
     `# Active Forecast Assumptions: ${activeAssumptionsSummary}`,
+    ...(activeGoalsBrief
+      ? [`# Planning Goals & Guardrails (${activeGoals.length} active): ${activeGoalsBrief}`]
+      : []),
     `# Purpose: Preliminary tax-planning projection for review with your CPA (does not replace professional CPA, tax, legal, or accounting advice).`,
     `# Disclaimer: ${disclaimerBody}`,
   ];
@@ -1478,6 +1845,7 @@ export function buildCpaPackageMetadata(
     totalYearDays,
     activeAssumptions,
     activeAssumptionsSummary,
+    activeGoals,
     disclaimerHeadline,
     disclaimerBody,
     csvCommentLines,
@@ -1514,10 +1882,14 @@ export function buildCpaProjectionCsv(
       'Ownership Split',
       `${primaryName} ${comp.billSharePct}% / ${spouseName} ${comp.debraSharePct}%`,
     ],
-    [
-      'Projected State Apportionment',
-      `CA ${comp.caPct.projected}% / AZ ${comp.azPct.projected}%`,
-    ],
+    ...(setup.multi_state_active
+      ? [
+          [
+            'Projected State Apportionment',
+            `CA ${comp.caPct.projected}% / AZ ${comp.azPct.projected}%`,
+          ],
+        ]
+      : []),
     ['Active Forecast Assumptions', meta.activeAssumptionsSummary],
     ['CPA Review Disclaimer', `${meta.disclaimerHeadline} — ${meta.disclaimerBody}`],
     [],
@@ -1609,7 +1981,10 @@ export function buildCpaProjectionCsv(
     comp.projectedCashYe.toFixed(2),
   ]);
   rows.push([
-    'Pension / Retirement Expense Payable',
+    bs.pension_payable_ye === 0 &&
+    comp.lines.dbp_contribution.projected + comp.lines.employer_401k.projected > 0
+      ? 'Pension / Retirement Expense Payable (IRC §404(a)(6) / cash-basis funding)'
+      : 'Pension / Retirement Expense Payable',
     bs.pension_payable_beg.toFixed(2),
     bs.pension_payable_ytd.toFixed(2),
     bs.pension_payable_ye.toFixed(2),
@@ -1643,65 +2018,93 @@ export function buildCpaProjectionCsv(
   const billNonded = round2(comp.mealsNondeductible50.projected * billPct);
   const debraNonded = round2(comp.mealsNondeductible50.projected - billNonded);
 
-  rows.push([]);
-  rows.push([
-    'FORM 7203 SHAREHOLDER STOCK BASIS PROJECTION',
-    'Combined (100%)',
-    `${primaryName} (${comp.billSharePct}%)`,
-    `${spouseName} (${comp.debraSharePct}%)`,
-  ]);
-  rows.push([
-    `Beginning Stock Basis (1/1/${pnlState.projection_year})`,
-    comp.beginningStockBasis.toFixed(2),
-    billBeg.toFixed(2),
-    debraBeg.toFixed(2),
-  ]);
-  rows.push([
-    '+ Projected Ordinary Business Income (K-1 Box 1)',
-    posInc.toFixed(2),
-    billInc.toFixed(2),
-    debraInc.toFixed(2),
-  ]);
-  rows.push([
-    '+ Schedule K Interest Income (Line 4)',
-    posInt.toFixed(2),
-    billInt.toFixed(2),
-    debraInt.toFixed(2),
-  ]);
-  rows.push([
-    '+ Capital Contributions (YTD + Remaining)',
-    comp.projectedCapitalContributionsTotal.toFixed(2),
-    billCap.toFixed(2),
-    debraCap.toFixed(2),
-  ]);
-  rows.push(['= Basis Available Before Distributions', comp.basisAvailableBeforeDraws.toFixed(2), '', '']);
-  rows.push([
-    '- Member Draws / Distributions (YTD + Planned Remaining)',
-    (-comp.projectedDrawsTotal).toFixed(2),
-    (-billDraws).toFixed(2),
-    (-debraDraws).toFixed(2),
-  ]);
-  rows.push([
-    '- Nondeductible Expenses (50% Meals Sch M-1)',
-    (-comp.mealsNondeductible50.projected).toFixed(2),
-    (-billNonded).toFixed(2),
-    (-debraNonded).toFixed(2),
-  ]);
-  rows.push([
-    `= Projected Ending Stock Basis (12/31/${pnlState.projection_year})`,
-    comp.projectedEndingStockBasis.toFixed(2),
-    comp.billProjectedBasisEnding.toFixed(2),
-    comp.debraProjectedBasisEnding.toFixed(2),
-  ]);
-  rows.push([
-    'Form 8949 Excess Distribution Capital Gain',
-    comp.projectedExcessDistributionGain.toFixed(2),
-    comp.billExcessGain.toFixed(2),
-    comp.debraExcessGain.toFixed(2),
-  ]);
+  if (setup.has_stock_basis !== false) {
+    rows.push([]);
+    rows.push([
+      'FORM 7203 SHAREHOLDER STOCK BASIS PROJECTION',
+      'Combined (100%)',
+      `${primaryName} (${comp.billSharePct}%)`,
+      `${spouseName} (${comp.debraSharePct}%)`,
+    ]);
+    rows.push([
+      `Beginning Stock Basis (1/1/${pnlState.projection_year})`,
+      comp.beginningStockBasis.toFixed(2),
+      billBeg.toFixed(2),
+      debraBeg.toFixed(2),
+    ]);
+    rows.push([
+      '+ Projected Ordinary Business Income (K-1 Box 1)',
+      posInc.toFixed(2),
+      billInc.toFixed(2),
+      debraInc.toFixed(2),
+    ]);
+    rows.push([
+      '+ Schedule K Interest Income (Line 4)',
+      posInt.toFixed(2),
+      billInt.toFixed(2),
+      debraInt.toFixed(2),
+    ]);
+    rows.push([
+      '+ Capital Contributions (YTD + Remaining)',
+      comp.projectedCapitalContributionsTotal.toFixed(2),
+      billCap.toFixed(2),
+      debraCap.toFixed(2),
+    ]);
+    rows.push(['= Basis Available Before Distributions', comp.basisAvailableBeforeDraws.toFixed(2), '', '']);
+    rows.push([
+      '- Member Draws / Distributions (YTD + Planned Remaining)',
+      (-comp.projectedDrawsTotal).toFixed(2),
+      (-billDraws).toFixed(2),
+      (-debraDraws).toFixed(2),
+    ]);
+    rows.push([
+      '- Nondeductible Expenses (50% Meals Sch M-1)',
+      (-comp.mealsNondeductible50.projected).toFixed(2),
+      (-billNonded).toFixed(2),
+      (-debraNonded).toFixed(2),
+    ]);
+    rows.push([
+      `= Projected Ending Stock Basis (12/31/${pnlState.projection_year})`,
+      comp.projectedEndingStockBasis.toFixed(2),
+      comp.billProjectedBasisEnding.toFixed(2),
+      comp.debraProjectedBasisEnding.toFixed(2),
+    ]);
+    rows.push([
+      'Form 8949 Excess Distribution Capital Gain',
+      comp.projectedExcessDistributionGain.toFixed(2),
+      comp.billExcessGain.toFixed(2),
+      comp.debraExcessGain.toFixed(2),
+    ]);
+  }
+
+  if (meta.activeGoals.length > 0) {
+    rows.push([]);
+    rows.push([
+      'PLANNING GOALS & GUARDRAILS FOR CPA REVIEW',
+      'Target Threshold',
+      'Current Projected',
+      'Status',
+      'Variance / Context',
+      'Why This Matters',
+    ]);
+    for (const item of meta.activeGoals) {
+      rows.push([
+        item.goal.title,
+        item.targetDisplay,
+        item.currentDisplay,
+        item.statusLabel,
+        item.varianceSummary,
+        item.goal.why_it_matters,
+      ]);
+    }
+  }
+
   rows.push([]);
   rows.push(['PACKAGE BRANDING & CPA DISCLAIMER']);
-  rows.push(['Prepared By', `${meta.preparedBy} (${meta.website})`]);
+  rows.push([
+    'Prepared By',
+    meta.website ? `${meta.preparedBy} (${meta.website})` : meta.preparedBy,
+  ]);
   rows.push(['Module', meta.moduleName]);
   rows.push([
     'As-Of Date & Remaining Days',

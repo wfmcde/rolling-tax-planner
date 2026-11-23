@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import type { ComputedTaxYear, SetupConfig } from '../types/tax';
 import { getPersonNames } from '../engine/scheduleCatalog';
+import { DEFAULT_PROFILE_SEED } from '../data/profiles';
 import { formatCurrency } from '../utils/format';
 
 interface VerificationCheckpointsCardProps {
@@ -36,7 +37,6 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
   year2025,
   onSet2025Ss,
 }) => {
-  const [expanded, setExpanded] = useState(true);
   const { primaryName, spouseName } = getPersonNames(setup);
 
   const caFiling = year2025.state_filings_out.find((s) => s.state_code === 'CA');
@@ -55,9 +55,14 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
   const ca100s = caFiling?.state_entity_tax_liability ?? 0;
   const az140nr = azFiling?.state_personal_tax_liability ?? 0;
 
-  const k1Diff = k1 - 91498;
+  const bench = DEFAULT_PROFILE_SEED.verification_benchmarks_2025;
+  const k1Diff = k1 - bench.k1_ordinary_income;
   const stdDed = year2025.form_1040_out.deduction_amount;
   const seniorDed = year2025.form_1040_out.enhanced_senior_deduction_allowed;
+  const ssTestAmt = bench.ss_annual_test_amount;
+  const ssTestLabel = `$${(ssTestAmt / 1000).toFixed(1)}k`;
+  const primaryOwnPct = year2025.scorp_in.bill_ownership_pct ?? 50;
+  const spouseOwnPct = year2025.scorp_in.debra_ownership_pct ?? 50;
 
   const checkpoints: CheckpointRow[] = [
     {
@@ -65,12 +70,10 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
       label: 'S-Corp Ordinary Business Income',
       formRef: 'Form 1120-S, Line 22',
       computed: k1,
-      target: 91498,
+      target: bench.k1_ordinary_income,
       note:
         k1Diff === 0
           ? 'Exact match to filed Form 1120-S.'
-          : k1Diff === -167
-          ? 'Exact -$167 variance equals Advertising ($167); verify whether $167 is inside Other Deductions ($23,529) or offset by Line 5 Other Income.'
           : `Gross receipts minus 1120-S deductions differs by ${formatSignedVariance(k1Diff)}.`,
     },
     {
@@ -78,58 +81,58 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
       label: 'Form 8995 QBI Deduction',
       formRef: 'Form 1040, Line 13a',
       computed: qbi,
-      target: 14337,
+      target: bench.qbi_deduction,
       note: ssActive
         ? `Includes $${(billSs + debraSs).toLocaleString()} gross SS baseline; 20% K-1 cap applies.`
-        : qbi === 14337
+        : qbi === bench.qbi_deduction
         ? 'Exact match: 20% × (Taxable before QBI − Net Cap Gain − Qualified Div).'
-        : 'Pure cascade from -$167 K-1 and +$20 Senior Deduction (-$187 taxable before QBI × 20%). Matches $14,337 exactly when K-1 = $91,498.',
+        : `Differs from filed reference target by ${formatSignedVariance(qbi - bench.qbi_deduction)}.`,
     },
     {
       id: 'agi',
       label: 'Form 1040 AGI',
       formRef: 'Form 1040, Line 11',
       computed: agi,
-      target: 150511,
+      target: bench.agi,
       note: ssActive
         ? `Reflects +${formatCurrency(year2025.form_1040_out.social_security_taxable)} taxable SS (Line 6b).`
-        : agi === 150511
+        : agi === bench.agi
         ? 'Exact match to filed Form 1040 Line 11.'
-        : 'Exact -$167 cascade from Form 1120-S Ordinary Business Income. Matches $150,511 exactly when K-1 = $91,498.',
+        : `Differs from filed reference target by ${formatSignedVariance(agi - bench.agi)}.`,
     },
     {
       id: 'taxable',
       label: 'Form 1040 Taxable Income',
       formRef: 'Form 1040, Line 15',
       computed: taxable,
-      target: 89536,
+      target: bench.taxable_income,
       note: ssActive
         ? `Std Ded ${formatCurrency(stdDed)} · Sch 1-A Senior Ded ${formatCurrency(seniorDed)}.`
-        : taxable === 89536
+        : taxable === bench.taxable_income
         ? `Exact match (Std Ded ${formatCurrency(stdDed)} · Sch 1-A Senior Ded ${formatCurrency(seniorDed)}).`
-        : `Std Ded ${formatCurrency(stdDed)} (exact) · Sch 1-A Senior Ded ${formatCurrency(seniorDed)} (+$20 cascade from -$167 AGI). Matches $89,536 exactly when K-1 = $91,498.`,
+        : `Std Ded ${formatCurrency(stdDed)} · Sch 1-A Senior Ded ${formatCurrency(seniorDed)}.`,
     },
     {
       id: 'fedTax',
       label: 'Form 1040 Total Tax',
       formRef: 'Form 1040, Line 24',
       computed: fedTax,
-      target: 6402,
+      target: bench.federal_tax,
       note: ssActive
         ? `Effective ${year2025.form_1040_out.effective_tax_rate.toFixed(2)}% · Marginal ${year2025.form_1040_out.marginal_tax_rate}% with SS active.`
-        : fedTax === 6402
-        ? 'Exact match using 2025 QDCG Worksheet + IRS $50 Tax Table midpoint.'
-        : 'Cascade (-$149 ordinary taxable × 12% bracket). Matches $6,402 exactly when K-1 = $91,498.',
+        : fedTax === bench.federal_tax
+        ? 'Exact match using QDCG Worksheet + IRS $50 Tax Table midpoint.'
+        : `Differs from filed reference target by ${formatSignedVariance(fedTax - bench.federal_tax)}.`,
     },
     {
       id: 'ca540',
       label: 'CA Form 540 Tax (Before Penalties/Interest)',
       formRef: 'CA Form 540',
       computed: ca540,
-      target: 5362,
+      target: bench.primary_state_personal_tax,
       note:
-        ca540 === 5362
-          ? `Exact match: CA AGI ${formatCurrency(caFiling?.state_apportioned_income ?? 0)} (+$969 Sch CA: +$2,891 FTB, -$511 depr, -$1,411 basis); CA 100S ${formatCurrency(ca100s)} tracked separately.`
+        ca540 === bench.primary_state_personal_tax
+          ? `Exact match: CA AGI ${formatCurrency(caFiling?.state_apportioned_income ?? 0)}; CA 100S ${formatCurrency(ca100s)} tracked separately.`
           : `CA AGI ${formatCurrency(caFiling?.state_apportioned_income ?? 0)} · CA 100S ${formatCurrency(ca100s)} tracked separately; SS exempt in CA.`,
     },
     {
@@ -137,9 +140,9 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
       label: 'AZ Form 140NR Net Tax (After Credit)',
       formRef: 'AZ Form 140NR / Form 309',
       computed: az140nr,
-      target: 0,
+      target: bench.secondary_state_personal_tax,
       note:
-        az140nr === 0
+        az140nr === bench.secondary_state_personal_tax
           ? 'Exact match: statutory CA/AZ reverse credit (AZ Form 309) offsets 100% of AZ non-resident tax.'
           : 'Review CA resident / AZ non-resident reverse credit configuration.',
     },
@@ -148,9 +151,24 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
   const exactCount = checkpoints.filter((c) => c.computed === c.target).length;
   const mismatchCount = checkpoints.length - exactCount;
 
+  // Default to collapsed whenever all checkpoints pass; auto-expand whenever any checkpoint fails
+  const [expanded, setExpanded] = useState<boolean>(() => mismatchCount > 0);
+  const prevMismatchCountRef = useRef<number>(mismatchCount);
+
+  useEffect(() => {
+    if (mismatchCount > 0 && prevMismatchCountRef.current === 0) {
+      setExpanded(true);
+    }
+    prevMismatchCountRef.current = mismatchCount;
+  }, [mismatchCount]);
+
   return (
     <div className="bg-white border border-slate-200 rounded-lg">
-      <div className="px-5 py-3.5 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+      <div
+        className={`px-5 py-3.5 ${
+          expanded ? 'border-b border-slate-200' : ''
+        } flex flex-col lg:flex-row lg:items-center justify-between gap-3`}
+      >
         <div className="flex items-start gap-2.5">
           <FlaskConical className="w-4 h-4 text-teal-700 mt-0.5 shrink-0" />
           <div>
@@ -184,7 +202,7 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
               role="group"
               aria-label={`2025 ${primaryName} Social Security test value`}
             >
-              {[0, 39500].map((val) => {
+              {[0, ssTestAmt].map((val) => {
                 const active = billSs === val;
                 return (
                   <button
@@ -197,7 +215,7 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
                         : 'text-slate-600 hover:text-slate-900'
                     }`}
                   >
-                    {val === 0 ? '$0' : '$39.5k'}
+                    {val === 0 ? '$0' : ssTestLabel}
                   </button>
                 );
               })}
@@ -211,7 +229,7 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
               role="group"
               aria-label={`2025 ${spouseName} Social Security test value`}
             >
-              {[0, 39500].map((val) => {
+              {[0, ssTestAmt].map((val) => {
                 const active = debraSs === val;
                 return (
                   <button
@@ -224,7 +242,7 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
                         : 'text-slate-600 hover:text-slate-900'
                     }`}
                   >
-                    {val === 0 ? '$0' : '$39.5k'}
+                    {val === 0 ? '$0' : ssTestLabel}
                   </button>
                 );
               })}
@@ -319,10 +337,10 @@ export const VerificationCheckpointsCard: React.FC<VerificationCheckpointsCardPr
                     year2025.form_1040_in.long_term_capital_gain_loss
                 )}
               </span>{' '}
-              (Filed: $32,122).
+              (Filed: {formatCurrency(bench.schedule_d_net_filed)}).
             </div>
             <div className="font-mono tabular-nums text-slate-500">
-              EIN {year2025.scorp_in.entity_ein ?? '83-1706286'} · 51% {primaryName} / 49% {spouseName}
+              EIN {year2025.scorp_in.entity_ein || setup.business_ein || '—'} · {primaryOwnPct}% {primaryName} / {spouseOwnPct}% {spouseName}
             </div>
           </div>
         </div>

@@ -9,6 +9,7 @@ import type {
 } from '../types/tax';
 import { STATE_TAX_RULES } from '../engine/taxEngine';
 import { formatCurrency } from '../utils/format';
+import { ALL_US_STATE_OPTIONS, getStateFullName } from '../utils/setupHelpers';
 import { NumericField } from './NumericField';
 
 interface MultiStateViewProps {
@@ -20,7 +21,7 @@ interface MultiStateViewProps {
   onUpdateYear: (taxYear: number, updater: (yr: TaxYearRecord) => TaxYearRecord) => void;
 }
 
-const AVAILABLE_STATES = Object.keys(STATE_TAX_RULES);
+const AVAILABLE_STATES = ALL_US_STATE_OPTIONS.map((st) => st.code);
 
 export const MultiStateView: React.FC<MultiStateViewProps> = ({
   setup,
@@ -58,7 +59,7 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
   const addState = () => {
     if (isLocked) return;
     const existingCodes = new Set(yr.state_filings.map((s) => s.state_code));
-    const nextCode = AVAILABLE_STATES.find((c) => !existingCodes.has(c)) ?? 'WA';
+    const nextCode = AVAILABLE_STATES.find((c) => !existingCodes.has(c)) ?? AVAILABLE_STATES[0] ?? 'TX';
     onUpdateYear(yr.tax_year, (prev) => {
       const nextItem: StateFilingInputs = {
         state_code: nextCode,
@@ -174,7 +175,7 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
               <div className="flex items-center justify-between gap-2 pb-3 border-b border-slate-200">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">
-                    {rule?.name ?? sf.state_code} ({sf.state_code})
+                    {rule?.name ?? getStateFullName(sf.state_code)} ({sf.state_code})
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">{sf.state_return_type}</p>
                 </div>
@@ -201,7 +202,7 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
                   >
                     {AVAILABLE_STATES.map((code) => (
                       <option key={code} value={code}>
-                        {code} — {STATE_TAX_RULES[code].name}
+                        {code} — {STATE_TAX_RULES[code]?.name ?? getStateFullName(code)}
                       </option>
                     ))}
                   </select>

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   Bar,
   CartesianGrid,
@@ -13,7 +13,11 @@ import {
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Eye,
+  FileCheck2,
+  Info,
   Lock,
   Pencil,
   RotateCcw,
@@ -22,6 +26,8 @@ import {
 import type {
   ArchivedActualsRecord,
   ComputedTaxYear,
+  GuardrailAckStatus,
+  GuardrailAcknowledgment,
   ScheduleViewConfig,
   SetupConfig,
   SsYearMode,
@@ -37,24 +43,44 @@ import {
   type CellTone,
   type ScheduleEditField,
 } from '../engine/scheduleCatalog';
+import { isDefaultSeedSetup } from '../data/profiles';
+import {
+  GUARDRAIL_ACK_STATUS_OPTIONS,
+  formatReasonableCompExplanationSummary,
+  getGuardrailAckStatusLabel,
+  syncReasonableCompNoteText,
+} from '../engine/validator';
+import { setIrmaaThresholdOverride } from '../engine/irmaa';
 import {
   formatCompactCurrency,
   formatCurrency,
   formatFilingStatus,
   formatPercent,
 } from '../utils/format';
+import {
+  MONTH_SHORT_NAMES,
+  getPersonBirthMonth,
+  updateProfileBirthMonth,
+} from '../utils/personTax';
+import { getSetupStates } from '../utils/setupHelpers';
 import { ScheduleRowPickerDrawer } from './ScheduleRowPickerDrawer';
+import { TaxReductionLeversDrawer } from './TaxReductionLeversDrawer';
 import { VerificationCheckpointsCard } from './VerificationCheckpointsCard';
 
 interface HorizonViewProps {
   setup: SetupConfig;
+  years: TaxYearRecord[];
   computed: ComputedTaxYear[];
   issues: ValidationIssue[];
+  guardrailAcknowledgments: Record<string, GuardrailAcknowledgment>;
   archivedYears: ArchivedActualsRecord[];
   selectedYear: number;
   scheduleView: ScheduleViewConfig;
+  onUpdateSetup: (next: SetupConfig) => void;
   onUpdateScheduleView: (next: ScheduleViewConfig) => void;
   onUpdateYear: (taxYear: number, updater: (yr: TaxYearRecord) => TaxYearRecord) => void;
+  onSaveGuardrailAck: (ack: GuardrailAcknowledgment) => void;
+  onReopenGuardrailAck: (ackKey: string) => void;
   onSelectYear: (year: number, navigateTo?: WorkspaceTab) => void;
   onNavigate: (tab: WorkspaceTab) => void;
 }
@@ -75,6 +101,62 @@ const BADGE_TONE_CLASS: Record<CellTone, string> = {
   accent: 'bg-teal-50 text-teal-800 border-teal-200',
 };
 
+const IRMAA_LOOKBACK_TOOLTIP =
+  "Medicare IRMAA uses a 2-year lookback: each year's MAGI (AGI + tax-exempt interest) is tested against the Medicare threshold 2 years later (e.g., 2026 income sets 2028 premiums at ≤$231k, not the 2026 threshold of $218k which tested 2024 income).";
+
+const IrmaaHoverTooltip: React.FC<{
+  text: string;
+  children: React.ReactNode;
+}> = ({ text, children }) => {
+  const [coords, setCoords] = useState<{
+    left: number;
+    top: number;
+    placement: 'top' | 'bottom';
+  } | null>(null);
+
+  const showFromElement = (el: HTMLElement) => {
+    const rect = el.getBoundingClientRect();
+    const tooltipWidth = 288;
+    const margin = 12;
+    const centerX = rect.left + rect.width / 2;
+    const clampedLeft = Math.max(
+      margin,
+      Math.min(window.innerWidth - tooltipWidth - margin, centerX - tooltipWidth / 2)
+    );
+    const showBelow = rect.top < 115;
+    setCoords({
+      left: clampedLeft,
+      top: showBelow ? rect.bottom + 8 : rect.top - 8,
+      placement: showBelow ? 'bottom' : 'top',
+    });
+  };
+
+  return (
+    <span
+      className="inline-flex items-center"
+      onMouseEnter={(e) => showFromElement(e.currentTarget)}
+      onMouseLeave={() => setCoords(null)}
+      onFocus={(e) => showFromElement(e.currentTarget)}
+      onBlur={() => setCoords(null)}
+    >
+      {children}
+      {coords && (
+        <span
+          role="tooltip"
+          style={{
+            left: `${coords.left}px`,
+            top: `${coords.top}px`,
+            transform: coords.placement === 'top' ? 'translateY(-100%)' : undefined,
+          }}
+          className="fixed z-50 w-72 px-3 py-2 rounded-md bg-slate-900 text-slate-50 border border-slate-700/80 shadow-lg text-[11px] font-normal leading-relaxed text-left whitespace-normal pointer-events-none"
+        >
+          {text}
+        </span>
+      )}
+    </span>
+  );
+};
+
 function parseCurrencyDraft(raw: string): number | null {
   const cleaned = raw.replace(/[^0-9.-]/g, '').trim();
   if (cleaned === '') return null;
@@ -85,13 +167,18 @@ function parseCurrencyDraft(raw: string): number | null {
 
 export const HorizonView: React.FC<HorizonViewProps> = ({
   setup,
+  years,
   computed,
   issues,
+  guardrailAcknowledgments,
   archivedYears,
   selectedYear,
   scheduleView,
+  onUpdateSetup,
   onUpdateScheduleView,
   onUpdateYear,
+  onSaveGuardrailAck,
+  onReopenGuardrailAck,
   onSelectYear,
   onNavigate,
 }) => {
@@ -103,10 +190,31 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
     initialValue: number;
   } | null>(null);
 
+  // Guardrail Acknowledge & Document workflow UI state
+  const guardrailSectionRef = useRef<HTMLDivElement | null>(null);
+  const [ackFormState, setAckFormState] = useState<{
+    ackKey: string;
+    status: GuardrailAckStatus;
+    note: string;
+    error: string | null;
+  } | null>(null);
+  const [acknowledgedAccordionOpen, setAcknowledgedAccordionOpen] = useState(false);
+  const [allAckCardExpanded, setAllAckCardExpanded] = useState(false);
+
   const year1 = computed[0];
   const cumulativeAllInTax = computed.reduce((s, c) => s + c.total_all_in_tax, 0);
   const cumulativeFederal = computed.reduce((s, c) => s + c.form_1040_out.federal_income_tax, 0);
-  const cumulativeState = computed.reduce((s, c) => s + c.total_state_tax, 0);
+  const cumulativePte = computed.reduce((s, c) => s + c.scorp_out.pte_tax_paid_total, 0);
+  const cumulativeStateExclPte = computed.reduce(
+    (s, c) => s + Math.max(0, c.total_state_tax - c.scorp_out.pte_tax_paid_total),
+    0
+  );
+  const cumulativePayrollAndPte =
+    computed.reduce((s, c) => s + c.total_entity_and_payroll_tax, 0) + cumulativePte;
+  const cumulativePersonalFica = computed.reduce(
+    (s, c) => s + c.form_1040_out.personal_fica_tax,
+    0
+  );
   const cumulativeGrossCashIncome = computed.reduce(
     (s, c) => s + c.total_gross_cash_income,
     0
@@ -116,27 +224,97 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
       ? (cumulativeAllInTax / cumulativeGrossCashIncome) * 100
       : 0;
 
-  const year1BillSs = year1?.form_1040_out.primary_ss_gross ?? 0;
-  const year1DebraSs = year1?.form_1040_out.spouse_ss_gross ?? 0;
-  const year1TotalSs = year1BillSs + year1DebraSs;
+  const year1TotalSs =
+    (year1?.form_1040_out.primary_ss_gross ?? 0) + (year1?.form_1040_out.spouse_ss_gross ?? 0);
   const year1CardTitle =
-    year1?.tax_year === 2025
-      ? year1TotalSs === 0
-        ? 'Year 1 (2025) Filed Anchor'
-        : year1BillSs === 39500 && year1DebraSs === 39500
-        ? 'Year 1 (2025) Baseline ($79k SS On)'
-        : `Year 1 (2025) Baseline (${formatCompactCurrency(year1TotalSs)} SS On)`
+    year1TotalSs > 0
+      ? `Year 1 (${year1?.tax_year}) Baseline (${formatCompactCurrency(year1TotalSs)} SS On)`
       : `Year 1 (${year1?.tax_year}) Filed Anchor`;
 
-  const errorCount = issues.filter((i) => i.severity === 'error').length;
-  const warningCount = issues.filter((i) => i.severity === 'warning').length;
+  const activeIssues = useMemo(
+    () => issues.filter((issue) => !guardrailAcknowledgments[issue.ack_key]),
+    [issues, guardrailAcknowledgments]
+  );
+  const acknowledgedIssues = useMemo(
+    () =>
+      issues
+        .filter((issue) => Boolean(guardrailAcknowledgments[issue.ack_key]))
+        .map((issue) => ({
+          issue,
+          ack: guardrailAcknowledgments[issue.ack_key],
+        })),
+    [issues, guardrailAcknowledgments]
+  );
+
+  const activeErrorCount = activeIssues.filter((i) => i.severity === 'error').length;
+  const activeWarningCount = activeIssues.filter((i) => i.severity === 'warning').length;
+  const activeAlertCount = activeIssues.length;
+  const acknowledgedCount = acknowledgedIssues.length;
+
+  const openAckFormForIssue = (issue: ValidationIssue, existing?: GuardrailAcknowledgment) => {
+    const defaultStatus: GuardrailAckStatus =
+      existing?.status ??
+      (issue.tax_year !== null && issue.tax_year <= setup.anchor_actuals_year
+        ? 'prior_year_historical'
+        : 'intentional_cpa_reviewed');
+    const syncedExistingNote =
+      existing?.note && issue.rule_id === 'low_reasonable_comp' && issue.reasonable_comp_meta
+        ? syncReasonableCompNoteText(
+            existing.note,
+            existing.finding_message,
+            issue.reasonable_comp_meta.officer_w2,
+            issue.reasonable_comp_meta.ordinary_business_income
+          )
+        : existing?.note ?? '';
+    setAckFormState({
+      ackKey: issue.ack_key,
+      status: defaultStatus,
+      note: syncedExistingNote,
+      error: null,
+    });
+  };
+
+  const handleSubmitAckForm = (issue: ValidationIssue) => {
+    if (!ackFormState || ackFormState.ackKey !== issue.ack_key) return;
+    const trimmed = ackFormState.note.trim();
+    if (!trimmed) {
+      setAckFormState({
+        ...ackFormState,
+        error: 'Please enter a brief explanation before saving.',
+      });
+      return;
+    }
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const existing = guardrailAcknowledgments[issue.ack_key];
+    onSaveGuardrailAck({
+      key: issue.ack_key,
+      rule_id: issue.rule_id,
+      tax_year: issue.tax_year,
+      status: ackFormState.status,
+      note: trimmed,
+      acknowledged_at: existing?.acknowledged_at ?? todayIso,
+      updated_at: existing ? todayIso : undefined,
+      finding_title: issue.title,
+      finding_message: issue.message,
+      finding_severity: issue.severity,
+    });
+    setAckFormState(null);
+  };
+
+  const handleViewAcknowledgedLog = () => {
+    setAllAckCardExpanded(true);
+    setAcknowledgedAccordionOpen(true);
+    setTimeout(() => {
+      guardrailSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 30);
+  };
 
   const chartData = computed.map((c) => ({
     year: c.is_locked_actuals ? `${c.tax_year} (Act)` : String(c.tax_year),
     taxYear: c.tax_year,
     Federal: c.form_1040_out.federal_income_tax,
-    State: c.total_state_tax,
-    'Payroll & PTE': c.total_entity_and_payroll_tax,
+    State: Math.max(0, c.total_state_tax - c.scorp_out.pte_tax_paid_total),
+    'Payroll & PTE': c.total_entity_and_payroll_tax + c.scorp_out.pte_tax_paid_total,
     'All-In Eff. Rate': c.all_in_effective_rate,
   }));
 
@@ -145,22 +323,114 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
     [scheduleView.hidden_line_item_ids]
   );
 
-  const visibleRowCount = ALL_SCHEDULE_ITEM_IDS.length - hiddenRowIds.size;
+  const moduleEligibleItemIds = useMemo(() => {
+    const showSsMedicare = setup.has_ss_medicare !== false;
+    const showStockBasis = setup.has_stock_basis ?? setup.has_scorp;
+    const showRetirement = Boolean(setup.has_dbp || setup.has_401k_or_ira || setup.has_annuity);
+    const showMultiState = Boolean(
+      setup.multi_state_active || setup.residency_change_active || setup.has_pte
+    );
+    const isJoint = setup.filing_status === 'married_filing_jointly';
+
+    return new Set(
+      MASTER_SCHEDULE_CATALOG.filter((item) => {
+        if (
+          !setup.has_scorp &&
+          (item.id === 'ca_scorp_revenue' ||
+            item.id === 'az_scorp_revenue' ||
+            item.id === 'scorp_gross_revenue' ||
+            item.id === 'scorp_operating_expenses' ||
+            item.id === 'scorp_k1_profit' ||
+            item.id === 'member_draws' ||
+            item.id === 'capital_contributions' ||
+            item.id === 'ending_stock_basis' ||
+            item.id === 'form_8949_excess_gain' ||
+            item.id === 'business_fica_tax' ||
+            item.id === 'qbi_deduction' ||
+            item.id === 'sehi_medicare_deduction')
+        ) {
+          return false;
+        }
+        if (
+          !showStockBasis &&
+          (item.id === 'ending_stock_basis' || item.id === 'form_8949_excess_gain')
+        ) {
+          return false;
+        }
+        if (
+          !showSsMedicare &&
+          (item.id === 'ss_bill' ||
+            item.id === 'ss_debra' ||
+            item.id === 'taxable_social_security' ||
+            item.id === 'sehi_medicare_premiums' ||
+            item.id === 'sehi_medicare_deduction' ||
+            item.id === 'irmaa_starting_threshold')
+        ) {
+          return false;
+        }
+        if (!isJoint && (item.id === 'debra_w2_comp' || item.id === 'ss_debra')) {
+          return false;
+        }
+        if (!setup.has_dbp && item.id === 'dbp_contribution') {
+          return false;
+        }
+        if (
+          !showRetirement &&
+          (item.id === 'dbp_contribution' ||
+            item.id === 'employer_401k_ps' ||
+            item.id === 'employee_401k_deferrals' ||
+            item.id === 'dbp_ps_tax_reduction')
+        ) {
+          return false;
+        }
+        if (
+          !setup.multi_state_active &&
+          !setup.secondary_state &&
+          item.id === 'az_scorp_revenue'
+        ) {
+          return false;
+        }
+        if (!showMultiState && item.id === 'az_state_tax') {
+          return false;
+        }
+        if (!showMultiState && !setup.home_state && item.id === 'ca_state_tax') {
+          return false;
+        }
+        return true;
+      }).map((i) => i.id)
+    );
+  }, [setup]);
+
+  const visibleRowCount = useMemo(
+    () =>
+      ALL_SCHEDULE_ITEM_IDS.filter(
+        (id) => moduleEligibleItemIds.has(id) && !hiddenRowIds.has(id)
+      ).length,
+    [moduleEligibleItemIds, hiddenRowIds]
+  );
 
   const visibleSections = useMemo(() => {
     return SCHEDULE_SECTIONS.map((section) => ({
       section,
       rows: MASTER_SCHEDULE_CATALOG.filter(
-        (item) => item.section === section.id && !hiddenRowIds.has(item.id)
+        (item) =>
+          item.section === section.id &&
+          moduleEligibleItemIds.has(item.id) &&
+          !hiddenRowIds.has(item.id)
       ),
     })).filter((g) => g.rows.length > 0);
-  }, [hiddenRowIds]);
+  }, [moduleEligibleItemIds, hiddenRowIds]);
 
   const isCellEditable = (editField: ScheduleEditField | undefined, c: ComputedTaxYear): boolean => {
-    if (!editField || c.is_locked_actuals) return false;
+    if (!editField) return false;
+    if (editField === 'irmaa_threshold') {
+      return setup.has_ss_medicare !== false;
+    }
+    if (c.is_locked_actuals) return false;
     if (
       (editField === 'ca_scorp_revenue' ||
         editField === 'az_scorp_revenue' ||
+        editField === 'operating_expenses' ||
         editField === 'member_draws' ||
         editField === 'capital_contributions') &&
       !setup.has_scorp
@@ -195,10 +465,18 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
     if (
       (editField === 'ss_bill' ||
         editField === 'ss_debra' ||
-        editField === 'sehi_medicare_premiums') &&
+        editField === 'sehi_medicare_premiums' ||
+        editField === 'irmaa_threshold' ||
+        editField === 'operating_expenses') &&
       trimmed !== '' &&
       parsed === initialValue
     ) {
+      setEditingCell(null);
+      return;
+    }
+
+    if (editField === 'irmaa_threshold') {
+      onUpdateSetup(setIrmaaThresholdOverride(setup, taxYear, parsed));
       setEditingCell(null);
       return;
     }
@@ -209,32 +487,65 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         case 'ca_scorp_revenue':
         case 'az_scorp_revenue': {
           if (parsed === null) return prev;
-          const nextCa =
+          const { primaryStateCode, secondaryStateCode, hasSecondaryState } = getSetupStates(setup);
+          const pCode = primaryStateCode || prev.state_filings[0]?.state_code || 'HOME';
+          const sCode = secondaryStateCode || prev.state_filings[1]?.state_code || 'OTHER';
+          const hasSecond = Boolean(setup.multi_state_active || hasSecondaryState);
+          const nextPrimary =
             editField === 'ca_scorp_revenue' ? parsed : prev.scorp_1120s.ca_revenue;
-          const nextAz =
+          const nextSecondary =
             editField === 'az_scorp_revenue' ? parsed : prev.scorp_1120s.az_revenue;
-          const nextTotal = nextCa + nextAz;
-          const nextCaApp = nextTotal > 0 ? nextCa / nextTotal : 0;
-          const nextAzApp = nextTotal > 0 ? nextAz / nextTotal : 0;
+          const nextTotal = nextPrimary + nextSecondary;
+          const nextPrimaryApp = nextTotal > 0 ? nextPrimary / nextTotal : 0;
+          const nextSecondaryApp = nextTotal > 0 ? nextSecondary / nextTotal : 0;
+          const nextBreakdown = hasSecond
+            ? [
+                { state_code: pCode, apportionment_percent: Number((nextPrimaryApp * 100).toFixed(2)) },
+                { state_code: sCode, apportionment_percent: Number((nextSecondaryApp * 100).toFixed(2)) },
+              ]
+            : primaryStateCode
+            ? [{ state_code: primaryStateCode, apportionment_percent: 100 }]
+            : [];
           return {
             ...prev,
             scorp_1120s: {
               ...prev.scorp_1120s,
-              ca_revenue: nextCa,
-              az_revenue: nextAz,
+              ca_revenue: nextPrimary,
+              az_revenue: nextSecondary,
               gross_receipts_revenue: nextTotal,
-              state_sourcing_breakdown: [
-                { state_code: 'CA', apportionment_percent: Number((nextCaApp * 100).toFixed(2)) },
-                { state_code: 'AZ', apportionment_percent: Number((nextAzApp * 100).toFixed(2)) },
-              ],
+              state_sourcing_breakdown: nextBreakdown,
             },
             state_filings: prev.state_filings.map((sf) =>
-              sf.state_code === 'CA'
-                ? { ...sf, state_apportionment_factor: nextCaApp }
-                : sf.state_code === 'AZ'
-                ? { ...sf, state_apportionment_factor: nextAzApp }
+              sf.state_code === pCode
+                ? { ...sf, state_apportionment_factor: hasSecond ? nextPrimaryApp : 1 }
+                : hasSecond && sf.state_code === sCode
+                ? { ...sf, state_apportionment_factor: nextSecondaryApp }
                 : sf
             ),
+          };
+        }
+        case 'operating_expenses': {
+          const isFutureForecastYear = taxYear > setup.current_tax_year;
+          const isProportionalMode =
+            (setup.assumptions.opex_scaling_mode ?? 'revenue_proportional') ===
+            'revenue_proportional';
+          if (isFutureForecastYear && isProportionalMode) {
+            return {
+              ...prev,
+              scorp_1120s: {
+                ...prev.scorp_1120s,
+                operating_expenses_override: parsed,
+              },
+            };
+          }
+          if (parsed === null) return prev;
+          return {
+            ...prev,
+            scorp_1120s: {
+              ...prev.scorp_1120s,
+              operating_expenses: parsed,
+              operating_expenses_override: null,
+            },
           };
         }
         case 'bill_w2': {
@@ -252,6 +563,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
               ...prev.scorp_1120s,
               bill_w2_wages: parsed,
               officer_w2_wages: nextOfficer,
+              payroll_taxes_input: undefined,
             },
             form_1040: {
               ...prev.form_1040,
@@ -268,6 +580,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
               ...prev.scorp_1120s,
               debra_w2_wages: parsed,
               officer_w2_wages: nextOfficer,
+              payroll_taxes_input: undefined,
             },
             form_1040: {
               ...prev.form_1040,
@@ -347,6 +660,10 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
   };
 
   const handleResetCellOverride = (editField: ScheduleEditField, taxYear: number) => {
+    if (editField === 'irmaa_threshold') {
+      onUpdateSetup(setIrmaaThresholdOverride(setup, taxYear, null));
+      return;
+    }
     onUpdateYear(taxYear, (prev) => {
       if (prev.is_locked_actuals) return prev;
       if (editField === 'ss_bill') {
@@ -365,6 +682,12 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         return {
           ...prev,
           form_1040: { ...prev.form_1040, sehi_medicare_override: null },
+        };
+      }
+      if (editField === 'operating_expenses') {
+        return {
+          ...prev,
+          scorp_1120s: { ...prev.scorp_1120s, operating_expenses_override: null },
         };
       }
       return prev;
@@ -397,6 +720,28 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         },
       };
     });
+  };
+
+  const handleSsBirthMonthChange = (person: 'debra' | 'bill', birthMonth: number) => {
+    if (person === 'bill') {
+      onUpdateSetup({
+        ...setup,
+        primary_profile: updateProfileBirthMonth(
+          setup.primary_profile,
+          birthMonth,
+          setup.primary_birth_year
+        ),
+      });
+    } else {
+      onUpdateSetup({
+        ...setup,
+        spouse_profile: updateProfileBirthMonth(
+          setup.spouse_profile,
+          birthMonth,
+          setup.spouse_birth_year ?? setup.primary_birth_year
+        ),
+      });
+    }
   };
 
   const handleSet2025Ss = (person: 'debra' | 'bill', amount: number) => {
@@ -456,15 +801,431 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         </div>
       </div>
 
-      {/* 4-Column Flat KPI Strip */}
+      {/* 1. Validation & Guardrail Findings Banner (top-most so alerts are immediately visible) */}
+      {issues.length > 0 && (
+        <div
+          ref={guardrailSectionRef}
+          className="bg-white border border-slate-200 rounded-lg overflow-hidden"
+        >
+          {activeAlertCount === 0 && !allAckCardExpanded ? (
+            <div className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 bg-emerald-50/40">
+              <div className="flex items-center gap-2 text-xs text-slate-700">
+                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                <span className="font-semibold text-slate-900">
+                  Validation &amp; Guardrail Findings
+                </span>
+                <span className="text-emerald-800 font-medium">0 Active Alerts</span>
+                <span className="text-slate-400" aria-hidden="true">·</span>
+                <span className="text-slate-600">
+                  {acknowledgedCount} {acknowledgedCount === 1 ? 'finding' : 'findings'} acknowledged &amp; documented
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setAllAckCardExpanded(true);
+                  setAcknowledgedAccordionOpen(true);
+                }}
+                className="inline-flex items-center gap-1 text-xs font-medium text-teal-800 hover:text-teal-950 whitespace-nowrap"
+              >
+                <span>Expand log</span>
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : (
+            <div className="p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-sm font-semibold text-slate-900">
+                    Validation &amp; Guardrail Findings ({activeAlertCount} Active
+                    {acknowledgedCount > 0 ? ` · ${acknowledgedCount} Acknowledged` : ''})
+                  </h2>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-slate-500">
+                    Module 4 §3 deterministic ruleset
+                  </span>
+                  {activeAlertCount === 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setAllAckCardExpanded(false)}
+                      className="text-xs font-medium text-slate-600 hover:text-slate-900"
+                    >
+                      Collapse bar
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Active Unacknowledged Findings */}
+              {activeIssues.length > 0 && (
+                <div className="divide-y divide-slate-100">
+                  {activeIssues.map((issue) => {
+                    const isFormOpen = ackFormState?.ackKey === issue.ack_key;
+                    return (
+                      <div key={issue.ack_key} className="py-2.5 space-y-2.5">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div className="flex items-start gap-2.5">
+                            {issue.severity === 'error' ? (
+                              <ShieldAlert className="w-4 h-4 text-red-700 mt-0.5 shrink-0" />
+                            ) : (
+                              <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 shrink-0" />
+                            )}
+                            <div>
+                              <div className="text-xs font-semibold text-slate-900">
+                                <span
+                                  className={
+                                    issue.severity === 'error'
+                                      ? 'text-red-700 mr-1.5'
+                                      : 'text-amber-700 mr-1.5'
+                                  }
+                                >
+                                  {issue.severity === 'error' ? 'Blocking Error:' : 'Warning:'}
+                                </span>
+                                {issue.title}
+                              </div>
+                              <p className="text-xs text-slate-600 mt-0.5">{issue.message}</p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2.5 shrink-0 self-start sm:self-center">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                isFormOpen ? setAckFormState(null) : openAckFormForIssue(issue)
+                              }
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 rounded hover:bg-slate-100 hover:border-slate-300 transition-colors whitespace-nowrap"
+                            >
+                              <FileCheck2 className="w-3.5 h-3.5 text-teal-700" />
+                              Acknowledge
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onSelectYear(
+                                  issue.tax_year ?? setup.anchor_actuals_year,
+                                  issue.target_tab
+                                )
+                              }
+                              className="text-xs font-medium text-teal-800 hover:text-teal-950 whitespace-nowrap"
+                            >
+                              Review in {issue.target_tab} →
+                            </button>
+                          </div>
+                        </div>
+
+                        {isFormOpen && ackFormState && (
+                          <div className="ml-0 sm:ml-6 p-3 bg-slate-50 border border-slate-200 rounded-md space-y-2.5">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                              <label
+                                htmlFor={`ack-status-${issue.ack_key}`}
+                                className="text-[11px] font-semibold text-slate-700"
+                              >
+                                Resolution Status
+                              </label>
+                              <select
+                                id={`ack-status-${issue.ack_key}`}
+                                value={ackFormState.status}
+                                onChange={(e) =>
+                                  setAckFormState({
+                                    ...ackFormState,
+                                    status: e.target.value as GuardrailAckStatus,
+                                  })
+                                }
+                                className="text-xs bg-white border border-slate-300 rounded px-2.5 py-1.5 text-slate-800 focus:outline-none focus:ring-1 focus:ring-teal-700"
+                              >
+                                {GUARDRAIL_ACK_STATUS_OPTIONS.map((opt) => (
+                                  <option key={opt.value} value={opt.value}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            <div>
+                              <label
+                                htmlFor={`ack-note-${issue.ack_key}`}
+                                className="block text-[11px] font-semibold text-slate-700 mb-1"
+                              >
+                                Explanation / CPA Note <span className="text-red-600">*</span>
+                              </label>
+                              {issue.rule_id === 'low_reasonable_comp' &&
+                                issue.reasonable_comp_meta && (
+                                  <div className="text-[10px] font-mono text-teal-800 mb-1.5">
+                                    {formatReasonableCompExplanationSummary(
+                                      issue.reasonable_comp_meta.officer_w2,
+                                      issue.reasonable_comp_meta.ordinary_business_income,
+                                      issue.tax_year ? `${issue.tax_year} Plan` : undefined
+                                    )}
+                                  </div>
+                                )}
+                              <textarea
+                                id={`ack-note-${issue.ack_key}`}
+                                rows={2}
+                                value={ackFormState.note}
+                                onChange={(e) =>
+                                  setAckFormState({
+                                    ...ackFormState,
+                                    note: e.target.value,
+                                    error: null,
+                                  })
+                                }
+                                placeholder="Explain why this is acceptable or how it is being addressed..."
+                                className="w-full text-xs bg-white border border-slate-300 rounded px-2.5 py-1.5 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-teal-700"
+                              />
+                              {ackFormState.error && (
+                                <p className="text-[11px] text-red-700 mt-1">
+                                  {ackFormState.error}
+                                </p>
+                              )}
+                            </div>
+
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setAckFormState(null)}
+                                className="px-2.5 py-1 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSubmitAckForm(issue)}
+                                className="px-3 py-1 text-xs font-medium text-white bg-teal-800 rounded hover:bg-teal-900"
+                              >
+                                Save Acknowledgment
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Collapsed "Acknowledged / Resolved (N)" Accordion */}
+              {acknowledgedIssues.length > 0 && (
+                <div
+                  className={
+                    activeIssues.length > 0 ? 'mt-3 pt-3 border-t border-slate-200' : ''
+                  }
+                >
+                  <button
+                    type="button"
+                    onClick={() => setAcknowledgedAccordionOpen((prev) => !prev)}
+                    aria-expanded={acknowledgedAccordionOpen}
+                    className="w-full flex items-center justify-between gap-2 py-1 text-xs font-semibold text-slate-700 hover:text-slate-900"
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      {acknowledgedAccordionOpen ? (
+                        <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                      ) : (
+                        <ChevronRight className="w-3.5 h-3.5 text-slate-500" />
+                      )}
+                      <span>Acknowledged / Resolved ({acknowledgedIssues.length})</span>
+                    </span>
+                    <span className="text-[11px] font-normal text-slate-500">
+                      Included in CPA Print Package
+                    </span>
+                  </button>
+
+                  {acknowledgedAccordionOpen && (
+                    <div className="mt-2 divide-y divide-slate-100 border border-slate-200 rounded-md bg-slate-50/60">
+                      {acknowledgedIssues.map(({ issue, ack }) => {
+                        const isEditingNote = ackFormState?.ackKey === issue.ack_key;
+                        const statusBadgeClass =
+                          ack.status === 'prior_year_historical'
+                            ? 'bg-slate-100 text-slate-700 border-slate-300'
+                            : ack.status === 'intentional_cpa_reviewed'
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                            : 'bg-teal-50 text-teal-800 border-teal-200';
+                        return (
+                          <div key={issue.ack_key} className="p-3 space-y-2">
+                            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+                              <div className="space-y-1 min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                                  <span className="text-xs font-semibold text-slate-800">
+                                    {issue.title}
+                                  </span>
+                                  <span
+                                    className={`inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap ${statusBadgeClass}`}
+                                  >
+                                    {getGuardrailAckStatusLabel(ack.status)}
+                                  </span>
+                                  <span className="text-[10px] font-mono text-slate-500">
+                                    Acknowledged {ack.acknowledged_at}
+                                  </span>
+                                </div>
+                                <p className="text-[11px] text-slate-500">{issue.message}</p>
+                                {!isEditingNote && (
+                                  <div className="text-xs text-slate-800 bg-white border border-slate-200 rounded px-2.5 py-1.5 mt-1 space-y-1">
+                                    <div>
+                                      <span className="font-semibold text-slate-600 mr-1">Note:</span>
+                                      {issue.rule_id === 'low_reasonable_comp' &&
+                                      issue.reasonable_comp_meta
+                                        ? syncReasonableCompNoteText(
+                                            ack.note,
+                                            ack.finding_message,
+                                            issue.reasonable_comp_meta.officer_w2,
+                                            issue.reasonable_comp_meta.ordinary_business_income
+                                          )
+                                        : ack.note}
+                                    </div>
+                                    {issue.rule_id === 'low_reasonable_comp' &&
+                                      issue.reasonable_comp_meta && (
+                                        <div className="text-[10px] font-mono text-teal-800">
+                                          {formatReasonableCompExplanationSummary(
+                                            issue.reasonable_comp_meta.officer_w2,
+                                            issue.reasonable_comp_meta.ordinary_business_income,
+                                            issue.tax_year ? `${issue.tax_year} Plan` : undefined
+                                          )}
+                                        </div>
+                                      )}
+                                  </div>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    isEditingNote
+                                      ? setAckFormState(null)
+                                      : openAckFormForIssue(issue, ack)
+                                  }
+                                  className="px-2 py-1 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 rounded hover:bg-slate-50 whitespace-nowrap"
+                                >
+                                  Edit Note
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (ackFormState?.ackKey === issue.ack_key) {
+                                      setAckFormState(null);
+                                    }
+                                    onReopenGuardrailAck(issue.ack_key);
+                                  }}
+                                  className="px-2 py-1 text-[11px] font-medium text-amber-800 bg-white border border-amber-200 rounded hover:bg-amber-50 whitespace-nowrap"
+                                >
+                                  Reopen
+                                </button>
+                              </div>
+                            </div>
+
+                            {isEditingNote && ackFormState && (
+                              <div className="p-3 bg-white border border-slate-200 rounded-md space-y-2.5">
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                  <label
+                                    htmlFor={`edit-ack-status-${issue.ack_key}`}
+                                    className="text-[11px] font-semibold text-slate-700"
+                                  >
+                                    Resolution Status
+                                  </label>
+                                  <select
+                                    id={`edit-ack-status-${issue.ack_key}`}
+                                    value={ackFormState.status}
+                                    onChange={(e) =>
+                                      setAckFormState({
+                                        ...ackFormState,
+                                        status: e.target.value as GuardrailAckStatus,
+                                      })
+                                    }
+                                    className="text-xs bg-white border border-slate-300 rounded px-2.5 py-1.5 text-slate-800 focus:outline-none focus:ring-1 focus:ring-teal-700"
+                                  >
+                                    {GUARDRAIL_ACK_STATUS_OPTIONS.map((opt) => (
+                                      <option key={opt.value} value={opt.value}>
+                                        {opt.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div>
+                                  <label
+                                    htmlFor={`edit-ack-note-${issue.ack_key}`}
+                                    className="block text-[11px] font-semibold text-slate-700 mb-1"
+                                  >
+                                    Explanation / CPA Note <span className="text-red-600">*</span>
+                                  </label>
+                                  <textarea
+                                    id={`edit-ack-note-${issue.ack_key}`}
+                                    rows={2}
+                                    value={ackFormState.note}
+                                    onChange={(e) =>
+                                      setAckFormState({
+                                        ...ackFormState,
+                                        note: e.target.value,
+                                        error: null,
+                                      })
+                                    }
+                                    placeholder="Explain why this is acceptable or how it is being addressed..."
+                                    className="w-full text-xs bg-white border border-slate-300 rounded px-2.5 py-1.5 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-teal-700"
+                                  />
+                                  {ackFormState.error && (
+                                    <p className="text-[11px] text-red-700 mt-1">
+                                      {ackFormState.error}
+                                    </p>
+                                  )}
+                                </div>
+                                <div className="flex items-center justify-end gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => setAckFormState(null)}
+                                    className="px-2.5 py-1 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50"
+                                  >
+                                    Cancel
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSubmitAckForm(issue)}
+                                    className="px-3 py-1 text-xs font-medium text-white bg-teal-800 rounded hover:bg-teal-900"
+                                  >
+                                    Save Changes
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 2. Four KPI Summary Cards (directly above the schedule so totals stay visible during inline edits) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <div className="bg-white border border-slate-200 rounded-lg p-4">
-          <div className="text-xs font-medium text-slate-500">6-Year All-In Tax Projection</div>
+          <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+            <span>6-Year All-In Tax Projection</span>
+            <span className="relative inline-flex items-center group">
+              <button
+                type="button"
+                aria-label="6-Year All-In Tax Projection breakdown details"
+                className="text-slate-400 hover:text-slate-600 focus:text-slate-700 focus:outline-none transition-colors"
+              >
+                <Info className="w-3.5 h-3.5" />
+              </button>
+              <span
+                role="tooltip"
+                className="pointer-events-none opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-1.5 z-30 w-72 rounded-md bg-slate-900 px-3 py-2 text-[11px] font-normal leading-relaxed text-slate-100 shadow-lg"
+              >
+                Sums 6-year Federal Income Tax ({formatCurrency(cumulativeFederal)}), State Tax ({formatCurrency(cumulativeStateExclPte)}), and Employer Payroll / PTE Tax ({formatCurrency(cumulativePayrollAndPte)}) to equal {formatCurrency(cumulativeAllInTax)}. Employee FICA ({formatCurrency(cumulativePersonalFica)}) is tracked separately in household cash flow.
+              </span>
+            </span>
+          </div>
           <div className="mt-1.5 text-2xl font-semibold font-mono tabular-nums text-slate-900">
             {formatCurrency(cumulativeAllInTax)}
           </div>
-          <div className="mt-1 text-xs text-slate-500 font-mono tabular-nums">
-            Fed {formatCompactCurrency(cumulativeFederal)} · State {formatCompactCurrency(cumulativeState)}
+          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-snug text-slate-500 font-mono tabular-nums">
+            <span>Fed {formatCurrency(cumulativeFederal)}</span>
+            <span aria-hidden="true">·</span>
+            <span>State {formatCurrency(cumulativeStateExclPte)}</span>
+            <span aria-hidden="true">·</span>
+            <span>ER Payroll/PTE {formatCurrency(cumulativePayrollAndPte)}</span>
           </div>
         </div>
 
@@ -494,19 +1255,24 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         <div className="bg-white border border-slate-200 rounded-lg p-4 flex flex-col justify-between">
           <div className="text-xs font-medium text-slate-500">Deterministic Guardrails</div>
           <div className="mt-1.5 flex items-center gap-2">
-            {errorCount > 0 ? (
+            {activeErrorCount > 0 ? (
               <>
                 <ShieldAlert className="w-5 h-5 text-red-700 shrink-0" />
                 <span className="text-lg font-semibold text-red-700">
-                  {errorCount} Blocking {errorCount === 1 ? 'Issue' : 'Issues'}
+                  {activeErrorCount} Blocking {activeErrorCount === 1 ? 'Issue' : 'Issues'}
                 </span>
               </>
-            ) : warningCount > 0 ? (
+            ) : activeWarningCount > 0 ? (
               <>
                 <AlertTriangle className="w-5 h-5 text-amber-700 shrink-0" />
                 <span className="text-lg font-semibold text-amber-700">
-                  {warningCount} Review {warningCount === 1 ? 'Alert' : 'Alerts'}
+                  {activeWarningCount} Active {activeWarningCount === 1 ? 'Alert' : 'Alerts'}
                 </span>
+              </>
+            ) : acknowledgedCount > 0 ? (
+              <>
+                <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0" />
+                <span className="text-lg font-semibold text-emerald-700">0 Active Alerts</span>
               </>
             ) : (
               <>
@@ -515,151 +1281,55 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
               </>
             )}
           </div>
-          <button
-            type="button"
-            onClick={() => onNavigate(issues[0]?.target_tab ?? 'scenarios')}
-            className="mt-1 text-left text-xs font-medium text-teal-800 hover:underline"
-          >
-            {issues.length > 0 ? 'Inspect guardrail alert →' : 'Open Scenarios & Grounded AI →'}
-          </button>
-        </div>
-      </div>
-
-      {/* Guardrail Escalation Strip (only shown when errors or warnings exist) */}
-      {issues.length > 0 && (
-        <div className="bg-white border border-slate-200 rounded-lg p-4">
-          <div className="flex items-center justify-between gap-4 mb-3">
-            <h2 className="text-sm font-semibold text-slate-900">
-              Validation &amp; Guardrail Findings ({issues.length})
-            </h2>
-            <span className="text-xs text-slate-500">
-              Module 4 §3 deterministic ruleset
-            </span>
-          </div>
-          <div className="divide-y divide-slate-100">
-            {issues.map((issue) => (
-              <div
-                key={issue.id}
-                className="py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+          <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+            {activeAlertCount > 0 ? (
+              <button
+                type="button"
+                onClick={() => onNavigate(activeIssues[0]?.target_tab ?? 'scenarios')}
+                className="text-left text-xs font-medium text-teal-800 hover:underline"
               >
-                <div className="flex items-start gap-2.5">
-                  {issue.severity === 'error' ? (
-                    <ShieldAlert className="w-4 h-4 text-red-700 mt-0.5 shrink-0" />
-                  ) : (
-                    <AlertTriangle className="w-4 h-4 text-amber-700 mt-0.5 shrink-0" />
-                  )}
-                  <div>
-                    <div className="text-xs font-semibold text-slate-900">
-                      <span
-                        className={
-                          issue.severity === 'error' ? 'text-red-700 mr-1.5' : 'text-amber-700 mr-1.5'
-                        }
-                      >
-                        {issue.severity === 'error' ? 'Blocking Error:' : 'Warning:'}
-                      </span>
-                      {issue.title}
-                    </div>
-                    <p className="text-xs text-slate-600 mt-0.5">{issue.message}</p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onSelectYear(issue.tax_year ?? setup.anchor_actuals_year, issue.target_tab)
-                  }
-                  className="text-xs font-medium text-teal-800 hover:text-teal-950 whitespace-nowrap shrink-0 self-start sm:self-center"
-                >
-                  Review in {issue.target_tab} →
-                </button>
-              </div>
-            ))}
+                Inspect active alert →
+              </button>
+            ) : acknowledgedCount > 0 ? (
+              <button
+                type="button"
+                onClick={handleViewAcknowledgedLog}
+                className="text-left text-xs text-slate-500 hover:text-teal-800 hover:underline"
+              >
+                {acknowledgedCount} acknowledged — view log
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onNavigate('scenarios')}
+                className="text-left text-xs font-medium text-teal-800 hover:underline"
+              >
+                Open Scenarios &amp; Grounded AI →
+              </button>
+            )}
+            {activeAlertCount > 0 && acknowledgedCount > 0 && (
+              <button
+                type="button"
+                onClick={handleViewAcknowledgedLog}
+                className="text-[11px] text-slate-500 hover:text-teal-800 hover:underline whitespace-nowrap"
+              >
+                {acknowledgedCount} acknowledged
+              </button>
+            )}
           </div>
-        </div>
-      )}
-
-      {/* Six-Year Tax Trajectory Chart */}
-      <div className="bg-white border border-slate-200 rounded-lg p-5">
-        <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 mb-4">
-          <div>
-            <h2 className="text-base font-semibold text-slate-900">
-              Six-Year Tax Composition &amp; Effective Rate Trajectory
-            </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Annual federal, state, and employer payroll / PTE tax layers stacked against all-in effective rate (% of AGI).
-            </p>
-          </div>
-          <div className="text-xs text-slate-500 font-mono">
-            {setup.forecast_years[0]} Actuals → {setup.forecast_years[5]} Forecast
-          </div>
-        </div>
-        <div className="h-[260px] w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <ComposedChart data={chartData} margin={{ top: 8, right: 16, left: 4, bottom: 4 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
-              <XAxis
-                dataKey="year"
-                tick={{ fontSize: 12, fill: '#475569', fontFamily: 'IBM Plex Mono' }}
-                axisLine={{ stroke: '#cbd5e1' }}
-                tickLine={false}
-              />
-              <YAxis
-                yAxisId="left"
-                tickFormatter={(v: number) => formatCompactCurrency(v)}
-                tick={{ fontSize: 11, fill: '#64748b', fontFamily: 'IBM Plex Mono' }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <YAxis
-                yAxisId="right"
-                orientation="right"
-                tickFormatter={(v: number) => `${v}%`}
-                domain={[0, 45]}
-                tick={{ fontSize: 11, fill: '#0f766e', fontFamily: 'IBM Plex Mono' }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <Tooltip
-                formatter={(value: unknown, name: unknown) => {
-                  const num = Number(value);
-                  const label = String(name);
-                  if (label.includes('Rate')) return [`${num.toFixed(1)}%`, label];
-                  return [formatCurrency(num), label];
-                }}
-                contentStyle={{
-                  backgroundColor: '#ffffff',
-                  borderColor: '#cbd5e1',
-                  borderRadius: '6px',
-                  fontSize: '12px',
-                  fontFamily: 'IBM Plex Mono',
-                }}
-              />
-              <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '8px' }} />
-              <Bar yAxisId="left" dataKey="Federal" stackId="tax" fill="#0f172a" radius={[0, 0, 0, 0]} />
-              <Bar yAxisId="left" dataKey="State" stackId="tax" fill="#0f766e" radius={[0, 0, 0, 0]} />
-              <Bar yAxisId="left" dataKey="Payroll & PTE" stackId="tax" fill="#94a3b8" radius={[3, 3, 0, 0]} />
-              <Line
-                yAxisId="right"
-                type="monotone"
-                dataKey="All-In Eff. Rate"
-                stroke="#d97706"
-                strokeWidth={2}
-                dot={{ r: 3.5, fill: '#d97706' }}
-              />
-            </ComposedChart>
-          </ResponsiveContainer>
         </div>
       </div>
 
-      {/* 2025 Deterministic Engine Verification Checkpoints */}
-      {year1 && year1.tax_year === 2025 && (
-        <VerificationCheckpointsCard
-          setup={setup}
-          year2025={year1}
-          onSet2025Ss={handleSet2025Ss}
-        />
-      )}
+      {/* 2b. Collapsible Actionable Tax-Reduction Levers Drawer (unlocked years with IRMAA cliff, Senior phaseout, or bracket jump) */}
+      <TaxReductionLeversDrawer
+        setup={setup}
+        years={years}
+        computed={computed}
+        onUpdateYear={onUpdateYear}
+        onSelectYear={onSelectYear}
+      />
 
-      {/* Interactive Top-Down Cash & Tax Waterfall Schedule */}
+      {/* 3. Six-Year Financial Schedule (interactive 2025–2030 grid) */}
       <div className="bg-white border border-slate-200 rounded-lg">
         <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
@@ -803,6 +1473,17 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                               >
                                 {rowLabel}
                               </span>
+                              {row.id === 'irmaa_starting_threshold' && (
+                                <IrmaaHoverTooltip text={IRMAA_LOOKBACK_TOOLTIP}>
+                                  <span
+                                    tabIndex={0}
+                                    aria-label="How Medicare IRMAA 2-year lookback works"
+                                    className="inline-flex items-center justify-center text-slate-400 hover:text-teal-700 focus:text-teal-700 focus:outline-none cursor-help"
+                                  >
+                                    <Info className="w-3.5 h-3.5 shrink-0" />
+                                  </span>
+                                </IrmaaHoverTooltip>
+                              )}
                               {row.editField && (
                                 <Pencil
                                   className="w-2.5 h-2.5 text-teal-600/70 shrink-0"
@@ -810,6 +1491,106 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                 />
                               )}
                             </div>
+                            {isSsRow &&
+                              (ssPerson === 'bill' ||
+                                setup.filing_status === 'married_filing_jointly') && (
+                                <div className="mt-1 flex items-center gap-1 text-[10px] text-slate-500">
+                                  <span>Birth mo:</span>
+                                  <select
+                                    aria-label={`${rowLabel} birth month for FRA and age-70 proration`}
+                                    value={
+                                      ssPerson === 'bill'
+                                        ? getPersonBirthMonth(setup.primary_profile, 1)
+                                        : getPersonBirthMonth(setup.spouse_profile, 1)
+                                    }
+                                    onChange={(e) =>
+                                      handleSsBirthMonthChange(ssPerson, Number(e.target.value))
+                                    }
+                                    className="text-[10px] font-mono text-slate-700 bg-slate-50 border border-slate-200 rounded px-1 py-0.2 focus:outline-none focus:border-teal-700 cursor-pointer"
+                                  >
+                                    {MONTH_SHORT_NAMES.map((mLabel, mIdx) => (
+                                      <option key={mLabel} value={mIdx + 1}>
+                                        {mLabel}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              )}
+                            {row.id === 'scorp_operating_expenses' && setup.has_scorp && (() => {
+                              const opexMode =
+                                setup.assumptions.opex_scaling_mode ?? 'revenue_proportional';
+                              const ratioPct = Number(
+                                ((setup.assumptions.expense_ratio ?? 0.2) * 100).toFixed(1)
+                              );
+                              const futureStartYear = setup.current_tax_year + 1;
+                              return (
+                                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">
+                                  <span>{futureStartYear}+:</span>
+                                  <div
+                                    className="inline-flex items-center rounded border border-slate-200 bg-slate-50 p-0.5 gap-0.5"
+                                    role="group"
+                                    aria-label="Forecast Operating Expenses scaling mode"
+                                  >
+                                    {(
+                                      [
+                                        { id: 'revenue_proportional', label: '% Rev' },
+                                        { id: 'fixed_inflation', label: 'Fixed' },
+                                      ] as const
+                                    ).map((opt) => {
+                                      const active = opexMode === opt.id;
+                                      return (
+                                        <button
+                                          key={opt.id}
+                                          type="button"
+                                          onClick={() =>
+                                            onUpdateSetup({
+                                              ...setup,
+                                              assumptions: {
+                                                ...setup.assumptions,
+                                                opex_scaling_mode: opt.id,
+                                              },
+                                            })
+                                          }
+                                          className={`px-1.5 py-0.5 text-[9px] font-medium rounded-sm leading-none transition-colors ${
+                                            active
+                                              ? 'bg-teal-700 text-white'
+                                              : 'text-slate-500 hover:text-slate-800'
+                                          }`}
+                                        >
+                                          {opt.label}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                  {opexMode === 'revenue_proportional' && (
+                                    <label className="inline-flex items-center gap-0.5 font-mono text-slate-700">
+                                      <input
+                                        type="number"
+                                        aria-label="Forecast operating expense ratio percent of revenue"
+                                        min={0}
+                                        max={100}
+                                        step={0.5}
+                                        value={ratioPct}
+                                        onChange={(e) => {
+                                          const raw = Number(e.target.value);
+                                          if (!Number.isFinite(raw)) return;
+                                          const clamped = Math.min(100, Math.max(0, raw)) / 100;
+                                          onUpdateSetup({
+                                            ...setup,
+                                            assumptions: {
+                                              ...setup.assumptions,
+                                              expense_ratio: clamped,
+                                            },
+                                          });
+                                        }}
+                                        className="w-12 text-right text-[10px] font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded px-1 py-0.2 focus:outline-none focus:border-teal-700"
+                                      />
+                                      <span>%</span>
+                                    </label>
+                                  )}
+                                </div>
+                              );
+                            })()}
                           </td>
 
                           {computed.map((c, idx) => {
@@ -835,74 +1616,83 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     : ''
                                 }`}
                               >
-                                {isEditing && row.editField ? (
-                                  <input
-                                    type="text"
-                                    inputMode="numeric"
-                                    autoFocus
-                                    value={editingCell.draft}
-                                    onChange={(e) =>
-                                      setEditingCell({
-                                        ...editingCell,
-                                        draft: e.target.value,
-                                      })
-                                    }
-                                    onFocus={(e) => e.currentTarget.select()}
-                                    onBlur={() =>
-                                      commitInlineEdit(
-                                        row.editField!,
-                                        c.tax_year,
-                                        editingCell.draft,
-                                        editingCell.initialValue
-                                      )
-                                    }
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter') {
-                                        e.currentTarget.blur();
-                                      } else if (e.key === 'Escape') {
-                                        setEditingCell(null);
+                                <div className="flex justify-end">
+                                  {isEditing && row.editField ? (
+                                    <input
+                                      type="text"
+                                      inputMode="numeric"
+                                      autoFocus
+                                      value={editingCell.draft}
+                                      onChange={(e) =>
+                                        setEditingCell({
+                                          ...editingCell,
+                                          draft: e.target.value,
+                                        })
                                       }
-                                    }}
-                                    aria-label={`${rowLabel} ${c.tax_year}`}
-                                    className="w-24 text-right font-mono text-xs tabular-nums bg-white text-slate-900 border border-teal-700 rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-teal-700"
-                                  />
-                                ) : editable && row.editField ? (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setEditingCell({
-                                        rowId: row.id,
-                                        taxYear: c.tax_year,
-                                        draft: String(cell.rawEditValue ?? 0),
-                                        initialValue: cell.rawEditValue ?? 0,
-                                      })
-                                    }
-                                    title={
-                                      isSsRow || row.editField === 'sehi_medicare_premiums'
-                                        ? 'Click to enter dollar override (leave blank to reset to Setup formula)'
-                                        : `Click to edit ${rowLabel} for ${c.tax_year}`
-                                    }
-                                    className="font-mono text-xs tabular-nums whitespace-nowrap text-slate-900 border-b border-dashed border-teal-600/60 hover:border-teal-800 hover:bg-teal-50/70 rounded-sm px-1 -mr-1 transition-colors"
-                                  >
-                                    {cell.display}
-                                  </button>
-                                ) : (
-                                  <div
-                                    className={`font-mono text-xs tabular-nums whitespace-nowrap ${
-                                      isPrimaryHighlight
-                                        ? 'font-semibold text-white'
-                                        : row.bold
-                                        ? 'font-semibold text-slate-900'
-                                        : 'text-slate-700'
-                                    }`}
-                                  >
-                                    {cell.display}
-                                  </div>
-                                )}
+                                      onFocus={(e) => e.currentTarget.select()}
+                                      onBlur={() =>
+                                        commitInlineEdit(
+                                          row.editField!,
+                                          c.tax_year,
+                                          editingCell.draft,
+                                          editingCell.initialValue
+                                        )
+                                      }
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          e.currentTarget.blur();
+                                        } else if (e.key === 'Escape') {
+                                          setEditingCell(null);
+                                        }
+                                      }}
+                                      aria-label={`${rowLabel} ${c.tax_year}`}
+                                      className="w-24 text-right font-mono text-xs tabular-nums bg-white text-slate-900 border border-teal-700 rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-teal-700"
+                                    />
+                                  ) : editable && row.editField ? (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setEditingCell({
+                                          rowId: row.id,
+                                          taxYear: c.tax_year,
+                                          draft: String(cell.rawEditValue ?? 0),
+                                          initialValue: cell.rawEditValue ?? 0,
+                                        })
+                                      }
+                                      title={
+                                        row.editField === 'irmaa_threshold'
+                                          ? `Click to override ${c.tax_year} coverage threshold (leave blank to reset to formula)`
+                                          : isSsRow ||
+                                            row.editField === 'sehi_medicare_premiums' ||
+                                            (row.editField === 'operating_expenses' &&
+                                              c.tax_year > setup.current_tax_year &&
+                                              (setup.assumptions.opex_scaling_mode ??
+                                                'revenue_proportional') === 'revenue_proportional')
+                                          ? 'Click to enter dollar override (leave blank to reset to Setup formula)'
+                                          : `Click to edit ${rowLabel} for ${c.tax_year}`
+                                      }
+                                      className="font-mono text-xs tabular-nums whitespace-nowrap text-slate-900 border-b border-dashed border-teal-600/60 hover:border-teal-800 hover:bg-teal-50/70 rounded-sm px-1 transition-colors"
+                                    >
+                                      {cell.display}
+                                    </button>
+                                  ) : (
+                                    <div
+                                      className={`font-mono text-xs tabular-nums whitespace-nowrap ${
+                                        isPrimaryHighlight
+                                          ? 'font-semibold text-white'
+                                          : row.bold
+                                          ? 'font-semibold text-slate-900'
+                                          : 'text-slate-700'
+                                      }`}
+                                    >
+                                      {cell.display}
+                                    </div>
+                                  )}
+                                </div>
 
                                 {/* Subtle Override Indicator + One-Click Reset Back to Formula */}
                                 {editable && cell.isOverridden && row.editField && (
-                                  <div className="mt-0.5 flex items-center justify-end gap-1">
+                                  <div className="mt-0.5 flex flex-wrap items-center justify-end gap-1">
                                     <span className="text-[9px] font-medium px-1 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 leading-none">
                                       Override
                                     </span>
@@ -911,65 +1701,83 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                       onClick={() =>
                                         handleResetCellOverride(row.editField!, c.tax_year)
                                       }
-                                      title={`Reset ${rowLabel} (${c.tax_year}) back to Setup formula`}
+                                      title={`Reset ${rowLabel} (${c.tax_year}) back to formula`}
                                       aria-label={`Reset ${rowLabel} ${c.tax_year} override back to formula`}
-                                      className="inline-flex items-center gap-0.5 text-[9px] font-medium text-teal-800 hover:text-teal-950 hover:underline leading-none"
+                                      className="inline-flex items-center gap-0.5 text-[9px] font-medium text-teal-800 hover:text-teal-950 hover:underline leading-none whitespace-nowrap"
                                     >
                                       <RotateCcw className="w-2.5 h-2.5" />
-                                      Reset
+                                      {row.editField === 'irmaa_threshold'
+                                        ? 'Reset to formula'
+                                        : 'Reset'}
                                     </button>
                                   </div>
                                 )}
 
-                                {/* Compact On / Suspended / Off Toggle for Primary & Spouse SS (2026–2030) */}
+                                {/* Compact On / Suspended / Off Toggle stacked cleanly beneath dollar value */}
                                 {isSsRow && editable && (
-                                  <div
-                                    className="mt-1 inline-flex items-center rounded border border-slate-200 bg-slate-50 p-0.5 gap-0.5"
-                                    role="group"
-                                    aria-label={`${rowLabel} ${c.tax_year} status`}
-                                  >
-                                    {(
-                                      [
-                                        { id: 'on', label: 'On' },
-                                        { id: 'suspended', label: 'Susp' },
-                                        { id: 'off', label: 'Off' },
-                                      ] as const
-                                    ).map((opt) => {
-                                      const active = activeSsMode === opt.id;
-                                      return (
-                                        <button
-                                          key={opt.id}
-                                          type="button"
-                                          onClick={() =>
-                                            handleSsModeChange(ssPerson, c.tax_year, opt.id)
-                                          }
-                                          className={`px-1 py-0.5 text-[9px] font-medium rounded-sm leading-none transition-colors ${
-                                            active
-                                              ? opt.id === 'on'
-                                                ? 'bg-emerald-700 text-white'
-                                                : opt.id === 'suspended'
-                                                ? 'bg-teal-700 text-white'
-                                                : 'bg-slate-600 text-white'
-                                              : 'text-slate-500 hover:text-slate-800'
-                                          }`}
-                                        >
-                                          {opt.label}
-                                        </button>
-                                      );
-                                    })}
+                                  <div className="mt-1 flex justify-end">
+                                    <div
+                                      className="inline-flex items-center rounded border border-slate-200 bg-slate-50 p-0.5 gap-0.5"
+                                      role="group"
+                                      aria-label={`${rowLabel} ${c.tax_year} status`}
+                                    >
+                                      {(
+                                        [
+                                          { id: 'on', label: 'On' },
+                                          { id: 'suspended', label: 'Susp' },
+                                          { id: 'off', label: 'Off' },
+                                        ] as const
+                                      ).map((opt) => {
+                                        const active = activeSsMode === opt.id;
+                                        return (
+                                          <button
+                                            key={opt.id}
+                                            type="button"
+                                            onClick={() =>
+                                              handleSsModeChange(ssPerson, c.tax_year, opt.id)
+                                            }
+                                            className={`px-1 py-0.5 text-[9px] font-medium rounded-sm leading-none transition-colors ${
+                                              active
+                                                ? opt.id === 'on'
+                                                  ? 'bg-emerald-700 text-white'
+                                                  : opt.id === 'suspended'
+                                                  ? 'bg-teal-700 text-white'
+                                                  : 'bg-slate-600 text-white'
+                                                : 'text-slate-500 hover:text-slate-800'
+                                            }`}
+                                          >
+                                            {opt.label}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
                                   </div>
                                 )}
 
                                 {/* Status / Alert Badge */}
                                 {cell.badge && (
                                   <div className="mt-1 flex justify-end">
-                                    <span
-                                      className={`inline-block text-[10px] font-medium leading-tight px-1.5 py-0.5 rounded border whitespace-nowrap ${
-                                        BADGE_TONE_CLASS[cell.badge.tone]
-                                      }`}
-                                    >
-                                      {cell.badge.text}
-                                    </span>
+                                    {row.id === 'total_joint_agi' ? (
+                                      <IrmaaHoverTooltip text={IRMAA_LOOKBACK_TOOLTIP}>
+                                        <span
+                                          tabIndex={0}
+                                          className={`inline-flex items-center gap-1 text-[10px] font-medium leading-tight px-1.5 py-0.5 rounded border whitespace-nowrap cursor-help focus:outline-none focus:ring-1 focus:ring-teal-600 ${
+                                            BADGE_TONE_CLASS[cell.badge.tone]
+                                          }`}
+                                        >
+                                          <span>{cell.badge.text}</span>
+                                          <Info className="w-2.5 h-2.5 opacity-70 shrink-0" aria-hidden="true" />
+                                        </span>
+                                      </IrmaaHoverTooltip>
+                                    ) : (
+                                      <span
+                                        className={`inline-block text-[10px] font-medium leading-tight px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                                          BADGE_TONE_CLASS[cell.badge.tone]
+                                        }`}
+                                      >
+                                        {cell.badge.text}
+                                      </span>
+                                    )}
                                   </div>
                                 )}
 
@@ -1011,6 +1819,79 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         )}
       </div>
 
+      {/* 4. Six-Year Tax Composition & Effective Rate Trajectory Stacked Bar Chart */}
+      <div className="bg-white border border-slate-200 rounded-lg p-5">
+        <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 mb-4">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900">
+              Six-Year Tax Composition &amp; Effective Rate Trajectory
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Annual federal, state, and employer payroll / PTE tax layers stacked against all-in effective rate (% of AGI).
+            </p>
+          </div>
+          <div className="text-xs text-slate-500 font-mono">
+            {setup.forecast_years[0]} Actuals → {setup.forecast_years[5]} Forecast
+          </div>
+        </div>
+        <div className="h-[260px] w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart data={chartData} margin={{ top: 8, right: 16, left: 4, bottom: 4 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+              <XAxis
+                dataKey="year"
+                tick={{ fontSize: 12, fill: '#475569', fontFamily: 'IBM Plex Mono' }}
+                axisLine={{ stroke: '#cbd5e1' }}
+                tickLine={false}
+              />
+              <YAxis
+                yAxisId="left"
+                tickFormatter={(v: number) => formatCompactCurrency(v)}
+                tick={{ fontSize: 11, fill: '#64748b', fontFamily: 'IBM Plex Mono' }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <YAxis
+                yAxisId="right"
+                orientation="right"
+                tickFormatter={(v: number) => `${v}%`}
+                domain={[0, 45]}
+                tick={{ fontSize: 11, fill: '#0f766e', fontFamily: 'IBM Plex Mono' }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <Tooltip
+                formatter={(value: unknown, name: unknown) => {
+                  const num = Number(value);
+                  const label = String(name);
+                  if (label.includes('Rate')) return [`${num.toFixed(1)}%`, label];
+                  return [formatCurrency(num), label];
+                }}
+                contentStyle={{
+                  backgroundColor: '#ffffff',
+                  borderColor: '#cbd5e1',
+                  borderRadius: '6px',
+                  fontSize: '12px',
+                  fontFamily: 'IBM Plex Mono',
+                }}
+              />
+              <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '8px' }} />
+              <Bar yAxisId="left" dataKey="Federal" stackId="tax" fill="#0f172a" radius={[0, 0, 0, 0]} />
+              <Bar yAxisId="left" dataKey="State" stackId="tax" fill="#0f766e" radius={[0, 0, 0, 0]} />
+              <Bar yAxisId="left" dataKey="Payroll & PTE" stackId="tax" fill="#94a3b8" radius={[3, 3, 0, 0]} />
+              <Line
+                yAxisId="right"
+                type="monotone"
+                dataKey="All-In Eff. Rate"
+                stroke="#d97706"
+                strokeWidth={2}
+                dot={{ r: 3.5, fill: '#d97706' }}
+              />
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
       {/* Archived Actuals History (shown after performing an Annual Roll Forward) */}
       {archivedYears.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-lg p-5">
@@ -1047,6 +1928,15 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
             </table>
           </div>
         </div>
+      )}
+
+      {/* 5. 2025 Deterministic Engine Verification Checkpoints (at the very bottom; collapsed by default when 7/7 pass) */}
+      {year1 && year1.tax_year === 2025 && isDefaultSeedSetup(setup) && (
+        <VerificationCheckpointsCard
+          setup={setup}
+          year2025={year1}
+          onSet2025Ss={handleSet2025Ss}
+        />
       )}
     </div>
   );

@@ -9,11 +9,21 @@ import type {
   TaxYearRecord,
 } from '../types/tax';
 import {
+  MONTH_SHORT_NAMES,
   calculateFraInfo,
+  formatDrcPercent,
   getAgeInTaxYear,
+  getPersonBirthMonth,
   parseBirthDate,
   sumEnteredMedicareMonthly,
 } from '../utils/personTax';
+import { computeIrmaaBracketThresholds, resolveIrmaaThresholdForYear } from './irmaa';
+import { computeReasonableCompRatio } from './validator';
+import {
+  getSetupStates,
+  getStateFullName,
+  resolveStateApportionmentForYear,
+} from '../utils/setupHelpers';
 
 interface TaxBracket {
   upTo: number;
@@ -231,6 +241,157 @@ export const STATE_TAX_RULES: Record<string, StateTaxRule> = {
     scorpMinTax: 150,
     scorpEntityRate: 0,
   },
+  TN: {
+    code: 'TN',
+    name: 'Tennessee',
+    mode: 'none',
+    stdDeduction: 0,
+    exemptsSocialSecurity: true,
+    pteAvailable: false,
+    pteRate: 0,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  IL: {
+    code: 'IL',
+    name: 'Illinois',
+    mode: 'flat',
+    flatRate: 0.0495,
+    stdDeduction: 5550,
+    exemptsSocialSecurity: true,
+    pteAvailable: true,
+    pteRate: 0.0495,
+    scorpMinTax: 0,
+    scorpEntityRate: 0.015,
+  },
+  NC: {
+    code: 'NC',
+    name: 'North Carolina',
+    mode: 'flat',
+    flatRate: 0.0425,
+    stdDeduction: 25500,
+    exemptsSocialSecurity: true,
+    pteAvailable: true,
+    pteRate: 0.0425,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  GA: {
+    code: 'GA',
+    name: 'Georgia',
+    mode: 'flat',
+    flatRate: 0.0539,
+    stdDeduction: 24000,
+    exemptsSocialSecurity: true,
+    pteAvailable: true,
+    pteRate: 0.0539,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  UT: {
+    code: 'UT',
+    name: 'Utah',
+    mode: 'flat',
+    flatRate: 0.0455,
+    stdDeduction: 0,
+    exemptsSocialSecurity: false,
+    pteAvailable: true,
+    pteRate: 0.0455,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  PA: {
+    code: 'PA',
+    name: 'Pennsylvania',
+    mode: 'flat',
+    flatRate: 0.0307,
+    stdDeduction: 0,
+    exemptsSocialSecurity: true,
+    pteAvailable: false,
+    pteRate: 0,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  MA: {
+    code: 'MA',
+    name: 'Massachusetts',
+    mode: 'flat',
+    flatRate: 0.05,
+    stdDeduction: 8800,
+    exemptsSocialSecurity: true,
+    pteAvailable: true,
+    pteRate: 0.05,
+    scorpMinTax: 456,
+    scorpEntityRate: 0,
+  },
+  VA: {
+    code: 'VA',
+    name: 'Virginia',
+    mode: 'flat',
+    flatRate: 0.0575,
+    stdDeduction: 17000,
+    exemptsSocialSecurity: true,
+    pteAvailable: true,
+    pteRate: 0.0575,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  OH: {
+    code: 'OH',
+    name: 'Ohio',
+    mode: 'flat',
+    flatRate: 0.035,
+    stdDeduction: 0,
+    exemptsSocialSecurity: true,
+    pteAvailable: true,
+    pteRate: 0.03,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  AK: {
+    code: 'AK',
+    name: 'Alaska',
+    mode: 'none',
+    stdDeduction: 0,
+    exemptsSocialSecurity: true,
+    pteAvailable: false,
+    pteRate: 0,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  NH: {
+    code: 'NH',
+    name: 'New Hampshire',
+    mode: 'none',
+    stdDeduction: 0,
+    exemptsSocialSecurity: true,
+    pteAvailable: false,
+    pteRate: 0,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  SD: {
+    code: 'SD',
+    name: 'South Dakota',
+    mode: 'none',
+    stdDeduction: 0,
+    exemptsSocialSecurity: true,
+    pteAvailable: false,
+    pteRate: 0,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
+  WY: {
+    code: 'WY',
+    name: 'Wyoming',
+    mode: 'none',
+    stdDeduction: 0,
+    exemptsSocialSecurity: true,
+    pteAvailable: false,
+    pteRate: 0,
+    scorpMinTax: 0,
+    scorpEntityRate: 0,
+  },
 };
 
 function round2(n: number): number {
@@ -348,13 +509,17 @@ function computeSocialSecurityTaxable(
 
 function computeIrmaaPerEnrollee(
   lookbackMagi: number,
-  filingStatus: FilingStatus,
-  scale: number
-): { tier: string; perEnrolleeSurcharge: number; tier1Threshold: number } {
-  const mfj = filingStatus === 'married_filing_jointly';
-  const thresholds = mfj
-    ? [212000, 266000, 334000, 400000, 750000]
-    : [106000, 133000, 167000, 200000, 500000];
+  coverageYear: number,
+  setup: SetupConfig,
+  surchargeScale: number
+): {
+  tier: string;
+  perEnrolleeSurcharge: number;
+  tier1Threshold: number;
+  formulaTier1Threshold: number;
+  isOverridden: boolean;
+} {
+  const { resolved, thresholds } = computeIrmaaBracketThresholds(coverageYear, setup);
   const perEnrolleeSurcharges = [0, 1052, 2642, 4232, 5822, 6352];
   const labels = [
     'Standard (No IRMAA)',
@@ -367,15 +532,17 @@ function computeIrmaaPerEnrollee(
 
   let idx = 0;
   for (let i = 0; i < thresholds.length; i++) {
-    if (lookbackMagi > thresholds[i] * scale) {
+    if (lookbackMagi > thresholds[i]) {
       idx = i + 1;
     }
   }
 
   return {
     tier: labels[idx],
-    perEnrolleeSurcharge: round0(perEnrolleeSurcharges[idx] * scale),
-    tier1Threshold: round0(thresholds[0] * scale),
+    perEnrolleeSurcharge: round0(perEnrolleeSurcharges[idx] * surchargeScale),
+    tier1Threshold: resolved.effectiveThreshold,
+    formulaTier1Threshold: resolved.formulaThreshold,
+    isOverridden: resolved.isOverridden,
   };
 }
 
@@ -423,21 +590,201 @@ function computePerson401kLimits(
 
 function defaultSsModeForYear(
   profile: SetupConfig['primary_profile'] | undefined,
+  fallbackBirthYear: number,
   taxYear: number,
-  anchorYear: number
+  anchorYear: number,
+  wasSuspendedPriorYear: boolean
 ): SsYearMode {
   if (!profile || !profile.social_security.receiving) return 'off';
-  if (!profile.social_security.suspend_fra_to_70) return 'on';
+  // Social Security projection starts in the active setup baseline year (never in prior baseline years)
+  if (taxYear < anchorYear) return 'off';
   const parsedDob = parseBirthDate(profile.birth_date);
+  const birthYear = parsedDob?.year ?? fallbackBirthYear;
+  const age70Year = birthYear + 70;
+
+  // Age-70 year defaults to 'suspended' (partial-year resume at birth month) ONLY when the
+  // immediately preceding year (age70Year - 1) was suspended; otherwise defaults to 'on'.
+  if (taxYear === age70Year) {
+    return wasSuspendedPriorYear ? 'suspended' : 'on';
+  }
+
+  if (!profile.social_security.suspend_fra_to_70) return 'on';
   const fra = calculateFraInfo(profile.birth_date);
   const resumeAge = Math.min(70, Math.max(68, profile.social_security.resume_age || 70));
   const suspendStart =
     profile.social_security.suspend_start_year ?? (fra ? fra.fraYear : anchorYear + 1);
-  const resumeYear = parsedDob
-    ? parsedDob.year + resumeAge
-    : suspendStart + Math.max(1, resumeAge - 67);
+  const resumeYear = birthYear + resumeAge;
   if (taxYear >= suspendStart && taxYear < resumeYear) return 'suspended';
   return 'on';
+}
+
+interface SsTrackState {
+  suspendedMonths: number;
+  wasSuspendedPriorYear: boolean;
+}
+
+interface ComputePersonSsYearParams {
+  profile: SetupConfig['primary_profile'] | undefined;
+  fallbackBirthYear: number;
+  fallbackBirthMonth: number;
+  taxYear: number;
+  setupBaseYear: number;
+  yearsFromSetupBase: number;
+  ssColaFactor: number;
+  ssColaLabel: string;
+  isLockedActuals: boolean;
+  requestedMode: SsYearMode;
+  overrideAmount: number | null | undefined;
+  track: SsTrackState;
+}
+
+/**
+ * Statutory Social Security voluntary suspension engine (birth-date driven for all households):
+ * - FRA year set to "Susp": prorates months BEFORE birth month:
+ *   fullYearCOLA * ((birthMonth - 1) / 12), accruing (13 - birthMonth) suspended DRC months.
+ * - Full suspension years (FRA < year < age70Year): $0 benefit, accruing 12 suspended DRC months/yr.
+ * - Age-70 year (year === age70Year):
+ *   - "Susp": suspends months before birth month (adding birthMonth - 1 DRC months), automatically
+ *     resumes in birth month at Age 70 with all accrued DRCs (+2/3% per month, capped at 36 mos / +24%),
+ *     prorated for (13 - birthMonth) / 12 months.
+ *   - "On": pays a full 12-month year (never prorated) applying only DRCs accrued through Dec of
+ *     age70Year - 1 (or pure compounded COLA if no prior years were suspended).
+ *   - "Off": true $0 override with no DRCs.
+ */
+function computePersonSsYear(params: ComputePersonSsYearParams): {
+  gross: number;
+  effectiveMode: SsYearMode;
+  status: string;
+} {
+  const {
+    profile,
+    fallbackBirthYear,
+    fallbackBirthMonth,
+    taxYear,
+    setupBaseYear,
+    yearsFromSetupBase,
+    ssColaFactor,
+    ssColaLabel,
+    isLockedActuals,
+    requestedMode,
+    overrideAmount,
+    track,
+  } = params;
+
+  // Explicit "Off": true $0 override, accrues no DRCs
+  if (requestedMode === 'off') {
+    track.wasSuspendedPriorYear = false;
+    return { gross: 0, effectiveMode: 'off', status: 'Off' };
+  }
+
+  const parsedDob = parseBirthDate(profile?.birth_date);
+  const birthYear = parsedDob?.year ?? fallbackBirthYear;
+  const birthMonth = getPersonBirthMonth(profile, fallbackBirthMonth);
+  const birthMonthShort = MONTH_SHORT_NAMES[birthMonth - 1];
+  const fra = calculateFraInfo(profile?.birth_date);
+  const fraYear = fra?.fraYear ?? birthYear + 67;
+  const age70Year = birthYear + 70;
+  const monthly = profile?.social_security.monthly_benefit ?? 0;
+  const fullYearCola = monthly > 0 ? monthly * 12 * ssColaFactor : 0;
+
+  // Explicit dollar override on an "On" cell (or locked actuals test override)
+  if (
+    requestedMode === 'on' &&
+    typeof overrideAmount === 'number' &&
+    Number.isFinite(overrideAmount)
+  ) {
+    track.wasSuspendedPriorYear = false;
+    const drcPct = formatDrcPercent(track.suspendedMonths);
+    return {
+      gross: round0(Math.max(0, overrideAmount)),
+      effectiveMode: 'on',
+      status: isLockedActuals
+        ? 'On'
+        : track.suspendedMonths > 0
+        ? `Override (+${drcPct}% DRC)`
+        : 'Override',
+    };
+  }
+
+  if (isLockedActuals) {
+    track.wasSuspendedPriorYear = false;
+    return { gross: 0, effectiveMode: 'off', status: 'Off' };
+  }
+
+  // Voluntary suspension ("Susp")
+  if (requestedMode === 'suspended') {
+    if (taxYear === age70Year) {
+      // Suspend months before birth month, then auto-resume in birth month at Age 70
+      // with all accrued DRCs (including this partial Age-70 year's pre-birth months).
+      const preBirthSuspMonths = birthMonth - 1;
+      track.suspendedMonths = Math.min(36, track.suspendedMonths + preBirthSuspMonths);
+      track.wasSuspendedPriorYear = false;
+      const drcMult = 1 + track.suspendedMonths * (0.08 / 12);
+      const drcPctStr = formatDrcPercent(track.suspendedMonths);
+      const paidMonths = 13 - birthMonth;
+      const annualizedWithDrc = fullYearCola * drcMult;
+      const gross = monthly > 0 ? round0(annualizedWithDrc * (paidMonths / 12)) : 0;
+      return {
+        gross,
+        effectiveMode: 'suspended',
+        status:
+          monthly <= 0
+            ? 'Benefit pending'
+            : `${paidMonths} mos (+${drcPctStr}% DRC · Age 70)`,
+      };
+    }
+
+    if (taxYear === fraYear) {
+      // Partial year of benefits for the months BEFORE the birth month
+      const paidMonths = birthMonth - 1;
+      const suspMonthsThisYear = 13 - birthMonth;
+      track.suspendedMonths = Math.min(36, track.suspendedMonths + suspMonthsThisYear);
+      track.wasSuspendedPriorYear = true;
+      const gross =
+        monthly > 0 && paidMonths > 0 ? round0(fullYearCola * (paidMonths / 12)) : 0;
+      const status =
+        paidMonths > 0
+          ? `${paidMonths} mos (Susp ${birthMonthShort})`
+          : `Suspended (Susp ${birthMonthShort} · +8%/yr)`;
+      return { gross, effectiveMode: 'suspended', status };
+    }
+
+    if (taxYear > fraYear && taxYear < age70Year) {
+      // Full suspension year (FRA < year < age 70)
+      track.suspendedMonths = Math.min(36, track.suspendedMonths + 12);
+      track.wasSuspendedPriorYear = true;
+      return { gross: 0, effectiveMode: 'suspended', status: 'Suspended (+8%/yr DRC)' };
+    }
+
+    if (taxYear < fraYear) {
+      // Pre-FRA cannot accrue voluntary suspension DRCs
+      track.wasSuspendedPriorYear = false;
+      return { gross: 0, effectiveMode: 'suspended', status: 'Pre-FRA (No DRC)' };
+    }
+
+    // Years strictly after age 70: SSA does not allow voluntary suspension past age 70
+  }
+
+  // Full 12-month COLA-adjusted "On" year (never prorated; applies only DRCs accrued through Dec of prior year)
+  const justResumed = track.wasSuspendedPriorYear && track.suspendedMonths > 0;
+  track.wasSuspendedPriorYear = false;
+  const drcMult = 1 + track.suspendedMonths * (0.08 / 12);
+  const drcPctStr = formatDrcPercent(track.suspendedMonths);
+  const gross = monthly > 0 ? round0(fullYearCola * drcMult) : 0;
+  const status =
+    monthly <= 0
+      ? 'Benefit pending'
+      : taxYear === age70Year && track.suspendedMonths > 0
+      ? `Full yr (+${drcPctStr}% DRC)`
+      : justResumed
+      ? `Resumed (+${drcPctStr}% DRC)`
+      : track.suspendedMonths > 0
+      ? `+${drcPctStr}% DRC · +${ssColaLabel} COLA`
+      : yearsFromSetupBase > 0
+      ? `+${ssColaLabel} COLA`
+      : `${setupBaseYear} Exact`;
+
+  return { gross, effectiveMode: 'on', status };
 }
 
 /**
@@ -452,8 +799,8 @@ export function calculateSixYearPlan(
   const results: ComputedTaxYear[] = [];
   let runningStockBasis: number | null = null;
   let runningAaa: number | null = null;
-  let debraSuspendedYears = 0;
-  let billSuspendedYears = 0;
+  const billSsTrack: SsTrackState = { suspendedMonths: 0, wasSuspendedPriorYear: false };
+  const debraSsTrack: SsTrackState = { suspendedMonths: 0, wasSuspendedPriorYear: false };
 
   for (let i = 0; i < years.length; i++) {
     const yr = years[i];
@@ -473,13 +820,97 @@ export function calculateSixYearPlan(
         : null;
 
     // ------------------------------------------------------------------
-    // LAYER 1: Entity, Per-Person W-2, Payroll & 401(k)/DBP Layer (1120-S)
+    // Pre-Layer 1: Per-Person Medicare & S-Corp >2% SEHI Premiums
+    // (Depends only on Setup Medicare premiums, inflation, & prior-year lookback MAGI)
     // ------------------------------------------------------------------
     const scorpIn = yr.scorp_1120s;
     const dbpIn = yr.dbp_and_retirement;
     const f1040In = yr.form_1040;
 
-    // Primary Taxpayer = Bill (bill_w2_wages); Spouse = Debra (debra_w2_wages when MFJ)
+    const setupBaseYear =
+      setup.current_tax_year ?? (setup.forecast_years[1] ?? setup.anchor_actuals_year + 1);
+    const yearsFromSetupBase = Math.max(0, yr.tax_year - setupBaseYear);
+
+    const medInflationRate = setup.assumptions.medicare_inflation_rate ?? 0.055;
+    const medInflationFactor = Math.pow(1 + medInflationRate, yearsFromSetupBase);
+
+    const primaryMedicareEnrolled =
+      !yr.is_locked_actuals && Boolean(setup.primary_profile?.medicare.enrolled);
+    const spouseMedicareEnrolled =
+      !yr.is_locked_actuals &&
+      setup.filing_status === 'married_filing_jointly' &&
+      Boolean(setup.spouse_profile?.medicare.enrolled);
+
+    const primaryMedicareBaseAnnual =
+      primaryMedicareEnrolled && setup.primary_profile
+        ? round0(
+            sumEnteredMedicareMonthly(setup.primary_profile.medicare) * 12 * medInflationFactor
+          )
+        : 0;
+    const spouseMedicareBaseAnnual =
+      spouseMedicareEnrolled && setup.spouse_profile
+        ? round0(
+            sumEnteredMedicareMonthly(setup.spouse_profile.medicare) * 12 * medInflationFactor
+          )
+        : 0;
+
+    // Two-year lookback MAGI for IRMAA evaluation (known before AGI for all years after Year 1)
+    const priorLookbackMagi =
+      i >= 2
+        ? results[i - 2].form_1040_out.adjusted_gross_income +
+          years[i - 2].form_1040.tax_exempt_interest
+        : i === 1
+        ? results[0].form_1040_out.adjusted_gross_income +
+          years[0].form_1040.tax_exempt_interest
+        : null;
+
+    const earlyIrmaaEval =
+      priorLookbackMagi !== null
+        ? computeIrmaaPerEnrollee(priorLookbackMagi, yr.tax_year, setup, scale)
+        : null;
+    const earlyIrmaaTotal = earlyIrmaaEval
+      ? (primaryMedicareEnrolled ? earlyIrmaaEval.perEnrolleeSurcharge : 0) +
+        (spouseMedicareEnrolled ? earlyIrmaaEval.perEnrolleeSurcharge : 0)
+      : 0;
+
+    // SEHI Medicare Premiums:
+    // - Locked actuals (e.g., filed prior year): uses filed health_insurance_premiums independent of current Setup.
+    // - Forecast years: Setup Medicare base premiums * medicare_inflation_rate + any applicable IRMAA surcharge,
+    //   falling back to plan health_insurance_premiums if no Setup monthly Medicare premiums are entered;
+    //   inline schedule overrides take precedence.
+    const setupMedicareCombined = primaryMedicareBaseAnnual + spouseMedicareBaseAnnual;
+    const hasSehiOverride =
+      !yr.is_locked_actuals &&
+      typeof f1040In.sehi_medicare_override === 'number' &&
+      Number.isFinite(f1040In.sehi_medicare_override);
+    const defaultSehiPremiums = yr.is_locked_actuals
+      ? f1040In.health_insurance_premiums
+      : setupMedicareCombined > 0
+      ? setupMedicareCombined + earlyIrmaaTotal
+      : f1040In.health_insurance_premiums;
+    const sehiMedicarePremiumsEffective = hasSehiOverride
+      ? round0(Math.max(0, f1040In.sehi_medicare_override!))
+      : defaultSehiPremiums;
+    const irmaaIncludedInSehi =
+      !yr.is_locked_actuals &&
+      !hasSehiOverride &&
+      setupMedicareCombined > 0 &&
+      earlyIrmaaTotal > 0;
+
+    // IRS Notice 2008-1: S-Corp >2% shareholder health insurance (SEHI) is deducted by the S-Corp
+    // (reducing Form 1120-S ordinary income / K-1 Box 1 and therefore Form 8995 QBI),
+    // added to W-2 Box 1 taxable wages, EXCLUDED from W-2 Box 3/5 FICA wages & 401(k) eligible wages,
+    // and deducted back out on Form 1040 Schedule 1 Line 17 (capped by Box 5 Medicare wages per Form 7206 Line 11).
+    // When use_detailed_1120s_deductions is true (locked filed return), SEHI is already reflected in explicit filed lines.
+    const scorpSehiDeduction =
+      setup.has_scorp && !scorpIn.use_detailed_1120s_deductions
+        ? sehiMedicarePremiumsEffective
+        : 0;
+
+    // ------------------------------------------------------------------
+    // LAYER 1: Entity, Per-Person Cash W-2, Payroll & 401(k)/DBP Layer (1120-S)
+    // ------------------------------------------------------------------
+    // Cash FICA W-2 wages (W-2 Box 3 & Box 5) — strictly EXCLUDING S-Corp >2% SEHI add-back
     const billW2 = setup.has_scorp ? scorpIn.bill_w2_wages : f1040In.w2_wages_total;
     const debraW2 =
       setup.has_scorp && setup.filing_status === 'married_filing_jointly'
@@ -490,8 +921,8 @@ export function calculateSixYearPlan(
     const ssWageBase = round0(176100 * scale);
 
     // Personal (employee) FICA per person + Additional Medicare Tax (0.9% over $250k MFJ / $200k Single)
-    const empFicaBill = computePersonFica(billW2, ssWageBase);
-    const empFicaDebra = computePersonFica(debraW2, ssWageBase);
+    const empFicaPrimary = computePersonFica(billW2, ssWageBase);
+    const empFicaSpouse = computePersonFica(debraW2, ssWageBase);
     const addlMedThreshold =
       setup.filing_status === 'married_filing_jointly'
         ? 250000
@@ -503,16 +934,17 @@ export function calculateSixYearPlan(
       combinedW2ForFica > addlMedThreshold
         ? round0((combinedW2ForFica - addlMedThreshold) * 0.009)
         : 0;
-    const personalFicaTax = round0(empFicaBill + empFicaDebra + addlMedicareTax);
+    const personalFicaTax = round0(empFicaPrimary + empFicaSpouse + addlMedicareTax);
 
-    // DBP termination & Post-DBP Employer 401(k) Profit Sharing Rate rule:
-    // Capped at 6% through Planned Termination Year; steps up to Post-DBP rate in Term Year + 1 (subject to §415(c))
+    // DBP termination & Post-DBP Employer 401(k) Profit Sharing Rate rule (IRC §404(a)(7)):
+    // 6% combined-plan cap applies ONLY while DBP is active; once DBP is terminated (or inactive),
+    // the statutory cap rises to 25% of cash W-2 wages (subject to IRS §415(c) limits).
     const termYear = setup.has_dbp ? setup.dbp_planned_termination_year : null;
-    const isPostDbpYear =
-      setup.has_dbp && termYear !== null && yr.tax_year > termYear;
-    const activeEmployerPsRate = !setup.has_dbp
-      ? Math.min(0.25, Math.max(0, setup.post_dbp_profit_sharing_rate))
-      : isPostDbpYear
+    const isDbpTerminatedOrInactive =
+      !setup.has_dbp ||
+      dbpIn.dbp_status === 'terminated' ||
+      (termYear !== null && yr.tax_year > termYear && dbpIn.dbp_status !== 'active');
+    const activeEmployerPsRate = isDbpTerminatedOrInactive
       ? Math.min(0.25, Math.max(0, setup.post_dbp_profit_sharing_rate))
       : 0.06;
 
@@ -570,33 +1002,79 @@ export function calculateSixYearPlan(
       Number.isFinite(scorpIn.ca_revenue) &&
       typeof scorpIn.az_revenue === 'number' &&
       Number.isFinite(scorpIn.az_revenue);
-    const caRevenue = hasSplitRev ? Math.max(0, round0(scorpIn.ca_revenue)) : 0;
-    const azRevenue = hasSplitRev ? Math.max(0, round0(scorpIn.az_revenue)) : 0;
+    const rawPrimaryRevenue = hasSplitRev ? Math.max(0, round0(scorpIn.ca_revenue)) : 0;
+    const rawSecondaryRevenue = hasSplitRev ? Math.max(0, round0(scorpIn.az_revenue)) : 0;
     const effectiveGrossRevenue = hasSplitRev
-      ? caRevenue + azRevenue
+      ? rawPrimaryRevenue + rawSecondaryRevenue
       : Math.max(0, round0(scorpIn.gross_receipts_revenue));
 
-    const liveCaApportionment =
+    const setupStates = getSetupStates(setup, yr);
+    const resolvedSetupSplit = resolveStateApportionmentForYear(setup, yr.tax_year);
+    const activeSplitSet = new Set(resolvedSetupSplit.activeStates);
+    const hasExternalScenarioStateApportionment = yr.state_filings.some(
+      (sf) => !activeSplitSet.has(sf.state_code) && sf.state_apportionment_factor > 0
+    );
+    const useSetupApportionment =
+      !yr.is_locked_actuals &&
+      Boolean(setup.state_revenue_apportionment) &&
+      resolvedSetupSplit.activeStates.length > 0 &&
+      !hasExternalScenarioStateApportionment;
+
+    const caRevenue = useSetupApportionment
+      ? resolvedSetupSplit.hasSecondary
+        ? round0(effectiveGrossRevenue * resolvedSetupSplit.primaryRatio)
+        : effectiveGrossRevenue
+      : rawPrimaryRevenue;
+    const azRevenue = useSetupApportionment
+      ? resolvedSetupSplit.hasSecondary
+        ? Math.max(0, effectiveGrossRevenue - caRevenue)
+        : 0
+      : rawSecondaryRevenue;
+
+    const livePrimaryApportionment =
       hasSplitRev && effectiveGrossRevenue > 0 ? caRevenue / effectiveGrossRevenue : null;
-    const liveAzApportionment =
+    const liveSecondaryApportionment =
       hasSplitRev && effectiveGrossRevenue > 0 ? azRevenue / effectiveGrossRevenue : null;
 
     const getEffectiveApportionment = (stateCode: string, fallback: number): number => {
-      if (stateCode === 'CA' && liveCaApportionment !== null) return liveCaApportionment;
-      if (stateCode === 'AZ' && liveAzApportionment !== null) return liveAzApportionment;
+      if (hasExternalScenarioStateApportionment) return fallback;
+      if (useSetupApportionment) {
+        if (Object.prototype.hasOwnProperty.call(resolvedSetupSplit.split, stateCode)) {
+          return (resolvedSetupSplit.split[stateCode] ?? 0) / 100;
+        }
+        return fallback;
+      }
+      if (
+        setupStates.primaryStateCode &&
+        stateCode === setupStates.primaryStateCode &&
+        livePrimaryApportionment !== null
+      ) {
+        return livePrimaryApportionment;
+      }
+      if (
+        setupStates.secondaryStateCode &&
+        stateCode === setupStates.secondaryStateCode &&
+        liveSecondaryApportionment !== null
+      ) {
+        return liveSecondaryApportionment;
+      }
       return fallback;
     };
+
+    let effectiveOperatingExpenses = 0;
+    let operatingExpensesIsScaled = false;
+    let operatingExpensesIsOverridden = false;
 
     if (setup.has_scorp) {
       // Employer FICA computed per person (each person has their own SS wage base) + FUTA,
       // or explicit Form 1120-S payroll tax line item when detailed 1120-S inputs are configured
-      const erFicaDebra = computePersonFica(debraW2, ssWageBase);
-      const erFicaBill = computePersonFica(billW2, ssWageBase);
+      const erFicaSpouse = computePersonFica(debraW2, ssWageBase);
+      const erFicaPrimary = computePersonFica(billW2, ssWageBase);
       const futaCount = (debraW2 > 0 ? 1 : 0) + (billW2 > 0 ? 1 : 0);
       employerPayrollTaxes =
-        scorpIn.use_detailed_1120s_deductions && scorpIn.payroll_taxes_input !== undefined
-          ? round0(scorpIn.payroll_taxes_input)
-          : round0(erFicaDebra + erFicaBill + futaCount * 420);
+        scorpIn.payroll_taxes_input !== undefined
+          ? round0(Math.max(0, scorpIn.payroll_taxes_input))
+          : round0(erFicaSpouse + erFicaPrimary + futaCount * 420);
 
       let prePteOrdinaryIncome: number;
       if (scorpIn.use_detailed_1120s_deductions) {
@@ -612,6 +1090,10 @@ export function calculateSixYearPlan(
           effectiveDbpDeduction + employer401kTotal;
         const otherDed = scorpIn.other_deductions ?? 0;
 
+        effectiveOperatingExpenses = round0(
+          rents + (scorpIn.ftb_state_taxes_input ?? 0) + advertising + otherDed
+        );
+
         prePteOrdinaryIncome = round0(
           effectiveGrossRevenue -
             officerComp -
@@ -623,10 +1105,46 @@ export function calculateSixYearPlan(
             otherDed
         );
       } else {
+        const opexScalingMode = setup.assumptions.opex_scaling_mode ?? 'revenue_proportional';
+        const clampedExpenseRatio = Math.min(
+          1,
+          Math.max(
+            0,
+            typeof setup.assumptions.expense_ratio === 'number' &&
+              Number.isFinite(setup.assumptions.expense_ratio)
+              ? setup.assumptions.expense_ratio
+              : 0.2
+          )
+        );
+        const isUnlockedFutureForecastYear =
+          !yr.is_locked_actuals && yr.tax_year > setupBaseYear;
+        const hasManualOpexOverride =
+          isUnlockedFutureForecastYear &&
+          typeof scorpIn.operating_expenses_override === 'number' &&
+          Number.isFinite(scorpIn.operating_expenses_override);
+
+        if (hasManualOpexOverride) {
+          effectiveOperatingExpenses = round0(
+            Math.max(0, scorpIn.operating_expenses_override as number)
+          );
+          operatingExpensesIsOverridden = true;
+        } else if (
+          isUnlockedFutureForecastYear &&
+          opexScalingMode === 'revenue_proportional'
+        ) {
+          effectiveOperatingExpenses = round0(
+            Math.max(0, effectiveGrossRevenue) * clampedExpenseRatio
+          );
+          operatingExpensesIsScaled = true;
+        } else {
+          effectiveOperatingExpenses = round0(Math.max(0, scorpIn.operating_expenses));
+        }
+
         prePteOrdinaryIncome = round0(
           effectiveGrossRevenue -
-            scorpIn.operating_expenses -
+            effectiveOperatingExpenses -
             combinedOfficerW2 -
+            scorpSehiDeduction -
             employerPayrollTaxes -
             effectiveDbpDeduction -
             employer401kTotal
@@ -679,14 +1197,16 @@ export function calculateSixYearPlan(
         aaaBeginning + ordinaryIncome1120s - scorpIn.scorp_distributions_total
       );
 
-      const denom = combinedOfficerW2 + Math.max(0, ordinaryIncome1120s);
-      reasonableCompRatio = denom > 0 ? round2(combinedOfficerW2 / denom) : 0;
+      reasonableCompRatio = computeReasonableCompRatio(combinedOfficerW2, ordinaryIncome1120s);
 
       runningStockBasis = stockBasisEnding;
       runningAaa = aaaEnding;
     }
 
     const scorpOut: SCorp1120SOutputs = {
+      effective_operating_expenses: effectiveOperatingExpenses,
+      operating_expenses_is_scaled: operatingExpensesIsScaled,
+      operating_expenses_is_overridden: operatingExpensesIsOverridden,
       employer_payroll_taxes: employerPayrollTaxes,
       pte_tax_paid_by_state: pteTaxPaidByState,
       pte_tax_paid_total: pteTaxPaidTotal,
@@ -710,12 +1230,13 @@ export function calculateSixYearPlan(
     const effectiveGrossW2 =
       setup.has_scorp ? combinedOfficerW2 : f1040In.w2_wages_total;
 
-    // Form 1040 Line 1a Taxable W-2:
-    // Use explicit filed Box 1 W-2 if configured (e.g., 2025 $14,050 = Bill $11,000 + Debra $3,050),
-    // otherwise compute Gross W-2 minus pre-tax Employee 401(k) deferrals dynamically
+    // Form 1040 Line 1a Taxable W-2 (Box 1):
+    // Use explicit filed Box 1 W-2 if configured (e.g., locked prior-year filed return),
+    // otherwise Cash W-2 minus pre-tax Employee 401(k) deferrals PLUS S-Corp >2% SEHI add-back
+    // per IRS Notice 2008-1 (SEHI is deducted back out on Schedule 1 Line 17 so it nets to $0 on AGI).
     const taxableW2Box1 = f1040In.use_explicit_w2_box1
       ? f1040In.w2_wages_total
-      : Math.max(0, effectiveGrossW2 - employee401kTotal);
+      : Math.max(0, effectiveGrossW2 - employee401kTotal + scorpSehiDeduction);
 
     const effectiveLtcg = f1040In.schedule_d_includes_excess_gain
       ? f1040In.long_term_capital_gain_loss
@@ -730,99 +1251,78 @@ export function calculateSixYearPlan(
       : f1040In.pensions_and_annuities_taxable;
 
     // Independent per-person Social Security schedules:
-    // - Locked actuals year (e.g., 2025) stays completely independent of 2026 Setup changes (except explicit per-year test overrides).
-    // - Current / Setup Tax Year (default 2026) applies exact Setup monthly inputs * 12 (0% COLA markup).
-    // - Forecast years >= Current Tax Year + 1 (2027+) compound by ss_cola_rate (default 2.6%).
-    const setupBaseYear =
-      setup.current_tax_year ?? (setup.forecast_years[1] ?? setup.anchor_actuals_year + 1);
-    const yearsFromSetupBase = Math.max(0, yr.tax_year - setupBaseYear);
+    // - Locked actuals year stays completely independent of current Setup changes (except explicit per-year test overrides).
+    // - Current / Setup Tax Year applies exact Setup monthly inputs * 12 (0% COLA markup).
+    // - Forecast years >= Current Tax Year + 1 compound by ss_cola_rate (default 2.6%).
     const ssColaRate = setup.assumptions.ss_cola_rate ?? 0.026;
     const ssColaFactor = Math.pow(1 + ssColaRate, yearsFromSetupBase);
     const ssColaLabel = `${Number((ssColaRate * 100).toFixed(1))}%`;
 
-    // Primary Taxpayer (Bill) Social Security schedule
-    const billSsMode: SsYearMode = yr.is_locked_actuals
+    // Primary Taxpayer Social Security schedule
+    const billRequestedMode: SsYearMode = yr.is_locked_actuals
       ? f1040In.ss_bill_mode ?? 'off'
       : f1040In.ss_bill_mode ??
-        defaultSsModeForYear(setup.primary_profile, yr.tax_year, setupBaseYear);
-    let primarySsGross = 0;
-    let primarySsStatus = 'Off';
-    if (billSsMode === 'suspended') {
-      billSuspendedYears += 1;
-      primarySsGross = 0;
-      primarySsStatus = 'Suspended (+8%/yr DRC)';
-    } else if (billSsMode === 'on') {
-      if (
-        typeof f1040In.ss_bill_override === 'number' &&
-        Number.isFinite(f1040In.ss_bill_override)
-      ) {
-        primarySsGross = round0(Math.max(0, f1040In.ss_bill_override));
-        primarySsStatus = yr.is_locked_actuals
-          ? 'On'
-          : billSuspendedYears > 0
-          ? `Override (+${billSuspendedYears * 8}% DRC)`
-          : 'Override';
-      } else if (yr.is_locked_actuals) {
-        primarySsGross = 0;
-        primarySsStatus = 'Off';
-      } else {
-        const monthly = setup.primary_profile?.social_security.monthly_benefit ?? 0;
-        const drcMult = 1 + billSuspendedYears * 0.08;
-        primarySsGross = monthly > 0 ? round0(monthly * 12 * ssColaFactor * drcMult) : 0;
-        primarySsStatus =
-          monthly <= 0
-            ? 'Benefit pending'
-            : billSuspendedYears > 0
-            ? `Resumed (+${billSuspendedYears * 8}% DRC)`
-            : yearsFromSetupBase > 0
-            ? `+${ssColaLabel} COLA`
-            : `${setupBaseYear} Exact`;
-      }
-    }
+        defaultSsModeForYear(
+          setup.primary_profile,
+          setup.primary_birth_year,
+          yr.tax_year,
+          setupBaseYear,
+          billSsTrack.wasSuspendedPriorYear
+        );
 
-    // Spouse (Debra) Social Security schedule (active when Married Filing Jointly)
-    const debraSsMode: SsYearMode =
-      setup.filing_status !== 'married_filing_jointly'
-        ? 'off'
-        : yr.is_locked_actuals
-        ? f1040In.ss_debra_mode ?? 'off'
-        : f1040In.ss_debra_mode ??
-          defaultSsModeForYear(setup.spouse_profile, yr.tax_year, setupBaseYear);
+    const billSsResult = computePersonSsYear({
+      profile: setup.primary_profile,
+      fallbackBirthYear: setup.primary_birth_year,
+      fallbackBirthMonth: 1,
+      taxYear: yr.tax_year,
+      setupBaseYear,
+      yearsFromSetupBase,
+      ssColaFactor,
+      ssColaLabel,
+      isLockedActuals: yr.is_locked_actuals,
+      requestedMode: billRequestedMode,
+      overrideAmount: f1040In.ss_bill_override,
+      track: billSsTrack,
+    });
+    const billSsMode = billSsResult.effectiveMode;
+    const primarySsGross = billSsResult.gross;
+    const primarySsStatus = billSsResult.status;
+
+    // Spouse Social Security schedule (active when Married Filing Jointly)
+    let debraSsMode: SsYearMode = 'off';
     let spouseSsGross = 0;
     let spouseSsStatus = setup.filing_status === 'married_filing_jointly' ? 'Off' : 'N/A';
+
     if (setup.filing_status === 'married_filing_jointly') {
-      if (debraSsMode === 'suspended') {
-        debraSuspendedYears += 1;
-        spouseSsGross = 0;
-        spouseSsStatus = 'Suspended (+8%/yr DRC)';
-      } else if (debraSsMode === 'on') {
-        if (
-          typeof f1040In.ss_debra_override === 'number' &&
-          Number.isFinite(f1040In.ss_debra_override)
-        ) {
-          spouseSsGross = round0(Math.max(0, f1040In.ss_debra_override));
-          spouseSsStatus = yr.is_locked_actuals
-            ? 'On'
-            : debraSuspendedYears > 0
-            ? `Override (+${debraSuspendedYears * 8}% DRC)`
-            : 'Override';
-        } else if (yr.is_locked_actuals) {
-          spouseSsGross = 0;
-          spouseSsStatus = 'Off';
-        } else {
-          const monthly = setup.spouse_profile?.social_security.monthly_benefit ?? 0;
-          const drcMult = 1 + debraSuspendedYears * 0.08;
-          spouseSsGross = monthly > 0 ? round0(monthly * 12 * ssColaFactor * drcMult) : 0;
-          spouseSsStatus =
-            monthly <= 0
-              ? 'Benefit pending'
-              : debraSuspendedYears > 0
-              ? `Resumed (+${debraSuspendedYears * 8}% DRC)`
-              : yearsFromSetupBase > 0
-              ? `+${ssColaLabel} COLA`
-              : `${setupBaseYear} Exact`;
-        }
-      }
+      const spouseFallbackBirthYear = setup.spouse_birth_year ?? setup.primary_birth_year;
+      const debraRequestedMode: SsYearMode = yr.is_locked_actuals
+        ? f1040In.ss_debra_mode ?? 'off'
+        : f1040In.ss_debra_mode ??
+          defaultSsModeForYear(
+            setup.spouse_profile,
+            spouseFallbackBirthYear,
+            yr.tax_year,
+            setupBaseYear,
+            debraSsTrack.wasSuspendedPriorYear
+          );
+
+      const debraSsResult = computePersonSsYear({
+        profile: setup.spouse_profile,
+        fallbackBirthYear: spouseFallbackBirthYear,
+        fallbackBirthMonth: 1,
+        taxYear: yr.tax_year,
+        setupBaseYear,
+        yearsFromSetupBase,
+        ssColaFactor,
+        ssColaLabel,
+        isLockedActuals: yr.is_locked_actuals,
+        requestedMode: debraRequestedMode,
+        overrideAmount: f1040In.ss_debra_override,
+        track: debraSsTrack,
+      });
+      debraSsMode = debraSsResult.effectiveMode;
+      spouseSsGross = debraSsResult.gross;
+      spouseSsStatus = debraSsResult.status;
     }
 
     const combinedIndividualSs = primarySsGross + spouseSsGross;
@@ -839,113 +1339,19 @@ export function calculateSixYearPlan(
       f1040In.ira_distributions_taxable +
       annuityTaxable;
 
-    // Per-person Medicare base premiums from Setup:
-    // - Locked actuals (2025) remain independent of 2026 Setup Medicare enrollment/premiums.
-    // - Current / Setup Tax Year (default 2026) applies exact Setup monthly inputs * 12 (0% markup).
-    // - Forecast years >= Current Tax Year + 1 (2027+) compound by medicare_inflation_rate (default 5.5%).
-    const medInflationRate = setup.assumptions.medicare_inflation_rate ?? 0.055;
-    const medInflationFactor = Math.pow(1 + medInflationRate, yearsFromSetupBase);
-
-    const primaryMedicareEnrolled =
-      !yr.is_locked_actuals && Boolean(setup.primary_profile?.medicare.enrolled);
-    const spouseMedicareEnrolled =
-      !yr.is_locked_actuals &&
-      setup.filing_status === 'married_filing_jointly' &&
-      Boolean(setup.spouse_profile?.medicare.enrolled);
-
-    const primaryMedicareBaseAnnual =
-      primaryMedicareEnrolled && setup.primary_profile
-        ? round0(
-            sumEnteredMedicareMonthly(setup.primary_profile.medicare) * 12 * medInflationFactor
-          )
-        : 0;
-    const spouseMedicareBaseAnnual =
-      spouseMedicareEnrolled && setup.spouse_profile
-        ? round0(
-            sumEnteredMedicareMonthly(setup.spouse_profile.medicare) * 12 * medInflationFactor
-          )
-        : 0;
-
-    // Two-year lookback MAGI for IRMAA evaluation (known before AGI for all years after Year 1)
-    const priorLookbackMagi =
-      i >= 2
-        ? results[i - 2].form_1040_out.adjusted_gross_income +
-          years[i - 2].form_1040.tax_exempt_interest
-        : i === 1
-        ? results[0].form_1040_out.adjusted_gross_income +
-          years[0].form_1040.tax_exempt_interest
-        : null;
-
-    const earlyIrmaaEval =
-      priorLookbackMagi !== null
-        ? computeIrmaaPerEnrollee(priorLookbackMagi, setup.filing_status, scale)
-        : null;
-    const earlyIrmaaTotal = earlyIrmaaEval
-      ? (primaryMedicareEnrolled ? earlyIrmaaEval.perEnrolleeSurcharge : 0) +
-        (spouseMedicareEnrolled ? earlyIrmaaEval.perEnrolleeSurcharge : 0)
-      : 0;
-
-    // SEHI Medicare Premiums:
-    // - Locked actuals (2025): uses filed health_insurance_premiums ($0) independent of 2026 Setup.
-    // - Forecast years: Setup Medicare base premiums * medicare_inflation_rate + any applicable IRMAA surcharge,
-    //   falling back to plan health_insurance_premiums if no Setup monthly Medicare premiums are entered;
-    //   inline schedule overrides take precedence.
-    const setupMedicareCombined = primaryMedicareBaseAnnual + spouseMedicareBaseAnnual;
-    const hasSehiOverride =
-      !yr.is_locked_actuals &&
-      typeof f1040In.sehi_medicare_override === 'number' &&
-      Number.isFinite(f1040In.sehi_medicare_override);
-    const defaultSehiPremiums = yr.is_locked_actuals
-      ? f1040In.health_insurance_premiums
-      : setupMedicareCombined > 0
-      ? setupMedicareCombined + earlyIrmaaTotal
-      : f1040In.health_insurance_premiums;
-    const sehiMedicarePremiumsEffective = hasSehiOverride
-      ? round0(Math.max(0, f1040In.sehi_medicare_override!))
-      : defaultSehiPremiums;
-    const irmaaIncludedInSehi =
-      !yr.is_locked_actuals &&
-      !hasSehiOverride &&
-      setupMedicareCombined > 0 &&
-      earlyIrmaaTotal > 0;
-
-    // Schedule 1 Line 17 SEHI Deduction capped at each shareholder's available W-2 Box 1 wages
-    // (W-2 Compensation minus Employee 401(k) Elective Deferrals)
-    const billAvailableBox1 = f1040In.use_explicit_w2_box1
-      ? Math.max(0, f1040In.bill_w2_box1 ?? billW2)
-      : Math.max(0, billW2 - bill401k.employeeDeferral);
-    const debraAvailableBox1 =
-      setup.filing_status === 'married_filing_jointly'
-        ? f1040In.use_explicit_w2_box1
-          ? Math.max(0, f1040In.debra_w2_box1 ?? debraW2)
-          : Math.max(0, debraW2 - debra401k.employeeDeferral)
-        : 0;
+    // Schedule 1 Line 17 SEHI Deduction (IRS Form 7206 Line 11 & IRC § 162(l)(5)):
+    // Capped at combined W-2 Box 5 Medicare wages (cash W-2 wages before 401(k) elective deferrals,
+    // strictly excluding the S-Corp >2% shareholder health insurance add-back).
+    const billBox5MedicareWages = Math.max(0, billW2);
+    const debraBox5MedicareWages =
+      setup.filing_status === 'married_filing_jointly' ? Math.max(0, debraW2) : 0;
+    const combinedBox5MedicareWages = round0(billBox5MedicareWages + debraBox5MedicareWages);
 
     let sehiMedicareDeduction = 0;
     if (setup.has_scorp && sehiMedicarePremiumsEffective > 0) {
-      if (setup.filing_status === 'married_filing_jointly') {
-        const primaryRawShare =
-          primaryMedicareBaseAnnual +
-          (primaryMedicareEnrolled && earlyIrmaaEval ? earlyIrmaaEval.perEnrolleeSurcharge : 0);
-        const spouseRawShare =
-          spouseMedicareBaseAnnual +
-          (spouseMedicareEnrolled && earlyIrmaaEval ? earlyIrmaaEval.perEnrolleeSurcharge : 0);
-        const rawSplitSum = primaryRawShare + spouseRawShare;
-        const billSehiShare =
-          rawSplitSum > 0
-            ? round0(sehiMedicarePremiumsEffective * (primaryRawShare / rawSplitSum))
-            : round0(sehiMedicarePremiumsEffective * 0.5);
-        const debraSehiShare = Math.max(0, sehiMedicarePremiumsEffective - billSehiShare);
-
-        sehiMedicareDeduction = round0(
-          Math.min(billSehiShare, billAvailableBox1) +
-            Math.min(debraSehiShare, debraAvailableBox1)
-        );
-      } else {
-        sehiMedicareDeduction = round0(
-          Math.min(sehiMedicarePremiumsEffective, billAvailableBox1)
-        );
-      }
+      sehiMedicareDeduction = round0(
+        Math.min(sehiMedicarePremiumsEffective, combinedBox5MedicareWages)
+      );
     }
 
     const adjustmentsToIncome = round0(
@@ -987,17 +1393,26 @@ export function calculateSixYearPlan(
     const deductionAmount =
       activeDedMethod === 'itemized' ? customItemized : standardDeduction;
 
-    // Schedule 1-A Enhanced Senior Deduction ($6,000 per age-65+ spouse, 6% phaseout per spouse above $150k MFJ / $75k non-MFJ)
-    const enhancedSeniorMax = seniorCount * 6000;
+    // Schedule 1-A Enhanced Senior Deduction (statutory window: tax years 2025–2028; sunsets after 2028):
+    // $6,000 per age-65+ spouse ($12,000 MFJ max), phasing out at 6% per spouse (12% combined MFJ)
+    // between $150,000 and $250,000 MAGI ($75,000–$175,000 non-MFJ).
+    const enhancedSeniorInEffect = yr.tax_year >= 2025 && yr.tax_year <= 2028;
+    const enhancedSeniorMax = enhancedSeniorInEffect ? seniorCount * 6000 : 0;
     const seniorPhaseoutStart =
       setup.filing_status === 'married_filing_jointly' ? 150000 : 75000;
     const seniorMagiExcess = Math.max(0, currentYearMagi - seniorPhaseoutStart);
     const lostPerSenior =
-      seniorCount > 0 ? Math.min(6000, round0(seniorMagiExcess * 0.06)) : 0;
+      enhancedSeniorInEffect && seniorCount > 0
+        ? Math.min(6000, round0(seniorMagiExcess * 0.06))
+        : 0;
     const enhancedSeniorLost = lostPerSenior * seniorCount;
-    const enhancedSeniorAllowed = Math.max(0, enhancedSeniorMax - enhancedSeniorLost);
+    const enhancedSeniorAllowed = enhancedSeniorInEffect
+      ? Math.max(0, enhancedSeniorMax - enhancedSeniorLost)
+      : 0;
 
-    // Form 8995 QBI (Section 199A) Deduction (including net capital gain & qualified dividend reduction)
+    // Form 8995 QBI (Section 199A) Deduction (including net capital gain & qualified dividend reduction).
+    // Note: effectiveK1Ordinary already deducts S-Corp >2% SEHI on Form 1120-S, so QBI excludes SEHI automatically.
+    // Section 199A W-2 wage limit uses W-2 Box 1 + elective deferrals (Cash W-2 + SEHI add-back per Rev. Proc. 2019-11).
     const taxableBeforeQbi = Math.max(0, agi - deductionAmount - enhancedSeniorAllowed);
     let qbiDeduction = 0;
     if (setup.has_scorp && effectiveK1Ordinary > 0) {
@@ -1008,7 +1423,7 @@ export function calculateSixYearPlan(
       );
       const qbiThreshold = BASE_QBI_THRESHOLD_2025[setup.filing_status];
       const scaledStart = qbiThreshold.start * scale;
-      const w2Limit = round0(combinedOfficerW2 * 0.5);
+      const w2Limit = round0((combinedOfficerW2 + scorpSehiDeduction) * 0.5);
 
       if (taxableBeforeQbi <= scaledStart) {
         qbiDeduction = Math.min(qbiBase, qbiCapTaxable);
@@ -1076,18 +1491,22 @@ export function calculateSixYearPlan(
 
     const federalIncomeTax = round0(ordinaryResult.tax + prefTax + niitTax);
 
+    const isZeroFederalTax = taxableIncome <= 0 && federalIncomeTax <= 0;
     const effectiveTaxRate = agi > 0 ? round2((federalIncomeTax / agi) * 100) : 0;
-    const marginalTaxRate = round2(ordinaryResult.marginalRate * 100);
+    const marginalTaxRate = isZeroFederalTax ? 0 : round2(ordinaryResult.marginalRate * 100);
 
-    // DBP Contribution + Profit Share Tax Reduction (estimated federal tax shield at marginal rate)
-    const dbpAndPsTaxReduction = round0(
-      (effectiveDbpDeduction + employer401kTotal) * ordinaryResult.marginalRate
-    );
+    // DBP Contribution + Profit Share Tax Reduction (estimated federal tax shield at marginal rate;
+    // returns $0 whenever Taxable Income (Line 15) and Federal Tax are $0)
+    const dbpAndPsTaxReduction = isZeroFederalTax
+      ? 0
+      : round0((effectiveDbpDeduction + employer401kTotal) * ordinaryResult.marginalRate);
 
     // Per-person Medicare & two-year lookback MAGI IRMAA evaluation
     const lookbackMagi = priorLookbackMagi ?? currentYearMagi;
-    const irmaaEval = computeIrmaaPerEnrollee(lookbackMagi, setup.filing_status, scale);
-    const currentMagiExceedsCliff = currentYearMagi > irmaaEval.tier1Threshold;
+    const irmaaEval = computeIrmaaPerEnrollee(lookbackMagi, yr.tax_year, setup, scale);
+    const futureCoverageYear = yr.tax_year + 2;
+    const futureThresholdResolved = resolveIrmaaThresholdForYear(futureCoverageYear, setup);
+    const currentMagiExceedsCliff = currentYearMagi > futureThresholdResolved.effectiveThreshold;
     const primaryIrmaaSurcharge = primaryMedicareEnrolled ? irmaaEval.perEnrolleeSurcharge : 0;
     const spouseIrmaaSurcharge = spouseMedicareEnrolled ? irmaaEval.perEnrolleeSurcharge : 0;
     const totalIrmaaSurcharge = primaryIrmaaSurcharge + spouseIrmaaSurcharge;
@@ -1133,7 +1552,14 @@ export function calculateSixYearPlan(
       niit_tax: niitTax,
       marginal_tax_rate: marginalTaxRate,
       effective_tax_rate: effectiveTaxRate,
+      irmaa_coverage_year: yr.tax_year,
+      irmaa_lookback_year: yr.tax_year - 2,
       irmaa_lookback_magi: lookbackMagi,
+      irmaa_tier1_threshold: irmaaEval.tier1Threshold,
+      irmaa_formula_tier1_threshold: irmaaEval.formulaTier1Threshold,
+      irmaa_is_overridden: irmaaEval.isOverridden,
+      irmaa_future_coverage_year: futureCoverageYear,
+      irmaa_future_tier1_threshold: futureThresholdResolved.effectiveThreshold,
       irmaa_current_magi_exceeds_cliff: currentMagiExceedsCliff,
       irmaa_tier: irmaaTierLabel,
       primary_irmaa_surcharge: primaryIrmaaSurcharge,
@@ -1147,16 +1573,17 @@ export function calculateSixYearPlan(
     // LAYER 4: Multi-State & Residency Layer
     // ------------------------------------------------------------------
     const stateOutputs: StateFilingOutputs[] = [];
-    const activeStateFilings = setup.multi_state_active
-      ? yr.state_filings
-      : yr.state_filings.slice(0, 1);
+    const activeStateFilings =
+      setup.multi_state_active || resolvedSetupSplit.activeStates.length > 1
+        ? yr.state_filings
+        : yr.state_filings.slice(0, 1);
 
     const filerCount = setup.filing_status === 'married_filing_jointly' ? 2 : 1;
 
     const preliminary = activeStateFilings.map((sf) => {
       const rule = STATE_TAX_RULES[sf.state_code] ?? {
         code: sf.state_code,
-        name: sf.state_code,
+        name: getStateFullName(sf.state_code),
         mode: 'flat' as const,
         flatRate: 0.045,
         stdDeduction: 15000,
@@ -1188,8 +1615,8 @@ export function calculateSixYearPlan(
         // Full-year resident: taxed on worldwide non-SS income
         stateAllocatedIncome = stateBaseAgi;
       } else if (sf.residency_status === 'part_year_resident') {
-        // Part-year resident (e.g., 2026 CA Jan 1 - Jun 19, WA Jun 20 - Dec 31):
-        // Taxed on worldwide non-SS income earned during resident days PLUS state-sourced S-Corp K-1 during nonresident days
+        // Part-year resident: taxed on worldwide non-SS income earned during resident days
+        // PLUS state-sourced S-Corp K-1 income during nonresident days
         const dayRatio =
           sf.residency_day_or_income_ratio > 0
             ? Math.min(1, sf.residency_day_or_income_ratio)
@@ -1203,9 +1630,8 @@ export function calculateSixYearPlan(
           Math.min(stateBaseAgi, residentPeriodIncome + nonresidentPeriodSourcedK1)
         );
       } else {
-        // Non-resident (e.g., 2027-2030 CA 540NR while WA resident, and 2025-2030 AZ 140NR):
-        // Applies ONLY to state-sourced S-Corp K-1 income (apportioned by state revenue %),
-        // NOT worldwide income or W-2 wages earned while living in Washington.
+        // Non-resident: applies ONLY to state-sourced S-Corp K-1 income (apportioned by state revenue %),
+        // NOT worldwide income or W-2 wages earned while living in another state.
         stateAllocatedIncome = setup.has_scorp
           ? round0(Math.max(0, effectiveK1Ordinary) * effApportionment)
           : 0;
@@ -1278,10 +1704,10 @@ export function calculateSixYearPlan(
       };
     });
 
-    // Statutory Reverse-Credit Pair check:
-    // - 2025 Full-Year CA Resident + AZ Non-Resident: AZ Form 309 grants credit on AZ 140NR for 100% of AZ-sourced income double-taxed by CA
-    // - 2026 Part-Year CA Resident (Jan 1 - Jun 19) + AZ Non-Resident: AZ Form 309 credit applies ONLY to the CA-resident period fraction (170/365)
-    // - 2027-2030 WA Resident + CA Non-Resident + AZ Non-Resident: NO CA resident credit; AZ 140NR 2.5% tax applies in full
+    // Statutory Reverse-Credit Pair check (CA + AZ statutory rule):
+    // - Full-Year CA Resident + AZ Non-Resident: AZ Form 309 grants credit on AZ 140NR for 100% of AZ-sourced income double-taxed by CA
+    // - Part-Year CA Resident + AZ Non-Resident: AZ Form 309 credit applies ONLY to the CA-resident period fraction (residency_day_or_income_ratio)
+    // - Non-CA Resident + AZ Non-Resident: no CA resident credit; AZ 140NR tax applies in full
     const caResident = preliminary.find(
       (p) => p.sf.state_code === 'CA' && p.sf.residency_status === 'resident'
     );
@@ -1418,13 +1844,18 @@ export function calculateSixYearPlan(
         employee401kTotal
     );
 
-    const syncedBreakdown = scorpIn.state_sourcing_breakdown.map((b) => {
-      const eff = getEffectiveApportionment(b.state_code, b.apportionment_percent / 100);
-      return {
-        ...b,
-        apportionment_percent: Number((eff * 100).toFixed(2)),
-      };
-    });
+    const syncedBreakdown = useSetupApportionment
+      ? resolvedSetupSplit.activeStates.map((code) => ({
+          state_code: code,
+          apportionment_percent: resolvedSetupSplit.split[code] ?? 0,
+        }))
+      : scorpIn.state_sourcing_breakdown.map((b) => {
+          const eff = getEffectiveApportionment(b.state_code, b.apportionment_percent / 100);
+          return {
+            ...b,
+            apportionment_percent: Number((eff * 100).toFixed(2)),
+          };
+        });
 
     results.push({
       tax_year: yr.tax_year,

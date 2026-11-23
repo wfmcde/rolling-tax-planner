@@ -1,11 +1,15 @@
 import React from 'react';
 import type { PersonMedicareConfig, PersonProfile, PersonSocialSecurityConfig } from '../types/tax';
 import {
+  MONTH_LONG_NAMES,
+  MONTH_SHORT_NAMES,
   calculateFraInfo,
   formatReadableDate,
   getAgeInTaxYear,
+  getPersonBirthMonth,
   parseBirthDate,
   sumEnteredMedicareMonthly,
+  updateProfileBirthMonth,
 } from '../utils/personTax';
 import { formatCurrency } from '../utils/format';
 
@@ -15,6 +19,7 @@ interface PersonProfileCardProps {
   profile: PersonProfile;
   forecastYears: number[];
   currentTaxYear: number;
+  showSsMedicare?: boolean;
   onNameChange: (nextName: string) => void;
   onChange: (next: PersonProfile) => void;
 }
@@ -67,6 +72,7 @@ export const PersonProfileCard: React.FC<PersonProfileCardProps> = ({
   profile,
   forecastYears,
   currentTaxYear,
+  showSsMedicare = true,
   onNameChange,
   onChange,
 }) => {
@@ -105,13 +111,17 @@ export const PersonProfileCard: React.FC<PersonProfileCardProps> = ({
   const annualizedSs =
     ss.monthly_benefit !== null && ss.monthly_benefit > 0 ? Math.round(ss.monthly_benefit * 12) : null;
 
+  const birthMonth = getPersonBirthMonth(profile, 1);
+  const birthMonthShort = MONTH_SHORT_NAMES[birthMonth - 1];
+  const fraPreSuspMonths = birthMonth - 1;
+  const age70ResumeMonths = 13 - birthMonth;
   const effectiveSuspendStart =
     ss.suspend_start_year ?? (fra ? fra.fraYear : anchorYear + 1);
   const effectiveResumeYear = parsedDob
     ? parsedDob.year + (ss.resume_age || 70)
     : effectiveSuspendStart + Math.max(1, (ss.resume_age || 70) - 67);
   const suspendedYears = Math.max(0, effectiveResumeYear - effectiveSuspendStart);
-  const drcBoostPct = Math.round(suspendedYears * 8);
+  const drcBoostPct = Math.round(Math.min(3, suspendedYears) * 8);
 
   const anyMedEntered =
     med.part_a_monthly !== null ||
@@ -158,34 +168,76 @@ export const PersonProfileCard: React.FC<PersonProfileCardProps> = ({
         />
       </div>
 
-      {/* Date of Birth & Calculated FRA */}
+      {/* Date of Birth, Birth Month & Calculated FRA */}
       <div className="space-y-2">
-        <div className="flex items-baseline justify-between gap-2">
-          <label className="text-xs font-medium text-slate-700">
-            {roleLabel === 'Primary Taxpayer' ? 'Primary Date of Birth' : 'Spouse Date of Birth'}
-          </label>
-          <span className="text-[11px] font-mono text-slate-400">
-            {roleLabel === 'Primary Taxpayer' ? 'primary_birth_date' : 'spouse_birth_date'}
-          </span>
+        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+          <div className="sm:col-span-7 space-y-1">
+            <div className="flex items-baseline justify-between gap-2">
+              <label className="text-xs font-medium text-slate-700">
+                {roleLabel === 'Primary Taxpayer' ? 'Primary Date of Birth' : 'Spouse Date of Birth'}
+              </label>
+              <span className="text-[11px] font-mono text-slate-400">
+                {roleLabel === 'Primary Taxpayer' ? 'primary_birth_date' : 'spouse_birth_date'}
+              </span>
+            </div>
+            <input
+              type="date"
+              value={profile.birth_date}
+              onChange={(e) => {
+                const nextDob = e.target.value;
+                const nextParsed = parseBirthDate(nextDob);
+                const nextFra = calculateFraInfo(nextDob);
+                onChange({
+                  ...profile,
+                  birth_date: nextDob,
+                  birth_month: nextParsed?.month ?? profile.birth_month,
+                  social_security: {
+                    ...profile.social_security,
+                    suspend_start_year:
+                      profile.social_security.suspend_start_year ?? (nextFra ? nextFra.fraYear : null),
+                  },
+                });
+              }}
+              className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-mono tabular-nums text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-1 focus:ring-teal-700/20"
+            />
+          </div>
+          <div className="sm:col-span-5 space-y-1">
+            <label
+              htmlFor={isPrimary ? 'primary_birth_month' : 'spouse_birth_month'}
+              className="block text-xs font-medium text-slate-700"
+            >
+              Birth Month (SS Proration)
+            </label>
+            <select
+              id={isPrimary ? 'primary_birth_month' : 'spouse_birth_month'}
+              value={birthMonth}
+              onChange={(e) => {
+                const nextMonth = Number(e.target.value);
+                const updated = updateProfileBirthMonth(
+                  profile,
+                  nextMonth,
+                  parsedDob?.year ?? 1970
+                );
+                const nextFra = calculateFraInfo(updated.birth_date);
+                onChange({
+                  ...updated,
+                  social_security: {
+                    ...updated.social_security,
+                    suspend_start_year:
+                      updated.social_security.suspend_start_year ?? (nextFra ? nextFra.fraYear : null),
+                  },
+                });
+              }}
+              className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-1 focus:ring-teal-700/20"
+            >
+              {MONTH_LONG_NAMES.map((label, idx) => (
+                <option key={label} value={idx + 1}>
+                  {idx + 1} — {label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
-        <input
-          type="date"
-          value={profile.birth_date}
-          onChange={(e) => {
-            const nextDob = e.target.value;
-            const nextFra = calculateFraInfo(nextDob);
-            onChange({
-              ...profile,
-              birth_date: nextDob,
-              social_security: {
-                ...profile.social_security,
-                suspend_start_year:
-                  profile.social_security.suspend_start_year ?? (nextFra ? nextFra.fraYear : null),
-              },
-            });
-          }}
-          className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-mono tabular-nums text-slate-900 focus:border-teal-700 focus:outline-none focus:ring-1 focus:ring-teal-700/20"
-        />
 
         {fra && parsedDob ? (
           <div className="space-y-1 pt-0.5 text-xs text-slate-600">
@@ -211,6 +263,8 @@ export const PersonProfileCard: React.FC<PersonProfileCardProps> = ({
       </div>
 
       {/* Independent Social Security Controls */}
+      {showSsMedicare && (
+      <>
       <div className="pt-3 border-t border-slate-200 space-y-3">
         <label className="flex items-start justify-between gap-3 cursor-pointer">
           <div>
@@ -302,7 +356,7 @@ export const PersonProfileCard: React.FC<PersonProfileCardProps> = ({
                 </div>
                 <div className="col-span-2 text-[11px] font-mono text-teal-800">
                   {suspendedYears > 0
-                    ? `Suspended ${effectiveSuspendStart}–${effectiveResumeYear - 1} · Resumes ${effectiveResumeYear} with +${drcBoostPct}% DRC`
+                    ? `FRA ${effectiveSuspendStart} (${birthMonthShort}): ${fraPreSuspMonths} mos pre-susp · Resumes ${effectiveResumeYear} (${birthMonthShort}) for ${age70ResumeMonths} mos at +${drcBoostPct}% DRC`
                     : 'Set Suspend Start Year before Resume Age to model Delayed Retirement Credits.'}
                 </div>
               </div>
@@ -369,6 +423,8 @@ export const PersonProfileCard: React.FC<PersonProfileCardProps> = ({
           </div>
         )}
       </div>
+      </>
+      )}
     </div>
   );
 };

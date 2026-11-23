@@ -14,6 +14,81 @@ export interface FraInfo {
   label: string; // e.g., "67 yrs" or "66 yrs 10 mos"
 }
 
+export const MONTH_SHORT_NAMES = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+] as const;
+
+export const MONTH_LONG_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+] as const;
+
+export function getPersonBirthMonth(
+  profile: PersonProfile | undefined,
+  fallbackMonth = 1
+): number {
+  if (
+    typeof profile?.birth_month === 'number' &&
+    Number.isFinite(profile.birth_month) &&
+    profile.birth_month >= 1 &&
+    profile.birth_month <= 12
+  ) {
+    return Math.round(profile.birth_month);
+  }
+  const parsed = parseBirthDate(profile?.birth_date);
+  if (parsed) {
+    return parsed.month;
+  }
+  return Math.min(12, Math.max(1, Math.round(fallbackMonth)));
+}
+
+export function updateProfileBirthMonth(
+  profile: PersonProfile,
+  birthMonth: number,
+  fallbackYear = 1970
+): PersonProfile {
+  const safeMonth = Math.min(12, Math.max(1, Math.round(birthMonth)));
+  const parsed = parseBirthDate(profile.birth_date);
+  const year = parsed?.year ?? fallbackYear;
+  const maxDay = new Date(Date.UTC(year, safeMonth, 0)).getUTCDate();
+  const day = Math.min(parsed?.day ?? 1, maxDay);
+  const nextBirthDate = `${year}-${String(safeMonth).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return {
+    ...profile,
+    birth_date: nextBirthDate,
+    birth_month: safeMonth,
+  };
+}
+
+export function formatDrcPercent(suspendedMonths: number): string {
+  const pct = (Math.max(0, suspendedMonths) * 2) / 3;
+  if (Math.abs(pct - Math.round(pct)) < 0.05) {
+    return String(Math.round(pct));
+  }
+  return pct.toFixed(1);
+}
+
 export function parseBirthDate(dob: string | null | undefined): ParsedDob | null {
   if (!dob || typeof dob !== 'string') return null;
   const trimmed = dob.trim();
@@ -139,6 +214,8 @@ export function computeIndividualSocialSecurityForYear(
 
   const parsedDob = parseBirthDate(profile.birth_date);
   const fra = calculateFraInfo(profile.birth_date);
+  const birthMonth = getPersonBirthMonth(profile, 5);
+  const birthMonthShort = MONTH_SHORT_NAMES[birthMonth - 1];
   const resumeAge = Math.min(70, Math.max(68, ss.resume_age || 70));
 
   const effectiveSuspendStart =
@@ -155,19 +232,43 @@ export function computeIndividualSocialSecurityForYear(
     };
   }
 
-  if (taxYear < effectiveResumeYear) {
+  if (taxYear === effectiveSuspendStart && fra && taxYear === fra.fraYear) {
+    const paidMonths = birthMonth - 1;
     return {
-      annualGross: 0,
-      status: `Suspended (accruing +8%/yr until ${effectiveResumeYear})`,
+      annualGross: paidMonths > 0 ? Math.round(baseAnnual * colaFactor * (paidMonths / 12)) : 0,
+      status:
+        paidMonths > 0
+          ? `${paidMonths} mos (Susp ${birthMonthShort})`
+          : `Suspended (Susp ${birthMonthShort} · +8%/yr)`,
       drcMultiplier: 1,
     };
   }
 
-  const suspendedYears = Math.max(0, effectiveResumeYear - effectiveSuspendStart);
-  const drcMultiplier = 1 + suspendedYears * 0.08;
+  if (taxYear < effectiveResumeYear) {
+    return {
+      annualGross: 0,
+      status: 'Suspended (+8%/yr DRC)',
+      drcMultiplier: 1,
+    };
+  }
+
+  const fullYearsBetween = Math.max(0, effectiveResumeYear - effectiveSuspendStart);
+  const suspendedMonths = Math.min(36, fullYearsBetween * 12);
+  const drcMultiplier = 1 + suspendedMonths * (0.08 / 12);
+  const drcPctStr = formatDrcPercent(suspendedMonths);
+
+  if (taxYear === effectiveResumeYear && resumeAge === 70) {
+    const paidMonths = 13 - birthMonth;
+    return {
+      annualGross: Math.round(baseAnnual * colaFactor * drcMultiplier * (paidMonths / 12)),
+      status: `${paidMonths} mos (+${drcPctStr}% DRC · Age 70)`,
+      drcMultiplier,
+    };
+  }
+
   return {
     annualGross: Math.round(baseAnnual * colaFactor * drcMultiplier),
-    status: `Resumed (+${Math.round(suspendedYears * 8)}% DRC)`,
+    status: `Resumed (+${drcPctStr}% DRC)`,
     drcMultiplier,
   };
 }
@@ -183,8 +284,10 @@ export function sumEnteredMedicareMonthly(med: PersonMedicareConfig): number {
 }
 
 export function createDefaultPersonProfile(birthDate: string): PersonProfile {
+  const parsed = parseBirthDate(birthDate);
   return {
     birth_date: birthDate,
+    birth_month: parsed?.month,
     social_security: {
       receiving: false,
       monthly_benefit: null,

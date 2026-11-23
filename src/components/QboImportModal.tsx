@@ -11,6 +11,7 @@ import {
   type QboTargetField,
 } from '../engine/pnlBalanceSheet';
 import { formatCurrencyExact } from '../utils/format';
+import { getSetupBusinessIdentity, getSetupStates } from '../utils/setupHelpers';
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -54,17 +55,25 @@ export const QboImportModal: React.FC<QboImportModalProps> = ({
 
   const parsedRows: ParsedQboRow[] = useMemo(() => {
     if (!rawText.trim()) return [];
-    return parseQboReportText(rawText, reportType);
-  }, [rawText, reportType]);
+    return parseQboReportText(rawText, reportType, setup);
+  }, [rawText, reportType, setup]);
 
   const effectiveTarget = (row: ParsedQboRow): QboTargetField =>
     targetOverrides[row.id] ?? row.suggestedTarget;
+
+  const { businessName } = getSetupBusinessIdentity(setup);
+  const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+  const pCode = primaryStateCode || 'Primary State';
+  const sCode = secondaryStateCode || 'Secondary State';
 
   const targetOptions = useMemo(() => {
     if (reportType === 'pnl') {
       return [
         { value: 'ignore' as QboTargetField, label: 'Skip / Ignore' },
-        { value: 'split_revenue_ca_az' as QboTargetField, label: 'Revenue — Split 50/50 CA & AZ' },
+        {
+          value: 'split_revenue_ca_az' as QboTargetField,
+          label: `Revenue — Split 50/50 ${pCode} & ${sCode}`,
+        },
         ...PNL_LINE_ITEMS.map((item) => ({
           value: item.id as QboTargetField,
           label: `${getPnlLineLabel(item, setup)} (${item.form1120sRef})`,
@@ -73,19 +82,19 @@ export const QboImportModal: React.FC<QboImportModalProps> = ({
     }
     return [
       { value: 'ignore' as QboTargetField, label: 'Skip / Ignore' },
-      { value: 'operating_cash_ytd' as QboTargetField, label: 'Operating Cash (BlueVine Checking)' },
+      { value: 'operating_cash_ytd' as QboTargetField, label: 'Operating Cash (Business Checking / Savings)' },
       {
         value: 'pension_payable_ytd' as QboTargetField,
-        label: 'Pension Expense Payable (DBP + OSS 401K Payable)',
+        label: 'Pension Expense Payable (DBP + Employer 401(k) Payable)',
       },
       {
         value: 'cc_ap_ytd' as QboTargetField,
-        label: 'Credit Card / Accounts Payable (Amazon, Amtrak, AMX, Cap One)',
+        label: 'Credit Card / Accounts Payable',
       },
       { value: 'member_draws_ytd' as QboTargetField, label: 'Member Draws / Distributions (YTD)' },
       { value: 'capital_contributions_ytd' as QboTargetField, label: 'Capital Contributions (YTD)' },
     ];
-  }, [reportType, setup]);
+  }, [reportType, setup, pCode, sCode]);
 
   const matchedCount = useMemo(
     () => parsedRows.filter((r) => effectiveTarget(r) !== 'ignore').length,
@@ -184,7 +193,7 @@ export const QboImportModal: React.FC<QboImportModalProps> = ({
               Paste / Upload QuickBooks Online Report
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Configured for Operating Support Services, LLC QBO accounts (auto-separates Travel meals, routes Schedule K Interest, and deduplicates subtotals).
+              Maps QuickBooks Online accounts for {businessName} (auto-separates Travel meals, routes Schedule K Interest, and deduplicates subtotals).
             </p>
           </div>
           <button
@@ -262,7 +271,7 @@ export const QboImportModal: React.FC<QboImportModalProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-md hover:bg-teal-100/70 transition-colors whitespace-nowrap"
               >
                 <FileSpreadsheet className="w-3.5 h-3.5" />
-                Load OSS QBO Sample
+                Load Sample QBO Report
               </button>
             </div>
           </div>
@@ -288,8 +297,8 @@ export const QboImportModal: React.FC<QboImportModalProps> = ({
               }}
               placeholder={
                 reportType === 'pnl'
-                  ? 'Consulting - Debra (CA)\t127,340.00\nConsulting - Bill (AZ)\t165,443.71\nState\t-466.84\nInterest Income\t609.18'
-                  : 'BlueVine Checking\t42,580.89\nAmazon CC\t842.15\nAMX CC\t1,125.40\nMember Draws\t(121,939.75)'
+                  ? `Advisory Retainers (${pCode})\t240,000.00\nConsulting Revenue\t85,000.00\nState Tax\t1,200.00\nInterest Income\t1,450.00`
+                  : 'Business Operating Checking\t85,200.00\nCorporate Credit Card\t2,840.00\nRetirement Payable\t18,500.00\nMember Draws\t(95,000.00)'
               }
               className="w-full px-3 py-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-teal-700"
             />

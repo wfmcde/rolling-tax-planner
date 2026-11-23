@@ -1,9 +1,155 @@
 import type {
   ComputedTaxYear,
+  GuardrailAckStatus,
   SetupConfig,
   TaxYearRecord,
   ValidationIssue,
 } from '../types/tax';
+
+export const GUARDRAIL_ACK_STATUS_OPTIONS: {
+  value: GuardrailAckStatus;
+  label: string;
+}[] = [
+  { value: 'prior_year_historical', label: 'Prior-Year / Historical' },
+  { value: 'intentional_cpa_reviewed', label: 'Intentional / CPA Reviewed' },
+  { value: 'mitigation_planned', label: 'Mitigation Planned' },
+];
+
+export function getGuardrailAckStatusLabel(status: GuardrailAckStatus): string {
+  return (
+    GUARDRAIL_ACK_STATUS_OPTIONS.find((opt) => opt.value === status)?.label ??
+    'Intentional / CPA Reviewed'
+  );
+}
+
+export function buildGuardrailAckKey(ruleId: string, taxYear: number | null): string {
+  return `${ruleId}:${taxYear ?? 'global'}`;
+}
+
+/**
+ * Canonical officer W-2 to (officer W-2 + Ordinary Business Income) ratio.
+ * Stored to 4 decimal places (0.01 percentage points) so 1-decimal percentage
+ * displays across the tax engine, guardrails, S-Corp schedule, and CPA Print
+ * Package are always identical.
+ */
+export function computeReasonableCompRatio(
+  officerW2: number,
+  ordinaryBusinessIncome: number
+): number {
+  const safeW2 = Math.max(0, Number.isFinite(officerW2) ? officerW2 : 0);
+  const safeObi = Math.max(0, Number.isFinite(ordinaryBusinessIncome) ? ordinaryBusinessIncome : 0);
+  const denom = safeW2 + safeObi;
+  if (denom <= 0) return 0;
+  return Math.round((safeW2 / denom) * 10000) / 10000;
+}
+
+export function formatReasonableCompPercent(
+  officerW2: number,
+  ordinaryBusinessIncome: number
+): string {
+  const ratio = computeReasonableCompRatio(officerW2, ordinaryBusinessIncome);
+  return `${(ratio * 100).toFixed(1)}%`;
+}
+
+export function formatReasonableCompFindingMessage(
+  officerW2: number,
+  ordinaryBusinessIncome: number
+): string {
+  const safeW2 = Math.max(0, Math.round(Number.isFinite(officerW2) ? officerW2 : 0));
+  const safeObi = Math.max(
+    0,
+    Math.round(Number.isFinite(ordinaryBusinessIncome) ? ordinaryBusinessIncome : 0)
+  );
+  const combined = safeW2 + safeObi;
+  const pct = formatReasonableCompPercent(safeW2, safeObi);
+  return `Officer W-2 wages ($${safeW2.toLocaleString()}) represent ${pct} of combined officer compensation + ordinary business income ($${combined.toLocaleString()}). Review IRS S-Corp reasonable compensation benchmarks.`;
+}
+
+export function formatReasonableCompExplanationSummary(
+  officerW2: number,
+  ordinaryBusinessIncome: number,
+  basisLabel?: string
+): string {
+  const safeW2 = Math.max(0, Math.round(Number.isFinite(officerW2) ? officerW2 : 0));
+  const safeObi = Math.max(
+    0,
+    Math.round(Number.isFinite(ordinaryBusinessIncome) ? ordinaryBusinessIncome : 0)
+  );
+  const combined = safeW2 + safeObi;
+  const pct = formatReasonableCompPercent(safeW2, safeObi);
+  const prefix = basisLabel ? `Computed Ratio (${basisLabel})` : 'Computed Ratio';
+  return `${prefix}: ${pct} ($${safeW2.toLocaleString()} officer W-2 ÷ $${combined.toLocaleString()} [W-2 + $${safeObi.toLocaleString()} OBI]).`;
+}
+
+/**
+ * Keeps any saved user explanation note synchronized with the live officer W-2 / (W-2 + OBI)
+ * ratio if the note explicitly referenced the prior snapshot's ratio percentage, while leaving
+ * unrelated percentages (e.g., 30% IRS benchmark or ownership shares) untouched.
+ */
+export function syncReasonableCompNoteText(
+  note: string,
+  priorFindingMessage: string | undefined,
+  officerW2: number,
+  ordinaryBusinessIncome: number
+): string {
+  if (!note) return note;
+  const livePct = formatReasonableCompPercent(officerW2, ordinaryBusinessIncome);
+  let synced = note;
+
+  // 1. If the stored snapshot finding message captured an older ratio (e.g., "represent 25.0%"),
+  // update exact references to that stale ratio in the explanation note.
+  const priorMatch = priorFindingMessage?.match(/represent\s+(\d+(?:\.\d+)?)%/i);
+  if (priorMatch) {
+    const staleNumStr = priorMatch[1];
+    const staleNum = Number(staleNumStr);
+    const stalePct = `${staleNumStr}%`;
+    if (Number.isFinite(staleNum) && stalePct !== livePct && Math.abs(staleNum - 30) > 0.05) {
+      const escapedExact = staleNumStr.replace('.', '\\.');
+      synced = synced.replace(new RegExp(`(?<!\\d)${escapedExact}%`, 'g'), livePct);
+
+      // If the prior snapshot was an integer-like percentage (e.g., "25.0%"), also update
+      // integer mentions ("25%") ONLY when directly tied to ratio/comp/W-2 phrasing.
+      if (/\.0$/.test(staleNumStr)) {
+        const intPart = staleNumStr.replace(/\.0$/, '');
+        synced = synced.replace(
+          new RegExp(
+            `(?<!\\d)${intPart}%(?=\\s*(?:ratio|comp|compensation|w-?2|of\\s+(?:combined|w-?2|total)))`,
+            'gi'
+          ),
+          livePct
+        );
+        synced = synced.replace(
+          new RegExp(
+            `((?:ratio|comp(?:ensation)?|w-?2)\\s*(?:of|at|is|:|=)?\\s*)${intPart}%(?!\\s*(?:profit|401|match|benchmark|threshold))`,
+            'gi'
+          ),
+          `$1${livePct}`
+        );
+      }
+    }
+  }
+
+  // 2. Also update explicit ratio-context phrases like "ratio of 25.4%" or "25.4% of W-2 + OBI"
+  // when they diverge from the live computed ratio (excluding explicit 30% benchmark mentions).
+  synced = synced.replace(
+    /(\b(?:reasonable\s+comp(?:ensation)?\s+ratio|comp(?:ensation)?\s+ratio|w-?2\s+ratio|officer\s+w-?2\s+ratio)\s*(?:of|at|is|:|=)\s*)(\d+(?:\.\d+)?)%/gi,
+    (full, prefix: string, numStr: string) => {
+      const val = Number(numStr);
+      if (Math.abs(val - 30) <= 0.05) return full;
+      return `${prefix}${livePct}`;
+    }
+  );
+  synced = synced.replace(
+    /(?<!\d)(\d+(?:\.\d+)?)%(\s+of\s+(?:combined\s+)?(?:officer\s+)?(?:w-?2|comp(?:ensation)?)\s*(?:\+|plus|and)\s*(?:obi|ordinary\s+business\s+income|k-?1))/gi,
+    (full, numStr: string, suffix: string) => {
+      const val = Number(numStr);
+      if (Math.abs(val - 30) <= 0.05) return full;
+      return `${livePct}${suffix}`;
+    }
+  );
+
+  return synced;
+}
 
 function daysBetweenInclusive(startStr: string, endStr: string): number | null {
   if (!startStr || !endStr) return null;
@@ -16,6 +162,7 @@ function daysBetweenInclusive(startStr: string, endStr: string): number | null {
 /**
  * Automated Validation & Guardrail Rules (Module 4 §3).
  * Executes deterministically against raw records and computed outputs.
+ * Every finding receives a stable `rule_id` and per-year `ack_key` (`${rule_id}:${tax_year ?? 'global'}`).
  */
 export function runGuardrailValidation(
   setup: SetupConfig,
@@ -24,10 +171,23 @@ export function runGuardrailValidation(
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
-  if (years.length !== 6) {
+  const pushIssue = (
+    rule_id: string,
+    tax_year: number | null,
+    rest: Omit<ValidationIssue, 'id' | 'rule_id' | 'ack_key' | 'tax_year'>
+  ) => {
+    const ack_key = buildGuardrailAckKey(rule_id, tax_year);
     issues.push({
-      id: 'horizon-length',
-      tax_year: null,
+      id: ack_key,
+      rule_id,
+      ack_key,
+      tax_year,
+      ...rest,
+    });
+  };
+
+  if (years.length !== 6) {
+    pushIssue('horizon_length', null, {
       category: 'reconciliation',
       severity: 'error',
       title: 'Six-year rolling window incomplete',
@@ -40,9 +200,7 @@ export function runGuardrailValidation(
   // Year 1 Lock Integrity
   const year1 = years[0];
   if (year1 && !year1.is_locked_actuals) {
-    issues.push({
-      id: `lock-unlocked-${year1.tax_year}`,
-      tax_year: year1.tax_year,
+    pushIssue('year1_lock_unlocked', year1.tax_year, {
       category: 'lock_integrity',
       severity: 'warning',
       title: `Year 1 (${year1.tax_year}) unlocked for amended-return edits`,
@@ -60,40 +218,39 @@ export function runGuardrailValidation(
 
     // S-Corp & Compensation Guardrails
     if (setup.has_scorp) {
-      if (
-        comp.scorp_out.ordinary_business_income_1120s > 0 &&
-        yr.scorp_1120s.officer_w2_wages <= 0
-      ) {
-        issues.push({
-          id: `scorp-missing-w2-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+      const officerW2 = comp.scorp_in.officer_w2_wages;
+      const obi = comp.scorp_out.ordinary_business_income_1120s;
+      const liveRatio = computeReasonableCompRatio(officerW2, obi);
+
+      if (obi > 0 && officerW2 <= 0) {
+        pushIssue('scorp_missing_officer_w2', yr.tax_year, {
           category: 'scorp_comp',
           severity: 'error',
           title: `Missing officer W-2 wages (${yr.tax_year})`,
-          message: `Ordinary business income is $${comp.scorp_out.ordinary_business_income_1120s.toLocaleString()} with $0 officer_w2_wages. IRS reasonable compensation rules require officer W-2 wages when taking S-Corp distributions.`,
+          message: `Ordinary business income is $${obi.toLocaleString()} with $0 officer_w2_wages. IRS reasonable compensation rules require officer W-2 wages when taking S-Corp distributions.`,
           field_reference: 'scorp_1120s.officer_w2_wages',
           target_tab: 'scorp',
         });
-      } else if (
-        comp.scorp_out.ordinary_business_income_1120s > 50000 &&
-        comp.scorp_out.reasonable_comp_ratio < 0.3
-      ) {
-        issues.push({
-          id: `scorp-low-w2-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+      } else if (obi > 50000 && liveRatio < 0.3) {
+        const ratioPercent = formatReasonableCompPercent(officerW2, obi);
+        pushIssue('low_reasonable_comp', yr.tax_year, {
           category: 'scorp_comp',
           severity: 'warning',
           title: `Low reasonable compensation ratio (${yr.tax_year})`,
-          message: `Officer W-2 wages represent ${(comp.scorp_out.reasonable_comp_ratio * 100).toFixed(1)}% of combined officer compensation + ordinary business income. Review IRS S-Corp reasonable compensation benchmarks.`,
+          message: formatReasonableCompFindingMessage(officerW2, obi),
           field_reference: 'scorp_1120s.officer_w2_wages',
           target_tab: 'scorp',
+          reasonable_comp_meta: {
+            officer_w2: Math.max(0, Math.round(officerW2)),
+            ordinary_business_income: Math.max(0, Math.round(obi)),
+            ratio: liveRatio,
+            ratio_percent: ratioPercent,
+          },
         });
       }
 
       if (comp.scorp_out.excess_distribution_capital_gain > 0) {
-        issues.push({
-          id: `scorp-basis-exceeded-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+        pushIssue('scorp_basis_excess', yr.tax_year, {
           category: 'scorp_comp',
           severity: 'warning',
           title: `Distributions exceed S-Corp stock basis (${yr.tax_year})`,
@@ -111,13 +268,11 @@ export function runGuardrailValidation(
         yr.scorp_1120s.state_sourcing_breakdown.length > 0 &&
         Math.abs(sourcingSum - 100) > 0.5
       ) {
-        issues.push({
-          id: `scorp-sourcing-sum-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+        pushIssue('scorp_sourcing_sum', yr.tax_year, {
           category: 'scorp_comp',
           severity: 'warning',
           title: `Multi-state apportionment ratios sum to ${sourcingSum.toFixed(2)}% (${yr.tax_year})`,
-          message: `state_sourcing_breakdown sums to ${sourcingSum.toFixed(2)}% across active states. This is expected when states use different statutory apportionment formulas (e.g., CA Schedule R vs. AZ Schedule A).`,
+          message: `state_sourcing_breakdown sums to ${sourcingSum.toFixed(2)}% across active states. This can occur when states apply different statutory apportionment formulas (e.g., single-sales-factor vs. three-factor schedules).`,
           field_reference: 'scorp_1120s.state_sourcing_breakdown',
           target_tab: 'scorp',
         });
@@ -128,9 +283,7 @@ export function runGuardrailValidation(
     if (setup.has_dbp) {
       const dbp = yr.dbp_and_retirement;
       if (dbp.dbp_actual_contribution > dbp.dbp_max_deductible_contribution) {
-        issues.push({
-          id: `dbp-over-max-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+        pushIssue('dbp_over_max', yr.tax_year, {
           category: 'dbp_retirement',
           severity: 'error',
           title: `DBP contribution exceeds actuarial maximum (${yr.tax_year})`,
@@ -144,9 +297,7 @@ export function runGuardrailValidation(
         yr.tax_year > dbp.dbp_target_termination_year &&
         dbp.dbp_actual_contribution > 0
       ) {
-        issues.push({
-          id: `dbp-post-term-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+        pushIssue('dbp_post_termination', yr.tax_year, {
           category: 'dbp_retirement',
           severity: 'error',
           title: `Active DBP contribution after termination year (${yr.tax_year})`,
@@ -160,9 +311,7 @@ export function runGuardrailValidation(
         (dbp.dbp_status === 'terminating' || dbp.dbp_status === 'terminated') &&
         dbp.dbp_loan_balance > 0
       ) {
-        issues.push({
-          id: `dbp-loan-winddown-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+        pushIssue('dbp_loan_winddown', yr.tax_year, {
           category: 'dbp_retirement',
           severity: 'warning',
           title: `Outstanding DBP participant loan during wind-down (${yr.tax_year})`,
@@ -173,9 +322,7 @@ export function runGuardrailValidation(
       }
 
       if (dbp.dbp_loan_balance > 0 && dbp.dbp_collateral_requirement < dbp.dbp_loan_balance) {
-        issues.push({
-          id: `dbp-collateral-${yr.tax_year}`,
-          tax_year: yr.tax_year,
+        pushIssue('dbp_loan_collateral', yr.tax_year, {
           category: 'dbp_retirement',
           severity: 'warning',
           title: `DBP loan collateral below loan balance (${yr.tax_year})`,
@@ -198,9 +345,7 @@ export function runGuardrailValidation(
           0
         );
         if (Math.abs(ratioSum - 1) > 0.03) {
-          issues.push({
-            id: `residency-ratio-sum-${yr.tax_year}`,
-            tax_year: yr.tax_year,
+          pushIssue('residency_ratio_sum', yr.tax_year, {
             category: 'multi_state',
             severity: 'warning',
             title: `Part-year residency allocation does not equal 100% (${yr.tax_year})`,
@@ -215,9 +360,7 @@ export function runGuardrailValidation(
           if (days !== null) {
             const expectedRatio = days / 365;
             if (Math.abs(expectedRatio - sf.residency_day_or_income_ratio) > 0.12) {
-              issues.push({
-                id: `residency-date-mismatch-${yr.tax_year}-${sf.state_code}`,
-                tax_year: yr.tax_year,
+              pushIssue(`residency_date_mismatch_${sf.state_code}`, yr.tax_year, {
                 category: 'multi_state',
                 severity: 'warning',
                 title: `${sf.state_code} residency dates vs. ratio mismatch (${yr.tax_year})`,
@@ -235,9 +378,7 @@ export function runGuardrailValidation(
           sf.credit_for_taxes_paid_to_other_states > sf.other_state_tax_credit_limitation &&
           sf.other_state_tax_credit_limitation > 0
         ) {
-          issues.push({
-            id: `ostc-limit-${yr.tax_year}-${sf.state_code}`,
-            tax_year: yr.tax_year,
+          pushIssue(`ostc_limit_${sf.state_code}`, yr.tax_year, {
             category: 'multi_state',
             severity: 'error',
             title: `${sf.state_code} other-state tax credit exceeds limitation (${yr.tax_year})`,

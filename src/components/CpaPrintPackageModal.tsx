@@ -1,6 +1,11 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { AlertTriangle, Download, Printer, X } from 'lucide-react';
-import type { PnlBalanceSheetState, SetupConfig } from '../types/tax';
+import type {
+  GuardrailAcknowledgment,
+  PnlBalanceSheetState,
+  SetupConfig,
+  ValidationIssue,
+} from '../types/tax';
 import {
   PNL_OPERATING_ITEMS,
   PNL_SECTIONS,
@@ -8,13 +13,1069 @@ import {
   buildCpaPackageMetadata,
   getPnlLineLabel,
   type ComputedPnlBalanceSheet,
+  type CpaPackageMetadata,
   type CpaReportMetadata,
 } from '../engine/pnlBalanceSheet';
 import { getPersonNames } from '../engine/scheduleCatalog';
+import {
+  formatReasonableCompExplanationSummary,
+  formatReasonableCompFindingMessage,
+  getGuardrailAckStatusLabel,
+  syncReasonableCompNoteText,
+} from '../engine/validator';
+import { getSetupStates } from '../utils/setupHelpers';
 import { formatCurrencyExact } from '../utils/format';
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+function escapeHtml(value: string | number): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function getCpaEntityLabels(
+  setup: SetupConfig,
+  primaryName: string,
+  spouseName: string,
+  computed: ComputedPnlBalanceSheet
+) {
+  const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+  const entityType = setup.entity_type;
+  const packageEyebrow =
+    entityType === 'scorp_llc'
+      ? 'Form 1120-S Year-End Financial & Tax Projection Package'
+      : entityType === 'partnership'
+      ? 'Form 1065 Year-End Financial & Tax Projection Package'
+      : entityType === 'ccorp'
+      ? 'Form 1120 Year-End Financial & Tax Projection Package'
+      : entityType === 'sole_prop'
+      ? 'Schedule C Year-End Financial & Tax Projection Package'
+      : 'Year-End Financial & Tax Projection Package';
+  const entityFormLabel =
+    entityType === 'scorp_llc'
+      ? 'Form 1120-S'
+      : entityType === 'partnership'
+      ? 'Form 1065'
+      : entityType === 'ccorp'
+      ? 'Form 1120'
+      : entityType === 'sole_prop'
+      ? 'Schedule C'
+      : 'Business P&L';
+  const ordinaryIncomeCardLabel =
+    entityType === 'scorp_llc'
+      ? 'Projected 1120-S Line 22'
+      : entityType === 'partnership'
+      ? 'Projected 1065 Ordinary Income'
+      : entityType === 'ccorp'
+      ? 'Projected 1120 Taxable Income'
+      : entityType === 'sole_prop'
+      ? 'Projected Schedule C Net Profit'
+      : 'Projected Net Operating Income';
+  const ordinaryIncomeRowLabel =
+    entityType === 'scorp_llc'
+      ? 'Projected Ordinary Business Income (Form 1120-S Line 22)'
+      : entityType === 'partnership'
+      ? 'Projected Ordinary Business Income (Form 1065 Line 23)'
+      : entityType === 'ccorp'
+      ? 'Projected Taxable Income (Form 1120 Line 30)'
+      : entityType === 'sole_prop'
+      ? 'Projected Net Profit (Schedule C Line 31)'
+      : 'Projected Net Operating Income';
+  const filingStatusLabel =
+    setup.filing_status === 'married_filing_jointly'
+      ? 'MFJ'
+      : setup.filing_status === 'married_filing_separately'
+      ? 'MFS'
+      : setup.filing_status === 'head_of_household'
+      ? 'HOH'
+      : 'Single';
+  const ownershipLabel =
+    setup.filing_status === 'married_filing_jointly'
+      ? `${primaryName} ${computed.billSharePct}% / ${spouseName} ${computed.debraSharePct}%`
+      : `${primaryName} 100%`;
+  const activeStatesLabel =
+    setup.multi_state_active && primaryStateCode && secondaryStateCode
+      ? `${primaryStateCode} / ${secondaryStateCode}`
+      : primaryStateCode || '';
+  return {
+    packageEyebrow,
+    entityFormLabel,
+    ordinaryIncomeCardLabel,
+    ordinaryIncomeRowLabel,
+    filingStatusLabel,
+    ownershipLabel,
+    activeStatesLabel,
+  };
+}
+
+interface StandaloneHtmlParams {
+  setup: SetupConfig;
+  pnlState: PnlBalanceSheetState;
+  computed: ComputedPnlBalanceSheet;
+  entityName: string;
+  entityEin: string;
+  primaryName: string;
+  spouseName: string;
+  generatedOn: string;
+  meta: CpaPackageMetadata;
+  basisRows: {
+    billBeg: number;
+    debraBeg: number;
+    posInc: number;
+    billInc: number;
+    debraInc: number;
+    posInt: number;
+    billInt: number;
+    debraInt: number;
+    billCap: number;
+    debraCap: number;
+    billDraws: number;
+    debraDraws: number;
+    billNonded: number;
+    debraNonded: number;
+  };
+  acknowledgedGuardrails: {
+    ack: GuardrailAcknowledgment;
+    title: string;
+    message: string;
+    explanationNote: string;
+    explanationRatioSummary?: string;
+    severity: string;
+  }[];
+  activeGuardrailCount: number;
+}
+
+function buildStandalonePrintHtml({
+  setup,
+  pnlState,
+  computed,
+  entityName,
+  entityEin,
+  primaryName,
+  spouseName,
+  generatedOn,
+  meta,
+  basisRows,
+  acknowledgedGuardrails,
+  activeGuardrailCount,
+}: StandaloneHtmlParams): string {
+  const bs = pnlState.balance_sheet;
+  const e = escapeHtml;
+  const cur = (n: number) => e(formatCurrencyExact(n));
+  const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+  const pCode = primaryStateCode || 'State 1';
+  const sCode = secondaryStateCode || 'State 2';
+  const priorYearLabel = `${pnlState.projection_year - 1} Filed`;
+  const labels = getCpaEntityLabels(setup, primaryName, spouseName, computed);
+  const entityMetaParts = [
+    entityEin.trim() ? `<span class="mono">EIN ${e(entityEin.trim())}</span>` : '',
+    `Tax Year ${e(pnlState.projection_year)}`,
+    `Filing: ${e(labels.filingStatusLabel)}${labels.activeStatesLabel ? ` · ${e(labels.activeStatesLabel)}` : ''}`,
+    `Ownership: ${e(labels.ownershipLabel)}`,
+  ].filter(Boolean);
+
+  const assumptionsHtml = meta.activeAssumptions
+    .map(
+      (item) =>
+        `<div class="assumption-item"><span class="assumption-label">${e(item.label)}:</span> ${e(
+          item.value
+        )}</div>`
+    )
+    .join('');
+
+  const pnlRowsHtml = PNL_SECTIONS.map((sec) => {
+    const items = PNL_OPERATING_ITEMS.filter((i) => i.section === sec.id);
+    const itemRows = items
+      .map((item) => {
+        const vals = computed.lines[item.id];
+        const mealsSubRows =
+          item.id === 'meals_gross'
+            ? `
+              <tr class="sub-row">
+                <td class="indent">&#8627; 50% Deductible Meals (Included in 1120-S)</td>
+                <td class="mono muted">Line 19</td>
+                <td class="num">${cur(computed.mealsDeductible50.ytd)}</td>
+                <td class="num">${cur(computed.mealsDeductible50.remaining)}</td>
+                <td class="num">${cur(computed.mealsDeductible50.projected)}</td>
+                <td class="num muted">${cur(computed.mealsDeductible50.filed2025)}</td>
+              </tr>
+              <tr class="sub-row amber-row">
+                <td class="indent">&#8627; 50% Nondeductible Meals (Sch M-1 / Basis)</td>
+                <td class="mono amber-text">Sch M-1</td>
+                <td class="num">${cur(computed.mealsNondeductible50.ytd)}</td>
+                <td class="num">${cur(computed.mealsNondeductible50.remaining)}</td>
+                <td class="num">${cur(computed.mealsNondeductible50.projected)}</td>
+                <td class="num">${cur(computed.mealsNondeductible50.filed2025)}</td>
+              </tr>
+            `
+            : '';
+
+        return `
+          <tr>
+            <td class="pad-l">${e(getPnlLineLabel(item, setup))}</td>
+            <td class="mono muted">${e(item.form1120sRef)}</td>
+            <td class="num">${cur(vals.ytd)}</td>
+            <td class="num">${cur(vals.remaining)}</td>
+            <td class="num strong">${cur(vals.projected)}</td>
+            <td class="num muted">${cur(vals.filed2025)}</td>
+          </tr>
+          ${mealsSubRows}
+        `;
+      })
+      .join('');
+
+    const sectionSubtotal =
+      sec.id === 'revenue'
+        ? `
+          <tr class="subtotal-row">
+            <td class="pad-l">Total Gross Receipts</td>
+            <td class="mono muted">Line 1a</td>
+            <td class="num">${cur(computed.totalRevenue.ytd)}</td>
+            <td class="num">${cur(computed.totalRevenue.remaining)}</td>
+            <td class="num">${cur(computed.totalRevenue.projected)}</td>
+            <td class="num muted">${cur(computed.totalRevenue.filed2025)}</td>
+          </tr>
+        `
+        : sec.id === 'operating_expenses'
+          ? `
+            <tr class="subtotal-row">
+              <td class="pad-l">
+                Total Operating Expenses (Excl. W-2 &amp; Retirement &middot; Tax Deductible)
+                <div class="muted" style="font-size:9px;font-weight:400;margin-top:2px;">
+                  Excl. Payroll Taxes (1120-S / Horizon OpEx): ${cur(computed.totalOperatingExpensesExclPayroll.projected)}
+                </div>
+              </td>
+              <td class="mono muted">Lines 11&ndash;19</td>
+              <td class="num">${cur(computed.totalOperatingExpensesDeductible.ytd)}</td>
+              <td class="num">${cur(computed.totalOperatingExpensesDeductible.remaining)}</td>
+              <td class="num">${cur(computed.totalOperatingExpensesDeductible.projected)}</td>
+              <td class="num muted">${cur(computed.totalOperatingExpensesDeductible.filed2025)}</td>
+            </tr>
+          `
+          : '';
+
+    return `
+      <tr class="section-row">
+        <td colspan="6">${e(sec.title)}</td>
+      </tr>
+      ${itemRows}
+      ${sectionSubtotal}
+    `;
+  }).join('');
+
+  const excessGainRowHtml = computed.drawsExceedBasis
+    ? `
+      <tr class="danger-row">
+        <td>Form 8949 Excess Dist. Gain</td>
+        <td class="num">${cur(computed.projectedExcessDistributionGain)}</td>
+        <td class="num">${cur(computed.billExcessGain)}</td>
+        <td class="num">${cur(computed.debraExcessGain)}</td>
+      </tr>
+    `
+    : '';
+
+  const goalsSectionNum = setup.has_stock_basis !== false ? 4 : 3;
+  const goalsSectionHtml =
+    meta.activeGoals.length > 0
+      ? `
+    <section class="goals-section">
+      <h2>${goalsSectionNum}. Planning Goals &amp; Guardrails for CPA Review (${meta.activeGoals.length} Active)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 24%;">Goal / Guardrail</th>
+            <th class="num" style="width: 14%;">Target</th>
+            <th class="num" style="width: 16%;">Projected</th>
+            <th style="width: 14%;">Status</th>
+            <th style="width: 32%;">Why This Matters &amp; Variance Context</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${meta.activeGoals
+            .map((item) => {
+              const badgeCls =
+                item.status === 'over'
+                  ? 'badge-over'
+                  : item.status === 'watch'
+                    ? 'badge-watch'
+                    : 'badge-within';
+              const targetSubHtml =
+                item.goal.kind === 'income_ceiling' && item.linkedIrmaa
+                  ? `<div class="goal-var">${
+                      item.linkedIrmaa.isGoalTargetOverridden
+                        ? `Custom &middot; ${e(item.linkedIrmaa.coverageYear)} IRMAA (${e(
+                            item.linkedIrmaa.filingStatusShort
+                          )}) ${cur(item.linkedIrmaa.threshold)}`
+                        : `${e(item.linkedIrmaa.coverageYear)} IRMAA Tier 1 (${e(
+                            item.linkedIrmaa.filingStatusShort
+                          )} &middot; 2-yr lookback)`
+                    }</div>`
+                  : '';
+              return `
+          <tr>
+            <td class="strong">${e(item.goal.title)}</td>
+            <td class="num"><div>${e(item.targetDisplay)}</div>${targetSubHtml}</td>
+            <td class="num strong">${e(item.currentDisplay)}</td>
+            <td><span class="status-badge ${badgeCls}">${e(item.statusLabel)}</span></td>
+            <td>
+              <div class="goal-why">${e(item.goal.why_it_matters)}</div>
+              <div class="goal-var">${e(item.varianceSummary)}</div>
+            </td>
+          </tr>`;
+            })
+            .join('')}
+        </tbody>
+      </table>
+    </section>
+      `
+      : '';
+
+  const pageTitle = `${entityName} — ${pnlState.projection_year} CPA Year-End Projection Package`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${e(pageTitle)}</title>
+  <style>
+    @page {
+      size: letter portrait;
+      margin: 0.45in 0.5in;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #f8fafc;
+      color: #0f172a;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 11px;
+      line-height: 1.4;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .toolbar {
+      max-width: 960px;
+      margin: 0 auto 14px auto;
+      padding: 10px 14px;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .toolbar-note {
+      font-size: 11px;
+      color: #475569;
+    }
+    .toolbar-btn {
+      background: #115e59;
+      color: #ffffff;
+      border: none;
+      border-radius: 5px;
+      padding: 7px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .toolbar-btn:hover {
+      background: #134e4a;
+    }
+    .sheet {
+      max-width: 960px;
+      margin: 0 auto;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 26px 28px;
+    }
+    .brand-bar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 8px;
+      margin-bottom: 10px;
+      border-bottom: 1px solid #e2e8f0;
+      font-size: 10.5px;
+      color: #475569;
+    }
+    .brand-strong {
+      font-weight: 700;
+      color: #0f172a;
+    }
+    .brand-site {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: #115e59;
+    }
+    .header-main {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 14px;
+      padding-bottom: 14px;
+      border-bottom: 2px solid #0f172a;
+      margin-bottom: 14px;
+    }
+    .eyebrow {
+      font-size: 10.5px;
+      font-weight: 600;
+      color: #64748b;
+      margin: 0 0 2px 0;
+    }
+    h1 {
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      margin: 0;
+      color: #0f172a;
+    }
+    .entity-meta {
+      margin-top: 4px;
+      font-size: 11px;
+      color: #475569;
+    }
+    .header-right {
+      text-align: right;
+      font-size: 11px;
+      color: #475569;
+      line-height: 1.5;
+    }
+    .disclaimer-box {
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
+      border-left: 4px solid #d97706;
+      border-radius: 5px;
+      padding: 10px 13px;
+      margin-bottom: 14px;
+      break-inside: avoid;
+    }
+    .disclaimer-title {
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      color: #78350f;
+      margin-bottom: 3px;
+    }
+    .disclaimer-body {
+      font-size: 10.5px;
+      line-height: 1.45;
+      color: #78350f;
+      margin: 0;
+    }
+    .assumptions-box {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 5px;
+      padding: 10px 13px;
+      margin-bottom: 16px;
+      break-inside: avoid;
+    }
+    .assumptions-title {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: #1e293b;
+      margin-bottom: 6px;
+    }
+    .assumptions-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px 18px;
+      font-size: 10px;
+      color: #475569;
+    }
+    .assumption-label {
+      font-weight: 600;
+      color: #334155;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 18px;
+      break-inside: avoid;
+    }
+    .summary-card {
+      border: 1px solid #e2e8f0;
+      border-radius: 5px;
+      padding: 9px 11px;
+    }
+    .summary-label {
+      font-size: 10px;
+      color: #64748b;
+    }
+    .summary-value {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 14px;
+      font-weight: 700;
+      color: #0f172a;
+      margin-top: 2px;
+    }
+    .summary-value.positive {
+      color: #047857;
+    }
+    .summary-value.negative {
+      color: #b91c1c;
+    }
+    .summary-sub {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 2px;
+    }
+    section {
+      margin-bottom: 18px;
+    }
+    h2 {
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #0f172a;
+      border-bottom: 1px solid #cbd5e1;
+      padding-bottom: 4px;
+      margin: 0 0 6px 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 10.5px;
+    }
+    th {
+      text-align: left;
+      font-size: 10px;
+      font-weight: 600;
+      color: #475569;
+      padding: 5px 6px;
+      border-bottom: 1px solid #cbd5e1;
+    }
+    td {
+      padding: 4px 6px;
+      border-bottom: 1px solid #f1f5f9;
+      vertical-align: top;
+    }
+    .pad-l {
+      padding-left: 8px;
+    }
+    .indent {
+      padding-left: 20px;
+    }
+    .num {
+      text-align: right;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    th.num {
+      text-align: right;
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 9.5px;
+    }
+    .strong {
+      font-weight: 600;
+      color: #0f172a;
+    }
+    .muted {
+      color: #64748b;
+    }
+    .section-row td {
+      background: #f8fafc;
+      font-weight: 700;
+      color: #1e293b;
+      padding: 5px 8px;
+    }
+    .sub-row td {
+      font-size: 10px;
+      color: #475569;
+      background: #fafafa;
+    }
+    .amber-row td {
+      background: #fffbeb;
+      color: #92400e;
+    }
+    .amber-text {
+      color: #b45309;
+    }
+    .subtotal-row td {
+      font-weight: 600;
+      background: #f8fafc;
+      border-top: 1px solid #cbd5e1;
+      padding-top: 5px;
+      padding-bottom: 5px;
+    }
+    .grand-total-row td {
+      font-weight: 700;
+      background: #f1f5f9;
+      border-top: 2px solid #0f172a;
+      border-bottom: 1px solid #cbd5e1;
+      padding-top: 6px;
+      padding-bottom: 6px;
+    }
+    .schk-row td {
+      background: #f8fafc;
+      font-weight: 500;
+    }
+    .danger-row td {
+      background: #fef2f2;
+      color: #b91c1c;
+      font-weight: 600;
+    }
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      break-inside: avoid;
+    }
+    .goals-section {
+      break-inside: avoid;
+    }
+    .status-badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 9.5px;
+      font-weight: 700;
+      white-space: nowrap;
+      border: 1px solid transparent;
+    }
+    .badge-within {
+      background: #ecfdf5;
+      color: #065f46;
+      border-color: #a7f3d0;
+    }
+    .badge-watch {
+      background: #fffbeb;
+      color: #92400e;
+      border-color: #fde68a;
+    }
+    .badge-over {
+      background: #fef2f2;
+      color: #991b1b;
+      border-color: #fecaca;
+    }
+    .goal-why {
+      font-size: 10px;
+      color: #334155;
+      line-height: 1.38;
+    }
+    .goal-var {
+      font-size: 9.5px;
+      color: #64748b;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      margin-top: 2px;
+    }
+    footer {
+      border-top: 2px solid #cbd5e1;
+      padding-top: 11px;
+      margin-top: 10px;
+      font-size: 10px;
+      color: #475569;
+      break-inside: avoid;
+    }
+    .footer-top {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 8px;
+      color: #1e293b;
+      margin-bottom: 6px;
+    }
+    .footer-assumptions {
+      margin-bottom: 6px;
+    }
+    .footer-disclaimer {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 4px;
+      padding: 7px 10px;
+      color: #334155;
+    }
+    @media print {
+      body {
+        background: #ffffff;
+        padding: 0;
+      }
+      .toolbar {
+        display: none !important;
+      }
+      .sheet {
+        max-width: none;
+        border: none;
+        border-radius: 0;
+        padding: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div class="toolbar-note">
+      Standalone printable CPA Year-End Projection Package &mdash; use <strong>Print / Save as PDF</strong> to save a PDF copy for review with your CPA.
+    </div>
+    <button type="button" class="toolbar-btn" onclick="window.print()">Print / Save as PDF</button>
+  </div>
+
+  <main class="sheet">
+    <header>
+      ${
+        setup.workspace_profile_kind === 'test_persona' ||
+        setup.workspace_profile_kind === 'blank'
+          ? `<div style="background:#fffbeb;border:1px solid #f59e0b;color:#78350f;padding:6px 10px;border-radius:4px;margin-bottom:10px;font-size:10px;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">
+        Testing Mode Active &mdash; ${
+          setup.workspace_profile_kind === 'test_persona'
+            ? 'Synthetic Test Persona Data'
+            : 'Blank User Sandbox'
+        } (Not Saved Profile &middot; Not for CPA Filing)
+      </div>`
+          : ''
+      }
+      <div class="brand-bar">
+        <div>
+          <span class="brand-strong">${e(meta.preparedBy)}</span>
+          ${meta.website ? `&nbsp;&middot;&nbsp;<span class="brand-site">${e(meta.website)}</span>` : ''}
+        </div>
+        <div><strong>Module:</strong> ${e(meta.moduleName)}</div>
+      </div>
+
+      <div class="header-main">
+        <div>
+          <p class="eyebrow">${e(labels.packageEyebrow)}</p>
+          <h1>${e(entityName)}</h1>
+          <div class="entity-meta">
+            ${entityMetaParts.join('&nbsp;&middot;&nbsp;')}
+          </div>
+        </div>
+        <div class="header-right">
+          <div>
+            As-Of Date: <strong class="mono">${e(meta.asOfDateDisplay)}</strong>
+            <span class="mono muted">(${e(meta.asOfDate)})</span>
+          </div>
+          <div>
+            Remaining Through ${e(meta.yearEndDisplay)}:
+            <strong class="mono">${e(meta.remainingDays)} days</strong>
+            <span class="mono muted">(${e(meta.elapsedDays)}/${e(meta.totalYearDays)} YTD)</span>
+          </div>
+          ${
+            setup.multi_state_active
+              ? `<div>
+            Apportionment (Projected):
+            <strong class="mono">${e(pCode)} ${e(computed.caPct.projected)}% / ${e(sCode)} ${e(
+                  computed.azPct.projected
+                )}%</strong>
+          </div>`
+              : ''
+          }
+          <div class="muted">Generated ${e(generatedOn)}</div>
+        </div>
+      </div>
+    </header>
+
+    <div class="disclaimer-box" role="note">
+      <div class="disclaimer-title">${e(meta.disclaimerHeadline)}</div>
+      <p class="disclaimer-body">${e(meta.disclaimerBody)}</p>
+    </div>
+
+    <div class="assumptions-box">
+      <div class="assumptions-title">Active Forecast Assumptions</div>
+      <div class="assumptions-grid">${assumptionsHtml}</div>
+    </div>
+
+    <div class="summary-grid" style="${
+      setup.has_stock_basis === false ? 'grid-template-columns: repeat(3, minmax(0, 1fr));' : ''
+    }">
+      <div class="summary-card">
+        <div class="summary-label">Projected Gross Receipts</div>
+        <div class="summary-value">${cur(computed.totalRevenue.projected)}</div>
+        <div class="summary-sub">${
+          setup.multi_state_active
+            ? `${e(pCode)} ${e(computed.caPct.projected)}% &middot; ${e(sCode)} ${e(computed.azPct.projected)}%`
+            : `YTD ${cur(computed.totalRevenue.ytd)}`
+        }</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-label">${e(labels.ordinaryIncomeCardLabel)}</div>
+        <div class="summary-value">${cur(computed.ordinaryBusinessIncome.projected)}</div>
+        <div class="summary-sub">Prior-Yr Filed: ${cur(computed.ordinaryBusinessIncome.filed2025)}</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-label">Projected Member Draws</div>
+        <div class="summary-value">${cur(computed.projectedDrawsTotal)}</div>
+        <div class="summary-sub">Cap Contrib: ${cur(computed.projectedCapitalContributionsTotal)}</div>
+      </div>
+      ${
+        setup.has_stock_basis !== false
+          ? `<div class="summary-card">
+        <div class="summary-label">Projected Ending Basis</div>
+        <div class="summary-value ${computed.drawsExceedBasis ? 'negative' : 'positive'}">${cur(
+              computed.projectedEndingStockBasis
+            )}</div>
+        <div class="summary-sub">${
+          computed.drawsExceedBasis
+            ? `Excess Gain: ${cur(computed.projectedExcessDistributionGain)}`
+            : 'No excess dist gain'
+        }</div>
+      </div>`
+          : ''
+      }
+    </div>
+
+    <section>
+      <h2>1. Profit &amp; Loss Projection (${e(labels.entityFormLabel)} Structure)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Line Item</th>
+            <th>Ref</th>
+            <th class="num">YTD Actuals</th>
+            <th class="num">Remaining</th>
+            <th class="num">Projected ${e(pnlState.projection_year)}</th>
+            <th class="num">${e(priorYearLabel)}</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${pnlRowsHtml}
+          <tr class="grand-total-row">
+            <td class="pad-l">${e(labels.ordinaryIncomeRowLabel)}</td>
+            <td class="mono">Line 22</td>
+            <td class="num">${cur(computed.ordinaryBusinessIncome.ytd)}</td>
+            <td class="num">${cur(computed.ordinaryBusinessIncome.remaining)}</td>
+            <td class="num">${cur(computed.ordinaryBusinessIncome.projected)}</td>
+            <td class="num muted">${cur(computed.ordinaryBusinessIncome.filed2025)}</td>
+          </tr>
+          <tr class="schk-row">
+            <td class="pad-l">${e(SCHEDULE_K_LINE_META.label)} (Excl. from Line 22 &middot; Adds to Basis)</td>
+            <td class="mono muted">${e(SCHEDULE_K_LINE_META.form1120sRef)}</td>
+            <td class="num">${cur(computed.scheduleKInterest.ytd)}</td>
+            <td class="num">${cur(computed.scheduleKInterest.remaining)}</td>
+            <td class="num strong">${cur(computed.scheduleKInterest.projected)}</td>
+            <td class="num muted">${cur(computed.scheduleKInterest.filed2025)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <div class="${setup.has_stock_basis !== false ? 'two-col' : ''}">
+      <section>
+        <h2>2. Schedule L Balance Sheet Projection</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Account</th>
+              <th class="num">Beg (1/1)</th>
+              <th class="num">YTD</th>
+              <th class="num">Proj 12/31</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Operating Cash</td>
+              <td class="num">${cur(bs.operating_cash_beg)}</td>
+              <td class="num">${cur(bs.operating_cash_ytd)}</td>
+              <td class="num strong">${cur(computed.projectedCashYe)}</td>
+            </tr>
+            <tr>
+              <td>
+                Pension Expense Payable${
+                  bs.pension_payable_ye === 0 &&
+                  computed.lines.dbp_contribution.projected + computed.lines.employer_401k.projected >
+                    0
+                    ? '<div class="muted" style="font-size:9px;">IRC &sect;404(a)(6) / cash-basis funding</div>'
+                    : ''
+                }
+              </td>
+              <td class="num">${cur(bs.pension_payable_beg)}</td>
+              <td class="num">${cur(bs.pension_payable_ytd)}</td>
+              <td class="num strong">${cur(bs.pension_payable_ye)}</td>
+            </tr>
+            <tr>
+              <td>Credit Card / Accounts Payable</td>
+              <td class="num">${cur(bs.cc_ap_beg)}</td>
+              <td class="num">${cur(bs.cc_ap_ytd)}</td>
+              <td class="num strong">${cur(bs.cc_ap_ye)}</td>
+            </tr>
+            <tr class="subtotal-row">
+              <td>Net Cash After Short-Term Liab.</td>
+              <td class="num">${cur(computed.netCashPositionBeg)}</td>
+              <td class="num">${cur(computed.netCashPositionYtd)}</td>
+              <td class="num">${cur(computed.netCashPositionYe)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      ${
+        setup.has_stock_basis !== false
+          ? `<section>
+        <h2>3. Form 7203 Shareholder Stock Basis (${e(primaryName)} ${e(
+              computed.billSharePct
+            )}% / ${e(spouseName)} ${e(computed.debraSharePct)}%)</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Basis Component</th>
+              <th class="num">Combined</th>
+              <th class="num">${e(primaryName)}</th>
+              <th class="num">${e(spouseName)}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Beginning Stock Basis</td>
+              <td class="num">${cur(computed.beginningStockBasis)}</td>
+              <td class="num">${cur(basisRows.billBeg)}</td>
+              <td class="num">${cur(basisRows.debraBeg)}</td>
+            </tr>
+            <tr>
+              <td>+ Projected K-1 Ordinary Income</td>
+              <td class="num">${cur(basisRows.posInc)}</td>
+              <td class="num">${cur(basisRows.billInc)}</td>
+              <td class="num">${cur(basisRows.debraInc)}</td>
+            </tr>
+            <tr>
+              <td>+ Schedule K Interest Income (Line 4)</td>
+              <td class="num">${cur(basisRows.posInt)}</td>
+              <td class="num">${cur(basisRows.billInt)}</td>
+              <td class="num">${cur(basisRows.debraInt)}</td>
+            </tr>
+            <tr>
+              <td>+ Capital Contributions</td>
+              <td class="num">${cur(computed.projectedCapitalContributionsTotal)}</td>
+              <td class="num">${cur(basisRows.billCap)}</td>
+              <td class="num">${cur(basisRows.debraCap)}</td>
+            </tr>
+            <tr>
+              <td>&minus; Member Draws / Distributions</td>
+              <td class="num">${cur(-computed.projectedDrawsTotal)}</td>
+              <td class="num">${cur(-basisRows.billDraws)}</td>
+              <td class="num">${cur(-basisRows.debraDraws)}</td>
+            </tr>
+            <tr>
+              <td>&minus; Nondeductible (50% Meals)</td>
+              <td class="num">${cur(-computed.mealsNondeductible50.projected)}</td>
+              <td class="num">${cur(-basisRows.billNonded)}</td>
+              <td class="num">${cur(-basisRows.debraNonded)}</td>
+            </tr>
+            <tr class="subtotal-row">
+              <td>Projected Ending Stock Basis</td>
+              <td class="num">${cur(computed.projectedEndingStockBasis)}</td>
+              <td class="num">${cur(computed.billProjectedBasisEnding)}</td>
+              <td class="num">${cur(computed.debraProjectedBasisEnding)}</td>
+            </tr>
+            ${excessGainRowHtml}
+          </tbody>
+        </table>
+      </section>`
+          : ''
+      }
+    </div>
+
+    ${goalsSectionHtml}
+
+    ${
+      acknowledgedGuardrails.length > 0
+        ? `<section class="goals-section" style="margin-top:16px;">
+      <h2>${
+        (setup.has_stock_basis !== false ? 4 : 3) + (meta.activeGoals.length > 0 ? 1 : 0)
+      }. Acknowledged Guardrail Findings &amp; Explanations (${acknowledgedGuardrails.length})${
+            activeGuardrailCount > 0
+              ? ` <span class="muted" style="font-weight:400;font-size:10px;">&middot; ${activeGuardrailCount} active ${
+                  activeGuardrailCount === 1 ? 'finding' : 'findings'
+                } still open</span>`
+              : ''
+          }</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Guardrail Finding</th>
+            <th style="white-space:nowrap;">Status</th>
+            <th>Explanation / Rationale</th>
+            <th style="white-space:nowrap;">Acknowledged</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${acknowledgedGuardrails
+            .map((entry) => {
+              const badgeClass =
+                entry.ack.status === 'intentional_cpa_reviewed'
+                  ? 'badge-within'
+                  : entry.ack.status === 'mitigation_planned'
+                  ? 'badge-watch'
+                  : '';
+              const badgeStyle =
+                entry.ack.status === 'prior_year_historical'
+                  ? 'background:#f1f5f9;color:#334155;border-color:#cbd5e1;'
+                  : '';
+              return `<tr>
+                <td style="vertical-align:top;">
+                  <strong>${e(entry.title)}</strong>
+                  <div class="goal-why" style="margin-top:2px;color:#64748b;">${e(entry.message)}</div>
+                </td>
+                <td style="vertical-align:top;white-space:nowrap;">
+                  <span class="status-badge ${badgeClass}" style="${badgeStyle}">${e(
+                    getGuardrailAckStatusLabel(entry.ack.status)
+                  )}</span>
+                </td>
+                <td style="vertical-align:top;">
+                  <div class="goal-why">${e(entry.explanationNote)}</div>
+                  ${
+                    entry.explanationRatioSummary
+                      ? `<div class="goal-var">${e(entry.explanationRatioSummary)}</div>`
+                      : ''
+                  }
+                </td>
+                <td class="mono muted" style="vertical-align:top;white-space:nowrap;">${e(
+                  entry.ack.acknowledged_at
+                )}</td>
+              </tr>`;
+            })
+            .join('')}
+        </tbody>
+      </table>
+    </section>`
+        : ''
+    }
+
+    <footer>
+      <div class="footer-top">
+        <div>
+          <span class="brand-strong">${e(meta.preparedBy)}</span>
+          ${meta.website ? `<span class="brand-site">(${e(meta.website)})</span>` : ''}
+          &nbsp;&middot;&nbsp;
+          <span>${e(meta.moduleName)}</span>
+        </div>
+        <div class="mono">
+          As-Of ${e(meta.asOfDateDisplay)} &middot; ${e(meta.remainingDays)} remaining days through ${e(
+            meta.yearEndDisplay
+          )}
+        </div>
+      </div>
+      <div class="footer-assumptions">
+        <strong>Active Forecast Assumptions:</strong> ${e(meta.activeAssumptionsSummary)}
+      </div>
+      <div class="footer-disclaimer">
+        <strong>${e(meta.disclaimerHeadline)}:</strong> ${e(meta.disclaimerBody)}
+      </div>
+    </footer>
+  </main>
+</body>
+</html>`;
 }
 
 interface CpaPrintPackageModalProps {
@@ -26,6 +1087,8 @@ interface CpaPrintPackageModalProps {
   reportMeta?: CpaReportMetadata;
   moduleName?: string;
   forecastAssumptions?: string;
+  issues?: ValidationIssue[];
+  guardrailAcknowledgments?: Record<string, GuardrailAcknowledgment>;
   onDownloadCsv: () => void;
   onClose: () => void;
 }
@@ -39,10 +1102,15 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
   reportMeta,
   moduleName,
   forecastAssumptions,
+  issues = [],
+  guardrailAcknowledgments = {},
   onDownloadCsv,
   onClose,
 }) => {
   const { primaryName, spouseName } = getPersonNames(setup);
+  const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+  const pCode = primaryStateCode || 'State 1';
+  const sCode = secondaryStateCode || 'State 2';
   const bs = pnlState.balance_sheet;
   const generatedOn = new Date().toLocaleDateString('en-US', {
     year: 'numeric',
@@ -54,6 +1122,69 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
     moduleName: reportMeta?.moduleName ?? moduleName,
     forecastAssumptions: reportMeta?.forecastAssumptions ?? forecastAssumptions,
   });
+
+  // Resolve acknowledged guardrail findings (matched against live P&L projection or Horizon issues)
+  const issueByAckKey = new Map(issues.map((item) => [item.ack_key, item]));
+  const livePnlOfficerW2 = Math.max(0, computed.totalCompensation.projected);
+  const livePnlObi = Math.max(0, computed.ordinaryBusinessIncome.projected);
+
+  const acknowledgedGuardrails = Object.values(guardrailAcknowledgments)
+    .map((ack) => {
+      const liveIssue = issueByAckKey.get(ack.key);
+      let message = liveIssue?.message ?? ack.finding_message;
+      let explanationNote = ack.note;
+      let explanationRatioSummary: string | undefined;
+
+      if (ack.rule_id === 'low_reasonable_comp') {
+        const useLivePnl = ack.tax_year === pnlState.projection_year;
+        const w2Basis = useLivePnl
+          ? livePnlOfficerW2
+          : liveIssue?.reasonable_comp_meta?.officer_w2;
+        const obiBasis = useLivePnl
+          ? livePnlObi
+          : liveIssue?.reasonable_comp_meta?.ordinary_business_income;
+
+        if (w2Basis !== undefined && obiBasis !== undefined) {
+          message = formatReasonableCompFindingMessage(w2Basis, obiBasis);
+          explanationNote = syncReasonableCompNoteText(
+            ack.note,
+            ack.finding_message,
+            w2Basis,
+            obiBasis
+          );
+          explanationRatioSummary = formatReasonableCompExplanationSummary(
+            w2Basis,
+            obiBasis,
+            useLivePnl
+              ? `${pnlState.projection_year} Projected P&L`
+              : ack.tax_year
+              ? `${ack.tax_year} Forecast`
+              : undefined
+          );
+        }
+      }
+
+      return {
+        ack,
+        title: liveIssue?.title ?? ack.finding_title,
+        message,
+        explanationNote,
+        explanationRatioSummary,
+        severity: liveIssue?.severity ?? ack.finding_severity,
+      };
+    })
+    .sort((a, b) => (a.ack.tax_year ?? 9999) - (b.ack.tax_year ?? 9999));
+  const activeGuardrailCount = issues.filter(
+    (item) => !guardrailAcknowledgments[item.ack_key]
+  ).length;
+  const ackSectionNum =
+    (setup.has_stock_basis !== false ? 4 : 3) + (meta.activeGoals.length > 0 ? 1 : 0);
+
+  const [printStatus, setPrintStatus] = useState<{
+    type: 'opened' | 'downloaded';
+    message: string;
+  } | null>(null);
+  const labels = getCpaEntityLabels(setup, primaryName, spouseName, computed);
 
   const billPct = computed.billSharePct / 100;
   const billBeg = round2(computed.beginningStockBasis * billPct);
@@ -71,6 +1202,84 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
   const billNonded = round2(computed.mealsNondeductible50.projected * billPct);
   const debraNonded = round2(computed.mealsNondeductible50.projected - billNonded);
 
+  const handlePrintOrSavePdf = () => {
+    const html = buildStandalonePrintHtml({
+      setup,
+      pnlState,
+      computed,
+      entityName,
+      entityEin,
+      primaryName,
+      spouseName,
+      generatedOn,
+      meta,
+      acknowledgedGuardrails,
+      activeGuardrailCount,
+      basisRows: {
+        billBeg,
+        debraBeg,
+        posInc,
+        billInc,
+        debraInc,
+        posInt,
+        billInt,
+        debraInt,
+        billCap,
+        debraCap,
+        billDraws,
+        debraDraws,
+        billNonded,
+        debraNonded,
+      },
+    });
+
+    let openedAndPrinted = false;
+    try {
+      const printWin = window.open('', '_blank');
+      if (printWin && !printWin.closed && printWin.document) {
+        printWin.document.open();
+        printWin.document.write(html);
+        printWin.document.close();
+        openedAndPrinted = true;
+        window.setTimeout(() => {
+          try {
+            printWin.focus();
+            printWin.print();
+          } catch {
+            // User can still use the built-in Print / Save as PDF button in the opened tab
+          }
+        }, 180);
+      }
+    } catch {
+      openedAndPrinted = false;
+    }
+
+    if (openedAndPrinted) {
+      setPrintStatus({
+        type: 'opened',
+        message: 'Opened standalone print report in a new browser tab. Choose Print → Save as PDF if the dialog does not appear automatically.',
+      });
+      return;
+    }
+
+    const safeEntity = entityName.replace(/[^a-z0-9]+/gi, '_').replace(/^_|_$/g, '') || 'CPA_Report';
+    const fileName = `${safeEntity}_${pnlState.projection_year}_CPA_Projection_Package.html`;
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    setPrintStatus({
+      type: 'downloaded',
+      message: `Downloaded standalone printable report (${fileName}) because popup printing is restricted in this preview frame. Open it in your browser and choose Print → Save as PDF.`,
+    });
+  };
+
   return (
     <div
       className="print-only-container fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4"
@@ -86,7 +1295,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
               CPA Year-End Projection Package — Print &amp; Export View
             </h2>
             <p className="text-xs text-slate-500">
-              Preliminary tax-planning schedule formatted for review with your CPA (Form 1120-S P&amp;L, Schedule M-1 Meals Split, Schedule L, and Form 7203 Basis).
+              Preliminary tax-planning schedule formatted for review with your CPA ({labels.entityFormLabel} P&amp;L, Schedule M-1 Meals Split, Schedule L{setup.has_stock_basis !== false ? ', and Form 7203 Basis' : ''}).
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -100,7 +1309,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => window.print()}
+              onClick={handlePrintOrSavePdf}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900 transition-colors whitespace-nowrap"
             >
               <Printer className="w-3.5 h-3.5" />
@@ -117,6 +1326,46 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
           </div>
         </div>
 
+        {printStatus && (
+          <div
+            className={`no-print px-6 py-2 text-xs border-b shrink-0 flex items-center justify-between gap-3 ${
+              printStatus.type === 'downloaded'
+                ? 'bg-teal-50 border-teal-200 text-teal-900'
+                : 'bg-slate-50 border-slate-200 text-slate-700'
+            }`}
+          >
+            <span>{printStatus.message}</span>
+            <button
+              type="button"
+              onClick={() => setPrintStatus(null)}
+              className="text-[11px] font-medium text-slate-500 hover:text-slate-800 shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {(setup.workspace_profile_kind === 'test_persona' ||
+          setup.workspace_profile_kind === 'blank') && (
+          <div
+            role="alert"
+            className="no-print bg-amber-50 border-b border-amber-300 px-6 py-2.5 flex items-center gap-2 text-xs text-amber-950 shrink-0"
+          >
+            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+            <span>
+              <strong className="font-semibold">Testing Mode Active</strong> — This preview uses{' '}
+              {setup.workspace_profile_kind === 'test_persona'
+                ? `synthetic Test Persona data (${primaryName}${
+                    setup.filing_status === 'married_filing_jointly' && spouseName
+                      ? ` & ${spouseName}`
+                      : ''
+                  })`
+                : 'the Blank User sandbox'}{' '}
+              and is not your saved profile. Switch back to <strong>My Profile</strong> before exporting a final CPA report.
+            </span>
+          </div>
+        )}
+
         {/* Printable Document Body */}
         <div className="print-only-container flex-1 overflow-y-auto p-6 sm:p-8 space-y-6 bg-white text-slate-900">
           {/* Formal Statement Header & Branding */}
@@ -124,8 +1373,12 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
             <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-200 text-[11px] text-slate-600">
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="font-semibold text-slate-900">{meta.preparedBy}</span>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono text-teal-800">{meta.website}</span>
+                {meta.website && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono text-teal-800">{meta.website}</span>
+                  </>
+                )}
               </div>
               <div className="font-medium text-slate-700">Module: {meta.moduleName}</div>
             </div>
@@ -133,20 +1386,26 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div>
                 <p className="text-xs font-medium text-slate-500">
-                  Form 1120-S Year-End Financial &amp; Tax Projection Package
+                  {labels.packageEyebrow}
                 </p>
                 <h1 className="text-xl font-bold tracking-tight text-slate-900 mt-0.5">
                   {entityName}
                 </h1>
                 <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 mt-1">
-                  <span className="font-mono">EIN {entityEin}</span>
-                  <span aria-hidden="true">·</span>
+                  {entityEin.trim() && (
+                    <>
+                      <span className="font-mono">EIN {entityEin.trim()}</span>
+                      <span aria-hidden="true">·</span>
+                    </>
+                  )}
                   <span>Tax Year {pnlState.projection_year}</span>
                   <span aria-hidden="true">·</span>
                   <span>
-                    Ownership: {primaryName} {computed.billSharePct}% / {spouseName}{' '}
-                    {computed.debraSharePct}%
+                    Filing: {labels.filingStatusLabel}
+                    {labels.activeStatesLabel ? ` · ${labels.activeStatesLabel}` : ''}
                   </span>
+                  <span aria-hidden="true">·</span>
+                  <span>Ownership: {labels.ownershipLabel}</span>
                 </div>
               </div>
               <div className="text-right text-xs text-slate-600 space-y-0.5">
@@ -166,12 +1425,14 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                     ({meta.elapsedDays}/{meta.totalYearDays} YTD)
                   </span>
                 </div>
-                <div>
-                  Apportionment (Projected):{' '}
-                  <span className="font-mono font-medium text-slate-900">
-                    CA {computed.caPct.projected}% / AZ {computed.azPct.projected}%
-                  </span>
-                </div>
+                {setup.multi_state_active && (
+                  <div>
+                    Apportionment (Projected):{' '}
+                    <span className="font-mono font-medium text-slate-900">
+                      {pCode} {computed.caPct.projected}% / {sCode} {computed.azPct.projected}%
+                    </span>
+                  </div>
+                )}
                 <div className="text-[11px] text-slate-400">Generated {generatedOn}</div>
               </div>
             </div>
@@ -211,23 +1472,29 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
           </div>
 
           {/* Executive Summary Row */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pb-2">
+          <div
+            className={`grid grid-cols-2 ${
+              setup.has_stock_basis !== false ? 'sm:grid-cols-4' : 'sm:grid-cols-3'
+            } gap-4 pb-2`}
+          >
             <div className="border border-slate-200 rounded p-3">
               <div className="text-[11px] text-slate-500">Projected Gross Receipts</div>
               <div className="text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5">
                 {formatCurrencyExact(computed.totalRevenue.projected)}
               </div>
               <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
-                CA {computed.caPct.projected}% · AZ {computed.azPct.projected}%
+                {setup.multi_state_active
+                  ? `${pCode} ${computed.caPct.projected}% · ${sCode} ${computed.azPct.projected}%`
+                  : `YTD ${formatCurrencyExact(computed.totalRevenue.ytd)}`}
               </div>
             </div>
             <div className="border border-slate-200 rounded p-3">
-              <div className="text-[11px] text-slate-500">Projected 1120-S Line 22</div>
+              <div className="text-[11px] text-slate-500">{labels.ordinaryIncomeCardLabel}</div>
               <div className="text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5">
                 {formatCurrencyExact(computed.ordinaryBusinessIncome.projected)}
               </div>
               <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
-                2025 Filed: {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
+                Prior-Yr Filed: {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
               </div>
             </div>
             <div className="border border-slate-200 rounded p-3">
@@ -239,27 +1506,29 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                 Cap Contrib: {formatCurrencyExact(computed.projectedCapitalContributionsTotal)}
               </div>
             </div>
-            <div className="border border-slate-200 rounded p-3">
-              <div className="text-[11px] text-slate-500">Projected Ending Basis</div>
-              <div
-                className={`text-base font-bold font-mono tabular-nums mt-0.5 ${
-                  computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
-                }`}
-              >
-                {formatCurrencyExact(computed.projectedEndingStockBasis)}
+            {setup.has_stock_basis !== false && (
+              <div className="border border-slate-200 rounded p-3">
+                <div className="text-[11px] text-slate-500">Projected Ending Basis</div>
+                <div
+                  className={`text-base font-bold font-mono tabular-nums mt-0.5 ${
+                    computed.drawsExceedBasis ? 'text-red-700' : 'text-emerald-700'
+                  }`}
+                >
+                  {formatCurrencyExact(computed.projectedEndingStockBasis)}
+                </div>
+                <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
+                  {computed.drawsExceedBasis
+                    ? `Excess Gain: ${formatCurrencyExact(computed.projectedExcessDistributionGain)}`
+                    : 'No excess dist gain'}
+                </div>
               </div>
-              <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
-                {computed.drawsExceedBasis
-                  ? `Excess Gain: ${formatCurrencyExact(computed.projectedExcessDistributionGain)}`
-                  : 'No excess dist gain'}
-              </div>
-            </div>
+            )}
           </div>
 
           {/* 1. Profit & Loss Statement */}
           <section>
             <h2 className="text-xs font-bold tracking-wide text-slate-900 border-b border-slate-300 pb-1.5 mb-2">
-              1. Profit &amp; Loss Projection (Form 1120-S Structure)
+              1. Profit &amp; Loss Projection ({labels.entityFormLabel} Structure)
             </h2>
             <table className="w-full text-left border-collapse text-xs">
               <thead>
@@ -269,7 +1538,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                   <th className="py-1.5 px-2 text-right">YTD Actuals</th>
                   <th className="py-1.5 px-2 text-right">Remaining</th>
                   <th className="py-1.5 px-2 text-right">Projected {pnlState.projection_year}</th>
-                  <th className="py-1.5 pl-2 text-right">2025 Filed</th>
+                  <th className="py-1.5 pl-2 text-right">{pnlState.projection_year - 1} Filed</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -374,7 +1643,13 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                       {sec.id === 'operating_expenses' && (
                         <tr className="font-semibold border-t border-slate-200 bg-slate-50/60">
                           <td className="py-1.5 pr-3 pl-2">
-                            Total Operating Expenses (Excl. W-2 &amp; Retirement · Tax Deductible)
+                            <div>Total Operating Expenses (Excl. W-2 &amp; Retirement · Tax Deductible)</div>
+                            <div className="text-[10px] font-normal text-slate-500">
+                              Excl. Payroll Taxes (1120-S / Horizon OpEx):{' '}
+                              <span className="font-mono tabular-nums">
+                                {formatCurrencyExact(computed.totalOperatingExpensesExclPayroll.projected)}
+                              </span>
+                            </div>
                           </td>
                           <td className="py-1.5 px-2 text-[10px] font-mono text-slate-500">
                             Lines 11–19
@@ -398,7 +1673,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                 })}
                 <tr className="border-t-2 border-slate-900 font-bold bg-slate-100/70">
                   <td className="py-2 pr-3 pl-2">
-                    Projected Ordinary Business Income (Form 1120-S Line 22)
+                    {labels.ordinaryIncomeRowLabel}
                   </td>
                   <td className="py-2 px-2 text-[10px] font-mono text-slate-600">Line 22</td>
                   <td className="py-2 px-2 text-right font-mono tabular-nums">
@@ -439,7 +1714,11 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
           </section>
 
           {/* 2. Schedule L Balance Sheet & 3. Form 7203 Basis Side-by-Side */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div
+            className={`grid grid-cols-1 ${
+              setup.has_stock_basis !== false ? 'md:grid-cols-2' : ''
+            } gap-6`}
+          >
             <section>
               <h2 className="text-xs font-bold tracking-wide text-slate-900 border-b border-slate-300 pb-1.5 mb-2">
                 2. Schedule L Balance Sheet Projection
@@ -467,7 +1746,17 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                     </td>
                   </tr>
                   <tr>
-                    <td className="py-1.5 pr-2">Pension Expense Payable</td>
+                    <td className="py-1.5 pr-2">
+                      <div>Pension Expense Payable</div>
+                      {bs.pension_payable_ye === 0 &&
+                        computed.lines.dbp_contribution.projected +
+                          computed.lines.employer_401k.projected >
+                          0 && (
+                          <div className="text-[10px] text-slate-400">
+                            IRC §404(a)(6) / cash-basis funding
+                          </div>
+                        )}
+                    </td>
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(bs.pension_payable_beg)}
                     </td>
@@ -506,6 +1795,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
               </table>
             </section>
 
+            {setup.has_stock_basis !== false && (
             <section>
               <h2 className="text-xs font-bold tracking-wide text-slate-900 border-b border-slate-300 pb-1.5 mb-2">
                 3. Form 7203 Shareholder Stock Basis ({primaryName} {computed.billSharePct}% /{' '}
@@ -622,14 +1912,152 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                 </tbody>
               </table>
             </section>
+            )}
           </div>
+
+          {/* Planning Goals & Guardrails for CPA Review */}
+          {meta.activeGoals.length > 0 && (
+            <section>
+              <h2 className="text-xs font-bold tracking-wide text-slate-900 border-b border-slate-300 pb-1.5 mb-2">
+                {setup.has_stock_basis !== false ? '4.' : '3.'} Planning Goals &amp; Guardrails for CPA Review ({meta.activeGoals.length} Active)
+              </h2>
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-300 text-[11px] font-semibold text-slate-600">
+                    <th className="py-1.5 pr-3">Goal / Guardrail</th>
+                    <th className="py-1.5 px-2 text-right whitespace-nowrap">Target</th>
+                    <th className="py-1.5 px-2 text-right whitespace-nowrap">Projected</th>
+                    <th className="py-1.5 px-2 whitespace-nowrap">Status</th>
+                    <th className="py-1.5 pl-2">Why This Matters &amp; Variance Context</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {meta.activeGoals.map((item) => {
+                    const badgeCls =
+                      item.status === 'over'
+                        ? 'bg-red-50 text-red-800 border-red-200'
+                        : item.status === 'watch'
+                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : 'bg-emerald-50 text-emerald-800 border-emerald-200';
+                    return (
+                      <tr key={item.goal.id}>
+                        <td className="py-2 pr-3 align-top font-semibold text-slate-900">
+                          {item.goal.title}
+                        </td>
+                        <td className="py-2 px-2 align-top text-right font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                          <div>{item.targetDisplay}</div>
+                          {item.goal.kind === 'income_ceiling' && item.linkedIrmaa && (
+                            <div className="text-[10px] font-sans text-slate-400 mt-0.5 whitespace-normal">
+                              {item.linkedIrmaa.isGoalTargetOverridden
+                                ? `Custom · ${item.linkedIrmaa.coverageYear} IRMAA (${item.linkedIrmaa.filingStatusShort}) ${formatCurrencyExact(
+                                    item.linkedIrmaa.threshold
+                                  )}`
+                                : `${item.linkedIrmaa.coverageYear} IRMAA Tier 1 (${item.linkedIrmaa.filingStatusShort} · 2-yr lookback)`}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2 px-2 align-top text-right font-mono tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                          {item.currentDisplay}
+                        </td>
+                        <td className="py-2 px-2 align-top whitespace-nowrap">
+                          <span
+                            className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold border ${badgeCls}`}
+                          >
+                            {item.statusLabel}
+                          </span>
+                        </td>
+                        <td className="py-2 pl-2 align-top">
+                          <div className="text-[11px] text-slate-700 leading-snug">
+                            {item.goal.why_it_matters}
+                          </div>
+                          <div className="text-[10px] font-mono text-slate-500 mt-0.5">
+                            {item.varianceSummary}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </section>
+          )}
+
+          {/* Acknowledged Guardrail Findings & Explanations for CPA Review */}
+          {acknowledgedGuardrails.length > 0 && (
+            <section>
+              <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-slate-300 pb-1.5 mb-2">
+                <h2 className="text-xs font-bold tracking-wide text-slate-900">
+                  {ackSectionNum}. Acknowledged Guardrail Findings &amp; Explanations (
+                  {acknowledgedGuardrails.length})
+                </h2>
+                {activeGuardrailCount > 0 && (
+                  <span className="text-[11px] text-amber-800 font-medium">
+                    {activeGuardrailCount} active {activeGuardrailCount === 1 ? 'finding' : 'findings'} still open
+                  </span>
+                )}
+              </div>
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-300 text-[11px] font-semibold text-slate-600">
+                    <th className="py-1.5 pr-3">Guardrail Finding</th>
+                    <th className="py-1.5 px-2 whitespace-nowrap">Status</th>
+                    <th className="py-1.5 px-2">Explanation / Rationale</th>
+                    <th className="py-1.5 pl-2 whitespace-nowrap text-right">Acknowledged</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {acknowledgedGuardrails.map((entry) => {
+                    const statusCls =
+                      entry.ack.status === 'intentional_cpa_reviewed'
+                        ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                        : entry.ack.status === 'mitigation_planned'
+                        ? 'bg-teal-50 text-teal-800 border-teal-200'
+                        : 'bg-slate-100 text-slate-700 border-slate-300';
+                    return (
+                      <tr key={entry.ack.key}>
+                        <td className="py-2 pr-3 align-top">
+                          <div className="font-semibold text-slate-900">{entry.title}</div>
+                          <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                            {entry.message}
+                          </div>
+                        </td>
+                        <td className="py-2 px-2 align-top whitespace-nowrap">
+                          <span
+                            className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold border ${statusCls}`}
+                          >
+                            {getGuardrailAckStatusLabel(entry.ack.status)}
+                          </span>
+                        </td>
+                        <td className="py-2 px-2 align-top text-[11px] text-slate-800 leading-snug">
+                          <div>{entry.explanationNote}</div>
+                          {entry.explanationRatioSummary && (
+                            <div className="text-[10px] font-mono text-slate-500 mt-0.5">
+                              {entry.explanationRatioSummary}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2 pl-2 align-top text-right font-mono text-[11px] text-slate-500 whitespace-nowrap">
+                          {entry.ack.acknowledged_at}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </section>
+          )}
 
           {/* Formal Branding, Assumptions & CPA Disclaimer Footer */}
           <footer className="border-t-2 border-slate-300 pt-3.5 mt-4 text-[11px] leading-relaxed text-slate-600 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2 text-slate-800">
               <div>
-                <span className="font-semibold">{meta.preparedBy}</span>{' '}
-                <span className="font-mono text-teal-800">({meta.website})</span>
+                <span className="font-semibold">{meta.preparedBy}</span>
+                {meta.website && (
+                  <>
+                    {' '}
+                    <span className="font-mono text-teal-800">({meta.website})</span>
+                  </>
+                )}
                 <span className="mx-1.5 text-slate-400">·</span>
                 <span className="text-slate-700">{meta.moduleName}</span>
               </div>

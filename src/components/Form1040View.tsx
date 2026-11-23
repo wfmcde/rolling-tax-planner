@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, FileText, Loader2, Lock, Unlock } from 'lucide-react';
+import { Check, FileText, Loader2, Lock, RotateCcw, Unlock } from 'lucide-react';
 import type {
   ComputedTaxYear,
   DeductionMethod,
@@ -7,6 +7,8 @@ import type {
   TaxYearRecord,
 } from '../types/tax';
 import { formatCurrency, formatPercent } from '../utils/format';
+import { resolveIrmaaThresholdForYear, setIrmaaThresholdOverride } from '../engine/irmaa';
+import { SAMPLE_GENERIC_RETURN_TEXT } from '../data/profiles';
 import { NumericField } from './NumericField';
 
 interface Form1040ViewProps {
@@ -16,6 +18,7 @@ interface Form1040ViewProps {
   selectedYear: number;
   onSelectYear: (year: number) => void;
   onUpdateYear: (taxYear: number, updater: (yr: TaxYearRecord) => TaxYearRecord) => void;
+  onUpdateSetup: (next: SetupConfig) => void;
 }
 
 interface ExtractedField {
@@ -35,15 +38,7 @@ interface ExtractActualsResponse {
   reconciliation_warnings?: string[];
 }
 
-const SAMPLE_RETURN_TEXT = `2025 Federal Form 1040 Summary (Married Filing Jointly)
-Line 1a W-2 Wages: $180,000
-Line 2b Taxable Interest: $5,400
-Line 3a Qualified Dividends: $7,200 | Line 3b Ordinary Dividends: $9,100
-Schedule D Net Long-Term Capital Gain: $8,500
-Schedule K-1 (Operating Support Services, LLC - Form 1120-S) Box 1 Ordinary Business Income: $95,000
-Form 1120-S Shareholder Distributions: $60,000 | Ending Stock Basis: $140,000
-Defined Benefit Plan Deductible Contribution: $45,000
-Standard Deduction Method Elected | Form 1040 Line 15 Taxable Income: $225,000`;
+const SAMPLE_RETURN_TEXT = SAMPLE_GENERIC_RETURN_TEXT;
 
 export const Form1040View: React.FC<Form1040ViewProps> = ({
   setup,
@@ -52,6 +47,7 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
   selectedYear,
   onSelectYear,
   onUpdateYear,
+  onUpdateSetup,
 }) => {
   const yr = years.find((y) => y.tax_year === selectedYear) ?? years[0];
   const comp = computed.find((c) => c.tax_year === yr.tax_year) ?? computed[0];
@@ -501,31 +497,33 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
               disabled={isLocked}
               onChange={(v) => update1040({ long_term_capital_gain_loss: v })}
             />
-            <NumericField
-              label="Social Security Gross"
-              fieldCode="social_security_gross"
-              prefix="$"
-              step={1000}
-              value={comp.form_1040_out.social_security_gross_effective}
-              disabled={
-                isLocked ||
-                Boolean(setup.primary_profile?.social_security.receiving) ||
-                (setup.filing_status === 'married_filing_jointly' &&
-                  Boolean(setup.spouse_profile?.social_security.receiving))
-              }
-              onChange={(v) => update1040({ social_security_gross: v })}
-              helperText={
-                setup.primary_profile?.social_security.receiving ||
-                (setup.filing_status === 'married_filing_jointly' &&
-                  setup.spouse_profile?.social_security.receiving)
-                  ? `Primary ${formatCurrency(comp.form_1040_out.primary_ss_gross)} (${comp.form_1040_out.primary_ss_status})${
-                      setup.filing_status === 'married_filing_jointly'
-                        ? ` · Spouse ${formatCurrency(comp.form_1040_out.spouse_ss_gross)} (${comp.form_1040_out.spouse_ss_status})`
-                        : ''
-                    } · Taxable: ${formatCurrency(comp.form_1040_out.social_security_taxable)}`
-                  : `Taxable portion computed: ${formatCurrency(comp.form_1040_out.social_security_taxable)}`
-              }
-            />
+            {setup.has_ss_medicare !== false && (
+              <NumericField
+                label="Social Security Gross"
+                fieldCode="social_security_gross"
+                prefix="$"
+                step={1000}
+                value={comp.form_1040_out.social_security_gross_effective}
+                disabled={
+                  isLocked ||
+                  Boolean(setup.primary_profile?.social_security.receiving) ||
+                  (setup.filing_status === 'married_filing_jointly' &&
+                    Boolean(setup.spouse_profile?.social_security.receiving))
+                }
+                onChange={(v) => update1040({ social_security_gross: v })}
+                helperText={
+                  setup.primary_profile?.social_security.receiving ||
+                  (setup.filing_status === 'married_filing_jointly' &&
+                    setup.spouse_profile?.social_security.receiving)
+                    ? `Primary ${formatCurrency(comp.form_1040_out.primary_ss_gross)} (${comp.form_1040_out.primary_ss_status})${
+                        setup.filing_status === 'married_filing_jointly'
+                          ? ` · Spouse ${formatCurrency(comp.form_1040_out.spouse_ss_gross)} (${comp.form_1040_out.spouse_ss_status})`
+                          : ''
+                      } · Taxable: ${formatCurrency(comp.form_1040_out.social_security_taxable)}`
+                    : `Taxable portion computed: ${formatCurrency(comp.form_1040_out.social_security_taxable)}`
+                }
+              />
+            )}
             <NumericField
               label="Taxable IRA Distributions"
               fieldCode="ira_distributions_taxable"
@@ -598,7 +596,7 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
                 onChange={(v) => update1040({ health_insurance_premiums: v })}
                 helperText={
                   setup.has_scorp
-                    ? 'Deducted above-the-line for >2% S-Corp shareholder'
+                    ? 'Deducted above-the-line on Sch 1 Ln 17 (capped at W-2 Box 5 Medicare wages per Form 7206 Ln 11)'
                     : 'Included in medical itemized threshold'
                 }
               />
@@ -714,47 +712,144 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
             ))}
           </dl>
 
-          <div className="pt-3 border-t border-slate-200 space-y-2 text-xs">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="font-semibold text-slate-800">
-                  Medicare &amp; IRMAA (2-Yr Lookback MAGI: {formatCurrency(comp.form_1040_out.irmaa_lookback_magi)})
-                </div>
-                <div className="text-slate-500 mt-0.5">{comp.form_1040_out.irmaa_tier}</div>
-              </div>
-              <div className="font-mono tabular-nums font-semibold text-slate-900">
-                {comp.form_1040_out.irmaa_annual_surcharge > 0
-                  ? `+${formatCurrency(comp.form_1040_out.irmaa_annual_surcharge)}/yr`
-                  : '$0/yr'}
-              </div>
-            </div>
+          {setup.has_ss_medicare !== false && (() => {
+            const covYear = comp.form_1040_out.irmaa_coverage_year;
+            const lookbackYear = comp.form_1040_out.irmaa_lookback_year;
+            const futureCovYear = comp.form_1040_out.irmaa_future_coverage_year;
+            const futureThreshold = comp.form_1040_out.irmaa_future_tier1_threshold;
+            const currentMagi =
+              comp.form_1040_out.adjusted_gross_income + yr.form_1040.tax_exempt_interest;
+            const resolvedCov = resolveIrmaaThresholdForYear(covYear, setup);
+            const isProxyLookback = lookbackYear < setup.anchor_actuals_year;
 
-            {(setup.primary_profile?.medicare.enrolled ||
-              (setup.filing_status === 'married_filing_jointly' &&
-                setup.spouse_profile?.medicare.enrolled)) && (
-              <div className="grid grid-cols-1 gap-1 pt-1 text-[11px] font-mono tabular-nums text-slate-600">
-                {setup.primary_profile?.medicare.enrolled && (
-                  <div className="flex justify-between">
-                    <span>Primary Enrolled (Base / IRMAA)</span>
+            return (
+              <div className="pt-3 border-t border-slate-200 space-y-2.5 text-xs">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="font-semibold text-slate-800">
+                      Medicare &amp; IRMAA — {covYear} Coverage Year
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      Tests <span className="font-mono font-medium text-slate-700">{lookbackYear} MAGI</span>
+                      {isProxyLookback ? ' (proxy)' : ''}:{' '}
+                      <span className="font-mono font-medium text-slate-800">
+                        {formatCurrency(comp.form_1040_out.irmaa_lookback_magi)}
+                      </span>{' '}
+                      vs. {formatCurrency(resolvedCov.effectiveThreshold)} ·{' '}
+                      <span className="font-medium text-slate-700">{comp.form_1040_out.irmaa_tier}</span>
+                    </div>
+                  </div>
+                  <div className="font-mono tabular-nums font-semibold text-slate-900 shrink-0">
+                    {comp.form_1040_out.irmaa_annual_surcharge > 0
+                      ? `+${formatCurrency(comp.form_1040_out.irmaa_annual_surcharge)}/yr`
+                      : '$0/yr'}
+                  </div>
+                </div>
+
+                {/* Inline Per-Year Threshold Override Control for Active Coverage Year */}
+                <div className="bg-slate-50 border border-slate-200 rounded-md p-2.5 space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label
+                      htmlFor={`form1040-irmaa-threshold-${covYear}`}
+                      className="text-[11px] font-medium text-slate-700"
+                    >
+                      {covYear} Starting Threshold ({setup.filing_status === 'married_filing_jointly' ? 'MFJ' : 'Single'})
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-slate-400 font-mono text-[11px]">$</span>
+                      <input
+                        id={`form1040-irmaa-threshold-${covYear}`}
+                        type="number"
+                        step={1000}
+                        min={0}
+                        value={resolvedCov.effectiveThreshold}
+                        onChange={(e) => {
+                          const raw = e.target.value.trim();
+                          if (raw === '') {
+                            onUpdateSetup(setIrmaaThresholdOverride(setup, covYear, null));
+                            return;
+                          }
+                          const parsed = Number(raw);
+                          if (Number.isFinite(parsed) && parsed >= 0) {
+                            const rounded = Math.round(parsed);
+                            onUpdateSetup(
+                              setIrmaaThresholdOverride(
+                                setup,
+                                covYear,
+                                rounded === resolvedCov.formulaThreshold ? null : rounded
+                              )
+                            );
+                          }
+                        }}
+                        className={`w-24 text-right font-mono text-xs tabular-nums px-1.5 py-0.5 rounded border focus:outline-none focus:ring-1 focus:ring-teal-700 ${
+                          resolvedCov.isOverridden
+                            ? 'border-amber-400 bg-white text-slate-900 font-semibold'
+                            : 'border-slate-300 bg-white text-slate-800'
+                        }`}
+                      />
+                      {resolvedCov.isOverridden && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateSetup(setIrmaaThresholdOverride(setup, covYear, null))
+                          }
+                          className="inline-flex items-center gap-0.5 text-[11px] font-medium text-teal-800 hover:text-teal-950 hover:underline whitespace-nowrap"
+                          title={`Reset ${covYear} threshold to formula (${formatCurrency(resolvedCov.formulaThreshold)})`}
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          Reset to formula
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
                     <span>
-                      {formatCurrency(comp.form_1040_out.primary_medicare_base_annual)} / +
-                      {formatCurrency(comp.form_1040_out.primary_irmaa_surcharge)}
+                      {resolvedCov.isOverridden
+                        ? `Manual Override (Formula: ${formatCurrency(resolvedCov.formulaThreshold)})`
+                        : `Formula: ${resolvedCov.sourceLabel}`}
+                    </span>
+                    <span
+                      className={
+                        comp.form_1040_out.irmaa_current_magi_exceeds_cliff
+                          ? 'font-medium text-amber-800'
+                          : 'text-emerald-700'
+                      }
+                    >
+                      {yr.tax_year} MAGI ({formatCurrency(currentMagi)}) → {futureCovYear} Cov (
+                      {comp.form_1040_out.irmaa_current_magi_exceeds_cliff ? '>' : '≤'}
+                      {formatCurrency(futureThreshold)})
                     </span>
                   </div>
+                </div>
+
+                {(setup.primary_profile?.medicare.enrolled ||
+                  (setup.filing_status === 'married_filing_jointly' &&
+                    setup.spouse_profile?.medicare.enrolled)) && (
+                  <div className="grid grid-cols-1 gap-1 pt-0.5 text-[11px] font-mono tabular-nums text-slate-600">
+                    {setup.primary_profile?.medicare.enrolled && (
+                      <div className="flex justify-between">
+                        <span>Primary Enrolled (Base / IRMAA)</span>
+                        <span>
+                          {formatCurrency(comp.form_1040_out.primary_medicare_base_annual)} / +
+                          {formatCurrency(comp.form_1040_out.primary_irmaa_surcharge)}
+                        </span>
+                      </div>
+                    )}
+                    {setup.filing_status === 'married_filing_jointly' &&
+                      setup.spouse_profile?.medicare.enrolled && (
+                        <div className="flex justify-between">
+                          <span>Spouse Enrolled (Base / IRMAA)</span>
+                          <span>
+                            {formatCurrency(comp.form_1040_out.spouse_medicare_base_annual)} / +
+                            {formatCurrency(comp.form_1040_out.spouse_irmaa_surcharge)}
+                          </span>
+                        </div>
+                      )}
+                  </div>
                 )}
-                {setup.filing_status === 'married_filing_jointly' &&
-                  setup.spouse_profile?.medicare.enrolled && (
-                    <div className="flex justify-between">
-                      <span>Spouse Enrolled (Base / IRMAA)</span>
-                      <span>
-                        {formatCurrency(comp.form_1040_out.spouse_medicare_base_annual)} / +
-                        {formatCurrency(comp.form_1040_out.spouse_irmaa_surcharge)}
-                      </span>
-                    </div>
-                  )}
               </div>
-            )}
-          </div>
+            );
+          })()}
         </div>
       </div>
     </div>
