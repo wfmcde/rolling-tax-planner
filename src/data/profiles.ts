@@ -10,6 +10,8 @@ import type {
   BalanceSheetProjectionInputs,
   CadenceForecasterState,
   CadenceTransactionRow,
+  EntityType,
+  NewProfileOptions,
   PlannerState,
   PnlBalanceSheetState,
   PnlLineAmounts,
@@ -383,7 +385,8 @@ export function isDefaultSeedSetup(setup?: SetupConfig | null): boolean {
   if (!setup) return false;
   if (
     setup.workspace_profile_kind === 'test_persona' ||
-    setup.workspace_profile_kind === 'blank'
+    setup.workspace_profile_kind === 'blank' ||
+    setup.workspace_profile_kind === 'custom'
   ) {
     return false;
   }
@@ -398,6 +401,108 @@ export function isDefaultSeedSetup(setup?: SetupConfig | null): boolean {
     (biz.length > 0 && biz === DEFAULT_PROFILE_SEED.business_name.toLowerCase()) ||
     (primary === seedPrimary && spouse === seedSpouse)
   );
+}
+
+/**
+ * Sanitizes a Pre-Populated Demo Baseline state so it inherits every user-provided
+ * field (entity/business name, website, EIN, taxpayer names, filing status, modules)
+ * and NEVER leaks DEFAULT_PROFILE_SEED branding into UI, CPA Print Package, ledger,
+ * or Shadow Tax Return Excel exports.
+ */
+export function sanitizeDemoBaselineState(
+  base: PlannerState,
+  options: NewProfileOptions,
+  cleanEntityName: string,
+  cleanEntityEin: string
+): PlannerState {
+  const isMfj = options.filing_status === 'married_filing_jointly';
+  const primaryName = options.primary_name.trim() || 'Primary';
+  const spouseName = isMfj ? options.spouse_name.trim() || 'Spouse' : '';
+  const cleanWebsite = (options.entity_website ?? '').trim();
+  const entityType: EntityType = options.modules.has_scorp
+    ? options.entity_type === 'none'
+      ? 'scorp_llc'
+      : options.entity_type
+    : options.entity_type === 'scorp_llc'
+    ? 'none'
+    : options.entity_type;
+
+  const sanitizedSetup: SetupConfig = {
+    ...base.setup,
+    workspace_profile_kind: 'custom',
+    filing_status: options.filing_status,
+    primary_name: primaryName,
+    spouse_name: spouseName,
+    business_name: options.modules.has_scorp ? cleanEntityName : options.entity_name.trim(),
+    business_website: cleanWebsite,
+    business_ein: cleanEntityEin,
+    has_scorp: options.modules.has_scorp,
+    has_ss_medicare: options.modules.has_ss_medicare,
+    has_dbp: options.modules.has_dbp,
+    multi_state_active: options.modules.multi_state_active,
+    has_stock_basis: options.modules.has_stock_basis,
+    entity_type: entityType,
+  };
+
+  const replaceIdentityText = (text: string): string => {
+    const spouseDisplay = spouseName || 'Spouse';
+    return text
+      .replace(/Operating Support Services,\s*LLC/gi, cleanEntityName || 'Demo Advisory Group, LLC')
+      .replace(/Operating Support Services\s+LLC/gi, cleanEntityName || 'Demo Advisory Group, LLC')
+      .replace(/ossadvisorygroup\.com/gi, cleanWebsite)
+      .replace(/83-1706286/g, cleanEntityEin)
+      .replace(/\bOSS\s+401K\s+Plan\s+Payable\b/gi, '401(k) Plan Payable')
+      .replace(/\bOSS\s+401\(k\)\s+Trust\b/gi, '401(k) Plan Trust')
+      .replace(/\bOSS\s+Payroll\b/gi, 'Company Payroll')
+      .replace(/\bBill\s*&\s*Debra\b/gi, isMfj ? `${primaryName} & ${spouseDisplay}` : primaryName)
+      .replace(/\bBill\b/g, primaryName)
+      .replace(/\bDebra\b/g, spouseDisplay);
+  };
+
+  const demoTransactions: CadenceTransactionRow[] = createDefaultSeedCadenceTransactions().map(
+    (tx, idx) => ({
+      ...tx,
+      id: `demo-${idx + 1}`,
+      vendor: replaceIdentityText(tx.vendor),
+      account: replaceIdentityText(tx.account),
+      split_account: replaceIdentityText(tx.split_account),
+      memo: replaceIdentityText(tx.memo),
+    })
+  );
+
+  const seedCadence = DEFAULT_PROFILE_SEED.default_cadence_2026;
+  const sanitizedCadence: CadenceForecasterState = {
+    projection_year: seedCadence.projection_year,
+    source_label: 'Pre-Populated Demo Transaction Ledger (1/1/2026–11/21/2026)',
+    ledger_format: 'transaction_list',
+    as_of_date: seedCadence.as_of_date,
+    grouping_mode: 'category',
+    exp_smooth_alpha: base.cadence_forecaster?.exp_smooth_alpha ?? 0.35,
+    exp_smooth_day_fraction: false,
+    payee_aliases: [],
+    transactions: demoTransactions,
+    stream_overrides: {},
+    pnl_line_overrides: {},
+    balance_sheet: {
+      ...seedCadence.balance_sheet,
+      pension_payable_ye: DEFAULT_PROFILE_SEED.default_pension_payable_ye,
+      beginning_stock_basis_override: null,
+    },
+  };
+
+  return {
+    ...base,
+    setup: sanitizedSetup,
+    years: base.years.map((yr) => ({
+      ...yr,
+      scorp_1120s: {
+        ...yr.scorp_1120s,
+        entity_name: cleanEntityName,
+        entity_ein: cleanEntityEin,
+      },
+    })),
+    cadence_forecaster: sanitizedCadence,
+  };
 }
 
 export const DEFAULT_PROFILE_META = {

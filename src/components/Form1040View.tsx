@@ -614,6 +614,34 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
               )}
             </div>
           </div>
+
+          <div className="pt-4 border-t border-slate-200 space-y-4">
+            <h3 className="text-sm font-semibold text-slate-900">
+              Federal Tax Withholding &amp; Estimated Payments
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <NumericField
+                label="Federal W-2 / 1099 Tax Withholding"
+                fieldCode="federal_tax_withholding"
+                prefix="$"
+                step={500}
+                value={yr.form_1040.federal_tax_withholding ?? 0}
+                disabled={isLocked}
+                onChange={(v) => update1040({ federal_tax_withholding: v })}
+                helperText="Form 1040 Line 25d — synced to Shadow Tax Return (Inputs!D65)"
+              />
+              <NumericField
+                label="Federal 1040-ES Estimated Tax Payments"
+                fieldCode="federal_estimated_tax_payments"
+                prefix="$"
+                step={500}
+                value={yr.form_1040.federal_estimated_tax_payments ?? 0}
+                disabled={isLocked}
+                onChange={(v) => update1040({ federal_estimated_tax_payments: v })}
+                helperText="Form 1040 Line 26 — synced to Shadow Tax Return (Inputs!D66)"
+              />
+            </div>
+          </div>
         </div>
 
         {/* Right: Deterministic Form 1040 Output Summary */}

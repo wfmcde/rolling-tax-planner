@@ -27,6 +27,7 @@ import {
   TEST_PERSONA_META,
   createBlankUserPlannerState,
   createTestPersonaPlannerState,
+  sanitizeDemoBaselineState,
 } from '../data/profiles';
 
 /** Dedicated isolated storage key for the user's real "My Profile" workspace (never overwritten by test modes) */
@@ -333,7 +334,7 @@ export function createBlankProfilePlannerState(options: NewProfileOptions): Plan
     primary_profile: createCleanPersonProfile(),
     spouse_profile: createCleanPersonProfile(),
     business_name: options.entity_name.trim(),
-    business_website: '',
+    business_website: (options.entity_website ?? '').trim(),
     business_ein: options.entity_ein.trim(),
     home_state: '',
     secondary_state: '',
@@ -407,33 +408,7 @@ export function createProfileRecord(options: NewProfileOptions): TaxProfileRecor
   let state: PlannerState;
   if (options.template === 'sample_oss') {
     const base = createInitialBaselineState();
-    base.cadence_forecaster = createInitialCadenceForecasterState(0, [], base.setup);
-    state = {
-      ...base,
-      setup: {
-        ...base.setup,
-        filing_status: options.filing_status,
-        primary_name: options.primary_name.trim() || base.setup.primary_name,
-        spouse_name:
-          options.filing_status === 'married_filing_jointly'
-            ? options.spouse_name.trim() || base.setup.spouse_name
-            : '',
-        has_scorp: options.modules.has_scorp,
-        has_ss_medicare: options.modules.has_ss_medicare,
-        has_dbp: options.modules.has_dbp,
-        multi_state_active: options.modules.multi_state_active,
-        has_stock_basis: options.modules.has_stock_basis,
-        entity_type: options.modules.has_scorp ? 'scorp_llc' : 'none',
-      },
-      years: base.years.map((yr) => ({
-        ...yr,
-        scorp_1120s: {
-          ...yr.scorp_1120s,
-          entity_name: cleanEntityName || yr.scorp_1120s.entity_name,
-          entity_ein: cleanEntityEin || yr.scorp_1120s.entity_ein,
-        },
-      })),
-    };
+    state = sanitizeDemoBaselineState(base, options, cleanEntityName, cleanEntityEin);
   } else {
     state = createBlankProfilePlannerState({
       ...options,

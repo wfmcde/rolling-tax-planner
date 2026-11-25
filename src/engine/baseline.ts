@@ -316,10 +316,19 @@ export function projectNextYear(
       schedule_1_adjustments_input: 0,
       schedule_k1_ordinary_income: prior.form_1040.schedule_k1_ordinary_income,
       schedule_k1_other_items: prior.form_1040.schedule_k1_other_items,
-      ira_distributions_gross: prior.form_1040.ira_distributions_gross,
-      ira_distributions_taxable: prior.form_1040.ira_distributions_taxable,
-      pensions_and_annuities_gross: prior.form_1040.pensions_and_annuities_gross,
-      pensions_and_annuities_taxable: prior.form_1040.pensions_and_annuities_taxable,
+      // Do not carry forward locked actuals one-time 1099-R IRA/pension distributions into future forecast years
+      ira_distributions_gross: prior.is_locked_actuals
+        ? 0
+        : prior.form_1040.ira_distributions_gross,
+      ira_distributions_taxable: prior.is_locked_actuals
+        ? 0
+        : prior.form_1040.ira_distributions_taxable,
+      pensions_and_annuities_gross: prior.is_locked_actuals
+        ? 0
+        : prior.form_1040.pensions_and_annuities_gross,
+      pensions_and_annuities_taxable: prior.is_locked_actuals
+        ? 0
+        : prior.form_1040.pensions_and_annuities_taxable,
       social_security_gross: 0,
       health_insurance_premiums:
         nextTaxYear <= setup.current_tax_year
@@ -329,6 +338,8 @@ export function projectNextYear(
         prior.form_1040.itemized_deductions_input * (1 + inflation_rate)
       ),
       deduction_method: setup.deduction_method,
+      federal_tax_withholding: 0,
+      federal_estimated_tax_payments: 0,
     },
     scorp_1120s: {
       entity_id: prior.scorp_1120s.entity_id,
@@ -850,9 +861,30 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
   const rawFirstYear = raw.years[0];
   const rawEntityName = rawFirstYear?.scorp_1120s.entity_name?.trim() || '';
   const rawEntityEin = rawFirstYear?.scorp_1120s.entity_ein?.trim() || '';
+  const isExplicitNonDefaultKind =
+    raw.setup.workspace_profile_kind === 'custom' ||
+    raw.setup.workspace_profile_kind === 'test_persona' ||
+    raw.setup.workspace_profile_kind === 'blank';
   const isDefaultSeedEntityEarly =
-    rawEntityEin === DEFAULT_PROFILE_SEED.business_ein ||
-    rawEntityName.toLowerCase() === DEFAULT_PROFILE_SEED.business_name.toLowerCase();
+    !isExplicitNonDefaultKind &&
+    (rawEntityEin === DEFAULT_PROFILE_SEED.business_ein ||
+      rawEntityName.toLowerCase() === DEFAULT_PROFILE_SEED.business_name.toLowerCase());
+
+  // Detect legacy saved profiles where 2025 one-time 1099-R IRA/pension values were carried verbatim into every unlocked forecast year
+  const filed2025Seed = DEFAULT_PROFILE_SEED.shadow_return_seed.filed_2025;
+  const unlockedForecastYears = raw.years.filter((y) => !y.is_locked_actuals && y.tax_year >= 2026);
+  const hasStaleCarried1099R =
+    unlockedForecastYears.length > 0 &&
+    rawFirstYear?.is_locked_actuals &&
+    rawFirstYear.tax_year === 2025 &&
+    Math.round(rawFirstYear.form_1040.ira_distributions_taxable) === filed2025Seed.ira_taxable &&
+    Math.round(rawFirstYear.form_1040.pensions_and_annuities_taxable) ===
+      filed2025Seed.pensions_taxable &&
+    unlockedForecastYears.every(
+      (y) =>
+        Math.round(y.form_1040.ira_distributions_taxable) === filed2025Seed.ira_taxable &&
+        Math.round(y.form_1040.pensions_and_annuities_taxable) === filed2025Seed.pensions_taxable
+    );
 
   let migratedLegacy2025Ss = false;
   let migratedLegacy2026OpEx = false;
@@ -969,6 +1001,16 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
       };
     }
 
+    if (hasStaleCarried1099R && !yr.is_locked_actuals && yr.tax_year >= 2026) {
+      migratedForm1040 = {
+        ...migratedForm1040,
+        ira_distributions_gross: 0,
+        ira_distributions_taxable: 0,
+        pensions_and_annuities_gross: 0,
+        pensions_and_annuities_taxable: 0,
+      };
+    }
+
     return {
       ...yr,
       form_1040: migratedForm1040,
@@ -1012,8 +1054,9 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
   const inferredEntityName = firstYear?.scorp_1120s.entity_name?.trim() || '';
   const inferredEntityEin = firstYear?.scorp_1120s.entity_ein?.trim() || '';
   const isDefaultSeedEntity =
-    inferredEntityEin === DEFAULT_PROFILE_SEED.business_ein ||
-    inferredEntityName.toLowerCase() === DEFAULT_PROFILE_SEED.business_name.toLowerCase();
+    !isExplicitNonDefaultKind &&
+    (inferredEntityEin === DEFAULT_PROFILE_SEED.business_ein ||
+      inferredEntityName.toLowerCase() === DEFAULT_PROFILE_SEED.business_name.toLowerCase());
 
   const businessName =
     typeof raw.setup.business_name === 'string'

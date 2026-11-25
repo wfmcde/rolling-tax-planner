@@ -161,6 +161,7 @@ interface EvaluatedYear {
   combEndBasis: number;
   combExcessGain: number;
   azSalesRatio: number;
+  azApportionmentFactor: number;
   azApportionedIncome: number;
   az120sMin: number;
   az120sTotal: number;
@@ -489,6 +490,8 @@ function extractYearInputs(
   const grossReceipts = setup.has_scorp ? r0(scIn.gross_receipts_revenue) : 0;
   const caFiling = comp.state_filings_out.find((s) => s.state_code === 'CA');
   const azFiling = comp.state_filings_out.find((s) => s.state_code === 'AZ');
+  const caFilingRaw = rec.state_filings.find((s) => s.state_code === 'CA');
+  const azFilingRaw = rec.state_filings.find((s) => s.state_code === 'AZ');
 
   // Apportioned CA & AZ revenue
   let caRevenue = 0;
@@ -606,6 +609,40 @@ function extractYearInputs(
       : caFiling.state_apportionment_factor
     : 0;
 
+  // Stop stale 2025 one-time 1099-R carryover ($12,935 IRA / $250 pension) into 2026+:
+  // Populate D57 & D58 strictly from the selected year's actual app state ($0 if none entered).
+  const rawIraTaxable = r0(rec.form_1040.ira_distributions_taxable ?? f1040In.ira_distributions_taxable ?? 0);
+  const rawPensionsTaxable = r0(
+    rec.form_1040.pensions_and_annuities_taxable ?? f1040In.pensions_and_annuities_taxable ?? 0
+  );
+  const isStale2025OneTime1099R =
+    !isBaseCol &&
+    rec.tax_year >= 2026 &&
+    !rec.is_locked_actuals &&
+    rawIraTaxable === seed.filed_2025.ira_taxable &&
+    rawPensionsTaxable === seed.filed_2025.pensions_taxable;
+
+  const iraTaxable = isStale2025OneTime1099R ? 0 : rawIraTaxable;
+  const pensionsTaxable = isStale2025OneTime1099R ? 0 : rawPensionsTaxable;
+
+  // Wire Federal, CA, and AZ withholding & estimated tax payments strictly from live app state
+  const fedWithholding = r0(
+    rec.form_1040.federal_tax_withholding ?? f1040In.federal_tax_withholding ?? 0
+  );
+  const fedEstimates = r0(
+    rec.form_1040.federal_estimated_tax_payments ?? f1040In.federal_estimated_tax_payments ?? 0
+  );
+  const caWithholdingEst = r0(
+    caFilingRaw?.state_tax_withholding_and_estimates ??
+      caFiling?.state_tax_withholding_and_estimates ??
+      0
+  );
+  const azWithholdingEst = r0(
+    azFilingRaw?.state_tax_withholding_and_estimates ??
+      azFiling?.state_tax_withholding_and_estimates ??
+      0
+  );
+
   return {
     year: rec.tax_year,
     primaryOwnershipPct,
@@ -650,19 +687,19 @@ function extractYearInputs(
     taxExemptInterest: r0(f1040In.tax_exempt_interest),
     ordinaryDividends: r0(f1040In.ordinary_dividends),
     qualifiedDividends: r0(f1040In.qualified_dividends),
-    iraTaxable: r0(f1040In.ira_distributions_taxable),
-    pensionsTaxable: r0(f1040In.pensions_and_annuities_taxable),
+    iraTaxable,
+    pensionsTaxable,
     ssGross: r0(f1040Out.social_security_gross_effective),
     brokerageCapGain,
     otherSch1Adj: r0(f1040In.schedule_1_adjustments_input ?? 0),
     itemizedDeductions: f1040In.deduction_method === 'itemized' ? r0(f1040In.itemized_deductions_input) : 0,
     seniors65PlusCount,
     ssTaxable: r0(f1040Out.social_security_taxable),
-    fedWithholding: 0,
-    fedEstimates: 0,
+    fedWithholding,
+    fedEstimates,
     caResidencyFactor,
-    caWithholdingEst: r0(caFiling?.state_tax_withholding_and_estimates ?? 0),
-    azWithholdingEst: r0(azFiling?.state_tax_withholding_and_estimates ?? 0),
+    caWithholdingEst,
+    azWithholdingEst,
   };
 }
 
@@ -697,8 +734,10 @@ function evaluateYear(inp: YearInputColumn, tbl: YearTaxTableParams): EvaluatedY
   const prePteObi = grossReceipts - prePteDed;
   const caSalesRatio = grossReceipts > 0 ? inp.caRevenue / grossReceipts : 0;
   const azSalesRatio = grossReceipts > 0 ? inp.azRevenue / grossReceipts : 0;
+  // Arizona standard double-weighted sales formula assuming 100% AZ payroll factor: (1 + 2 * AZ_Sales_Ratio) / 3
+  const azApportionmentFactor = (1 + 2 * azSalesRatio) / 3;
   const caPteAmt = inp.caPteActive === 1 ? r0(Math.max(0, prePteObi * caSalesRatio) * tbl.caPteRate) : 0;
-  const azPteAmt = inp.azPteActive === 1 ? r0(Math.max(0, prePteObi * azSalesRatio) * tbl.azPteRate) : 0;
+  const azPteAmt = inp.azPteActive === 1 ? r0(Math.max(0, prePteObi * azApportionmentFactor) * tbl.azPteRate) : 0;
   const line12Taxes = inp.payrollTaxes + inp.caEntityStateTax + caPteAmt + azPteAmt;
   const totalDeductions = prePteDed + caPteAmt + azPteAmt;
   const obi = grossReceipts - totalDeductions;
@@ -741,7 +780,7 @@ function evaluateYear(inp: YearInputColumn, tbl: YearTaxTableParams): EvaluatedY
   const combExcessGain = pExcessGain + sExcessGain;
 
   // AZ 120S & CA 100S
-  const azApportionedIncome = r0(obi * azSalesRatio);
+  const azApportionedIncome = r0(obi * azApportionmentFactor);
   const az120sMin = inp.azRevenue > 0 ? tbl.az120sMinTax : 0;
   const az120sTotal = az120sMin + azPteAmt;
 
@@ -887,6 +926,7 @@ function evaluateYear(inp: YearInputColumn, tbl: YearTaxTableParams): EvaluatedY
     combEndBasis,
     combExcessGain,
     azSalesRatio,
+    azApportionmentFactor,
     azApportionedIncome,
     az120sMin,
     az120sTotal,
@@ -1423,8 +1463,8 @@ export async function buildShadowTaxReturnWorkbook(
     31,
     'B17',
     'AZ PTE Election Amount (2.98% AZ Net Income; $0 if OFF)',
-    f(`IF(C30=1,ROUND(MAX(0,(C11-SUM(C15:C24))*IF(C11>0,C9/C11,0))*'Tax Tables'!C27,0),0)`, baseEval.azPteAmt),
-    f(`IF(D30=1,ROUND(MAX(0,(D11-SUM(D15:D24))*IF(D11>0,D9/D11,0))*'Tax Tables'!D27,0),0)`, projEval.azPteAmt),
+    f(`IF(C30=1,ROUND(MAX(0,(C11-SUM(C15:C24))*'AZ 120S & CA 100S'!C9)*'Tax Tables'!C27,0),0)`, baseEval.azPteAmt),
+    f(`IF(D30=1,ROUND(MAX(0,(D11-SUM(D15:D24))*'AZ 120S & CA 100S'!D9)*'Tax Tables'!D27,0),0)`, projEval.azPteAmt),
     '$',
     'Flows to 1120-S Line 12, AZ 120S & AZ 140NR PTE credit',
     { bold: true }
@@ -1626,7 +1666,7 @@ export async function buildShadowTaxReturnWorkbook(
   setDataRow(wsStateBiz, 6, '120S-A1', 'Arizona-Sourced Gross Receipts', f('Inputs!C9', baseInp.azRevenue), f('Inputs!D9', projInp.azRevenue), f('D6-C6', projInp.azRevenue - baseInp.azRevenue), 'AZ market-sourced service sales');
   setDataRow(wsStateBiz, 7, '120S-A2', 'Everywhere Total Gross Receipts', f('Inputs!C11', baseEval.grossReceipts), f('Inputs!D11', projEval.grossReceipts), f('D7-C7', projEval.grossReceipts - baseEval.grossReceipts), 'Denominator for AZ sales factor', { zebra: true });
   setDataRow(wsStateBiz, 8, '120S-A3', 'AZ Sales Ratio (AZ Sales / Total Sales)', f('IF(C7>0,C6/C7,0)', baseEval.azSalesRatio), f('IF(D7>0,D6/D7,0)', projEval.azSalesRatio), f('D8-C8', projEval.azSalesRatio - baseEval.azSalesRatio), 'Sales factor numerator/denominator', { numFmt: FMT.percent2 });
-  setDataRow(wsStateBiz, 9, '120S-A4', 'AZ Apportionment Factor (Double-Weighted / Enhanced Sales)', f('C8', baseEval.azSalesRatio), f('D8', projEval.azSalesRatio), f('D9-C9', projEval.azSalesRatio - baseEval.azSalesRatio), 'Enhanced 100% sales election for service entities', { numFmt: FMT.percent2, zebra: true });
+  setDataRow(wsStateBiz, 9, '120S-A4', 'AZ Apportionment Factor (Double-Weighted Sales)', f('(1+2*C8)/3', baseEval.azApportionmentFactor), f('(1+2*D8)/3', projEval.azApportionmentFactor), f('D9-C9', projEval.azApportionmentFactor - baseEval.azApportionmentFactor), 'Standard AZ double-weighted sales: (100% AZ payroll + 2 × AZ sales) / 3', { numFmt: FMT.percent2, zebra: true });
   setDataRow(wsStateBiz, 10, '120S-L1', 'Federal Form 1120-S Ordinary Business Income', f(`'1120-S (Fed S-Corp)'!C20`, baseEval.obi), f(`'1120-S (Fed S-Corp)'!D20`, projEval.obi), f('D10-C10', projEval.obi - baseEval.obi), 'Starting point from Fed 1120-S Line 22');
   setDataRow(wsStateBiz, 11, '120S-L10', 'Arizona-Apportioned S-Corp Net Income (To AZ 140NR)', f('ROUND(C10*C9,0)', baseEval.azApportionedIncome), f('ROUND(D10*D9,0)', projEval.azApportionedIncome), f('D11-C11', projEval.azApportionedIncome - baseEval.azApportionedIncome), 'Flows to AZ Form 140NR Line AZ-2', { bold: true, zebra: true });
   setDataRow(wsStateBiz, 12, '120S-L16', 'Arizona Form 120S Minimum Corporate Tax', f(`IF(C6>0,'Tax Tables'!C28,0)`, baseEval.az120sMin), f(`IF(D6>0,'Tax Tables'!D28,0)`, projEval.az120sMin), f('D12-C12', projEval.az120sMin - baseEval.az120sMin), '$50 minimum if AZ-sourced activity');

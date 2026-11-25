@@ -95,6 +95,7 @@ export const ProfilesManagerModal: React.FC<ProfilesManagerModalProps> = ({
   const [newEntityType, setNewEntityType] = useState<EntityType>('none');
   const [newEntityName, setNewEntityName] = useState('');
   const [newEntityEin, setNewEntityEin] = useState('');
+  const [newEntityWebsite, setNewEntityWebsite] = useState('');
   const [newNotes, setNewNotes] = useState('');
   const [newTemplate, setNewTemplate] = useState<'blank' | 'sample_oss'>('blank');
   const [newModules, setNewModules] = useState<ProfileModuleFlags>({ ...DEFAULT_MODULES });
@@ -205,6 +206,7 @@ export const ProfilesManagerModal: React.FC<ProfilesManagerModalProps> = ({
         : newEntityType,
       entity_name: newEntityName.trim() || resolvedName,
       entity_ein: newEntityEin.trim(),
+      entity_website: newEntityWebsite.trim(),
       notes: newNotes.trim(),
       template: newTemplate,
       modules: newModules,
@@ -801,7 +803,7 @@ export const ProfilesManagerModal: React.FC<ProfilesManagerModalProps> = ({
                       </label>
 
                       {mod.key === 'has_scorp' && checked && (
-                        <div className="mt-3 pt-3 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="mt-3 pt-3 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-3 gap-3">
                           <div>
                             <label className="block text-[11px] font-medium text-slate-700 mb-1">
                               Business / S-Corp Entity Name
@@ -824,6 +826,18 @@ export const ProfilesManagerModal: React.FC<ProfilesManagerModalProps> = ({
                               onChange={(e) => setNewEntityEin(e.target.value)}
                               placeholder="XX-XXXXXXX"
                               className="w-full px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-md bg-white text-slate-900 focus:border-teal-700 focus:outline-none"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                              Business Website (Optional)
+                            </label>
+                            <input
+                              type="text"
+                              value={newEntityWebsite}
+                              onChange={(e) => setNewEntityWebsite(e.target.value)}
+                              placeholder="e.g., apexadvisory.com"
+                              className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white text-slate-900 focus:border-teal-700 focus:outline-none"
                             />
                           </div>
                         </div>

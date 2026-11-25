@@ -163,6 +163,10 @@ export interface Form1040Inputs {
   sehi_medicare_override?: number | null;
   itemized_deductions_input: number;
   deduction_method: DeductionMethod;
+  /** Federal W-2 / 1099 income tax withholding (Form 1040 Line 25d) */
+  federal_tax_withholding?: number;
+  /** Federal Form 1040-ES estimated tax payments (Form 1040 Line 26) */
+  federal_estimated_tax_payments?: number;
   /** Optional filed-return override strictly for Year 1 locked actuals reconciliation */
   locked_taxable_income_override?: number;
   locked_federal_tax_override?: number;
@@ -729,6 +733,7 @@ export interface NewProfileOptions {
   entity_type: EntityType;
   entity_name: string;
   entity_ein: string;
+  entity_website?: string;
   notes?: string;
   template: 'blank' | 'sample_oss';
   modules: ProfileModuleFlags;
