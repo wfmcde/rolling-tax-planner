@@ -97,6 +97,8 @@ interface TransactionCadenceViewProps {
     computed: ComputedPnlBalanceSheet
   ) => PushToHorizonImpact | void;
   onNavigate: (tab: WorkspaceTab) => void;
+  onExportShadowReturn?: () => void;
+  exportingShadowReturn?: boolean;
 }
 
 type PnlEditColumn = 'ytd' | 'remaining' | 'projected';
@@ -210,6 +212,8 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   onUpdatePlanningGoals,
   onPushTo2026Schedule,
   onNavigate,
+  onExportShadowReturn,
+  exportingShadowReturn,
 }) => {
   const [activeEdit, setActiveEdit] = useState<ActiveInlineEdit | null>(null);
   const [showImportPanel, setShowImportPanel] = useState(cadenceState.transactions.length === 0);
@@ -3466,6 +3470,8 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           issues={issues}
           guardrailAcknowledgments={guardrailAcknowledgments}
           onDownloadCsv={handleDownloadCsv}
+          onExportShadowReturn={onExportShadowReturn}
+          exportingShadowReturn={exportingShadowReturn}
           onClose={() => setShowPrintModal(false)}
         />
       )}

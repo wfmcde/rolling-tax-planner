@@ -851,7 +851,7 @@ export const SetupView: React.FC<SetupViewProps> = ({
               {
                 key: 'has_scorp' as const,
                 title: 'S-Corp / Business Cadence & P&L (Form 1120-S / Ledger Forecaster)',
-                desc: 'Activates P&L & Balance Sheet, Transaction Cadence Forecaster, Form 1120-S, K-1 pass-through, and officer W-2 vs. distributions.',
+                desc: 'Activates Transaction Cadence Forecast, Form 1120-S (including Schedule L & M-2), K-1 pass-through, and officer W-2 vs. distributions.',
               },
               {
                 key: 'has_ss_medicare' as const,

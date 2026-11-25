@@ -688,7 +688,6 @@ export interface PlannerState {
 export type WorkspaceTab =
   | 'horizon'
   | 'setup'
-  | 'pnl_bs'
   | 'cadence_forecaster'
   | 'form1040'
   | 'scorp'

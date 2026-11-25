@@ -1,6 +1,12 @@
 import React from 'react';
 import { Lock } from 'lucide-react';
-import type { ComputedTaxYear, SetupConfig, TaxYearRecord } from '../types/tax';
+import type {
+  BalanceSheetProjectionInputs,
+  ComputedTaxYear,
+  PnlBalanceSheetState,
+  SetupConfig,
+  TaxYearRecord,
+} from '../types/tax';
 import { getPersonNames } from '../engine/scheduleCatalog';
 import { getSetupStates } from '../utils/setupHelpers';
 import { formatCurrency, formatPercent } from '../utils/format';
@@ -13,6 +19,8 @@ interface SCorpViewProps {
   selectedYear: number;
   onSelectYear: (year: number) => void;
   onUpdateYear: (taxYear: number, updater: (yr: TaxYearRecord) => TaxYearRecord) => void;
+  pnlState?: PnlBalanceSheetState;
+  onUpdatePnlState?: (updater: (prev: PnlBalanceSheetState) => PnlBalanceSheetState) => void;
 }
 
 export const SCorpView: React.FC<SCorpViewProps> = ({
@@ -22,6 +30,8 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
   selectedYear,
   onSelectYear,
   onUpdateYear,
+  pnlState,
+  onUpdatePnlState,
 }) => {
   const yr = years.find((y) => y.tax_year === selectedYear) ?? years[0];
   const comp = computed.find((c) => c.tax_year === yr.tax_year) ?? computed[0];
@@ -49,6 +59,23 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
       },
     }));
   };
+
+  const updateBalanceSheet = (patch: Partial<BalanceSheetProjectionInputs>) => {
+    if (!onUpdatePnlState || isLocked) return;
+    onUpdatePnlState((prev) => ({
+      ...prev,
+      balance_sheet: {
+        ...prev.balance_sheet,
+        ...patch,
+      },
+    }));
+  };
+
+  const bs = pnlState?.balance_sheet;
+  const effectiveEndCash = bs
+    ? bs.operating_cash_ye_override ?? bs.operating_cash_ytd ?? bs.operating_cash_beg
+    : 0;
+  const scheduleLMatchesYear = Boolean(pnlState && pnlState.projection_year === yr.tax_year);
 
   const updateSourcingPercent = (index: number, pct: number) => {
     if (isLocked) return;
@@ -354,15 +381,134 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
                   : 'Carried forward automatically from prior year ending basis'
               }
             />
-            <NumericField
-              label="Beginning AAA Balance"
-              fieldCode="aaa_balance_beginning"
-              prefix="$"
-              step={5000}
-              value={comp.scorp_in.aaa_balance_beginning}
-              disabled={isLocked || yr.tax_year !== years[0].tax_year}
-              onChange={(v) => updateScorp({ aaa_balance_beginning: v })}
-            />
+          </div>
+
+          <div className="pt-4 border-t border-slate-200 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-semibold text-slate-900">
+                  Schedule L &amp; M-2 — Balance Sheet, AAA &amp; Separately Stated Items
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  Schedule M-1 / M-2 inputs for {yr.tax_year} and Schedule L Balance Sheet balances
+                  {pnlState ? ` (${pnlState.projection_year} projection)` : ''} synced to Form 1120-S &amp; Shadow Tax Return (.xlsx).
+                </p>
+              </div>
+              {pnlState && !scheduleLMatchesYear && !isLocked && (
+                <span className="text-[11px] font-mono text-amber-700 whitespace-nowrap">
+                  Sch L applies to {pnlState.projection_year}
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <NumericField
+                label="Beginning AAA Balance (Schedule M-2)"
+                fieldCode="aaa_balance_beginning"
+                prefix="$"
+                step={5000}
+                value={comp.scorp_in.aaa_balance_beginning}
+                disabled={isLocked || yr.tax_year !== years[0].tax_year}
+                onChange={(v) => updateScorp({ aaa_balance_beginning: v })}
+                helperText={
+                  yr.tax_year === years[0].tax_year
+                    ? 'Year 1 starting Accumulated Adjustments Account'
+                    : 'Carried forward automatically from prior year ending AAA'
+                }
+              />
+              <NumericField
+                label="Schedule K Interest Income (Box 4)"
+                fieldCode="schedule_k_interest_income"
+                prefix="$"
+                step={100}
+                value={yr.scorp_1120s.schedule_k_interest_income ?? 0}
+                disabled={isLocked}
+                onChange={(v) => updateScorp({ schedule_k_interest_income: Math.max(0, v) })}
+                helperText="Separately stated S-Corp portfolio interest; adds to Form 7203 basis"
+              />
+              <NumericField
+                label="50% Nondeductible Meals / Sch M-1 (Box 16c)"
+                fieldCode="schedule_k_nondeductible_expenses"
+                prefix="$"
+                step={250}
+                value={yr.scorp_1120s.schedule_k_nondeductible_expenses ?? 0}
+                disabled={isLocked}
+                onChange={(v) => updateScorp({ schedule_k_nondeductible_expenses: Math.max(0, v) })}
+                helperText="Schedule M-1 nondeductible expenses reducing AAA & stock basis"
+              />
+            </div>
+
+            {pnlState && bs && onUpdatePnlState && (
+              <div className="pt-3 border-t border-slate-100 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                    Schedule L Balance Sheet ({pnlState.projection_year} Projection)
+                  </div>
+                  {isLocked && (
+                    <span className="text-[11px] text-slate-400">
+                      Select {pnlState.projection_year} to edit Schedule L balances
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <NumericField
+                    label="Beginning Operating Cash (Sch L Line 1a)"
+                    fieldCode="operating_cash_beg"
+                    prefix="$"
+                    step={1000}
+                    value={bs.operating_cash_beg}
+                    disabled={isLocked}
+                    onChange={(v) => updateBalanceSheet({ operating_cash_beg: v })}
+                    helperText="Cash & operating checking balance as of Jan 1"
+                  />
+                  <div className="space-y-1">
+                    <NumericField
+                      label="End-of-Year Operating Cash (Sch L Line 1d)"
+                      fieldCode="operating_cash_ye"
+                      prefix="$"
+                      step={1000}
+                      value={effectiveEndCash}
+                      disabled={isLocked}
+                      onChange={(v) => updateBalanceSheet({ operating_cash_ye_override: v })}
+                      helperText={
+                        bs.operating_cash_ye_override !== null
+                          ? 'Manual year-end override active (feeds Shadow Return Inputs!D36)'
+                          : `Using current YTD cash (${formatCurrency(bs.operating_cash_ytd)})`
+                      }
+                    />
+                    {!isLocked && bs.operating_cash_ye_override !== null && (
+                      <button
+                        type="button"
+                        onClick={() => updateBalanceSheet({ operating_cash_ye_override: null })}
+                        className="text-[11px] font-medium text-teal-800 hover:text-teal-950 hover:underline"
+                      >
+                        Reset EOY Cash to YTD balance ({formatCurrency(bs.operating_cash_ytd)})
+                      </button>
+                    )}
+                  </div>
+                  <NumericField
+                    label="Accounts Payable & Credit Cards EOY (Sch L Line 16)"
+                    fieldCode="cc_ap_ye"
+                    prefix="$"
+                    step={500}
+                    value={bs.cc_ap_ye}
+                    disabled={isLocked}
+                    onChange={(v) => updateBalanceSheet({ cc_ap_ye: Math.max(0, v) })}
+                    helperText="Year-end business credit card & AP balances"
+                  />
+                  <NumericField
+                    label="Accrued Pension Payable EOY (Sch L Line 18)"
+                    fieldCode="pension_payable_ye"
+                    prefix="$"
+                    step={1000}
+                    value={bs.pension_payable_ye}
+                    disabled={isLocked}
+                    onChange={(v) => updateBalanceSheet({ pension_payable_ye: Math.max(0, v) })}
+                    helperText="Accrued DBP / 401(k) liability at 12/31 ($0 under cash-basis / §404(a)(6))"
+                  />
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="pt-4 border-t border-slate-200 space-y-3">
@@ -513,6 +659,20 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
                 val: formatCurrency(comp.scorp_out.excess_distribution_capital_gain),
                 warn: comp.scorp_out.excess_distribution_capital_gain > 0,
               },
+              ...(scheduleLMatchesYear && bs
+                ? [
+                    {
+                      label: 'Schedule L End-of-Year Cash',
+                      code: 'operating_cash_ye',
+                      val: formatCurrency(effectiveEndCash),
+                    },
+                    {
+                      label: 'Schedule L Short-Term Payables (AP + Pension)',
+                      code: 'cc_ap_ye + pension_payable_ye',
+                      val: formatCurrency(bs.cc_ap_ye + bs.pension_payable_ye),
+                    },
+                  ]
+                : []),
             ].map((row) => (
               <div key={row.code} className="py-2.5 flex items-center justify-between gap-3">
                 <div>

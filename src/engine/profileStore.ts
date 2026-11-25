@@ -51,7 +51,7 @@ export const OPTIONAL_PROFILE_MODULES: OptionalModuleDefinition[] = [
     title: 'S-Corp / Business Cadence & P&L (Form 1120-S / Ledger Forecaster)',
     shortLabel: 'S-Corp / P&L',
     description:
-      'Activates P&L & Balance Sheet, Transaction Cadence Forecaster, Form 1120-S, K-1 pass-through, and officer W-2 vs. distributions.',
+      'Activates Transaction Cadence Forecast, Form 1120-S (including Schedule L & M-2), K-1 pass-through, and officer W-2 vs. distributions.',
   },
   {
     key: 'has_ss_medicare',

@@ -12,7 +12,6 @@ import {
   MapPin,
   Menu,
   RotateCcw,
-  Scale,
   SlidersHorizontal,
   Upload,
   X,
@@ -84,7 +83,6 @@ import {
 } from './utils/setupHelpers';
 import { HorizonView } from './components/HorizonView';
 import { SetupView } from './components/SetupView';
-import { PnlBalanceSheetView } from './components/PnlBalanceSheetView';
 import { TransactionCadenceView } from './components/TransactionCadenceView';
 import { Form1040View } from './components/Form1040View';
 import { SCorpView } from './components/SCorpView';
@@ -99,13 +97,12 @@ import { ProfilesManagerModal } from './components/ProfilesManagerModal';
 import { exportShadowTaxReturnXlsx } from './utils/shadowReturnExport';
 
 const TAB_LABELS: Record<WorkspaceTab, string> = {
+  setup: 'Setup & Profile',
   horizon: 'Six-Year Horizon',
-  setup: 'Setup & Decision Tree',
-  pnl_bs: 'P&L & Balance Sheet',
-  cadence_forecaster: 'Transaction Cadence Forecaster',
+  dbp: 'DBP & Retirement',
+  cadence_forecaster: 'Transaction Cadence Forecast',
   form1040: 'Form 1040 Return',
   scorp: 'S-Corp (1120-S)',
-  dbp: 'DBP & Retirement',
   multistate: 'Multi-State & PTE',
   forms: 'IRS Forms Map',
   scenarios: 'Scenarios & AI',
@@ -620,23 +617,41 @@ export function App() {
           computed[0]?.scorp_out.stock_basis_ending ?? 0,
           prev.setup
         );
-      return {
-        ...prev,
-        pnl_balance_sheet: updater(base),
-      };
-    });
-  };
+      const nextPnl = updater(base);
 
-  const handleResetPnlFrom2026Schedule = () => {
-    setState((prev) => {
-      const yr2026 = prev.years.find((y) => y.tax_year === 2026) ?? prev.years[1];
+      // Keep matching cadence_forecaster balance sheet fields in sync when edited from 1120-S Schedule L
+      let nextCadence = prev.cadence_forecaster;
+      if (nextCadence && nextCadence.projection_year === nextPnl.projection_year) {
+        const bsPatch: Partial<CadenceForecasterState['balance_sheet']> = {};
+        const prevBs = base.balance_sheet;
+        const currBs = nextPnl.balance_sheet;
+        if (currBs.operating_cash_beg !== prevBs.operating_cash_beg) {
+          bsPatch.operating_cash_beg = currBs.operating_cash_beg;
+        }
+        if (currBs.operating_cash_ye_override !== prevBs.operating_cash_ye_override) {
+          bsPatch.operating_cash_ye_override = currBs.operating_cash_ye_override;
+        }
+        if (currBs.cc_ap_ye !== prevBs.cc_ap_ye) {
+          bsPatch.cc_ap_ye = currBs.cc_ap_ye;
+        }
+        if (currBs.pension_payable_ye !== prevBs.pension_payable_ye) {
+          bsPatch.pension_payable_ye = currBs.pension_payable_ye;
+        }
+        if (Object.keys(bsPatch).length > 0) {
+          nextCadence = {
+            ...nextCadence,
+            balance_sheet: {
+              ...nextCadence.balance_sheet,
+              ...bsPatch,
+            },
+          };
+        }
+      }
+
       return {
         ...prev,
-        pnl_balance_sheet: createInitialPnlBalanceSheetState(
-          yr2026,
-          computed[0]?.scorp_out.stock_basis_ending ?? 0,
-          prev.setup
-        ),
+        pnl_balance_sheet: nextPnl,
+        cadence_forecaster: nextCadence,
       };
     });
   };
@@ -869,29 +884,6 @@ export function App() {
     };
   };
 
-  const handlePushPnlTo2026Schedule = (
-    pnlSnapshot: PnlBalanceSheetState,
-    pnlComp: ComputedPnlBalanceSheet
-  ): PushToHorizonImpact => {
-    const targetYear = pnlSnapshot.projection_year || state.setup.current_tax_year || 2026;
-    const nextSetup = syncSetupSplitFromPnlPush(state.setup, pnlSnapshot, pnlComp);
-    const nextYears = applyProjected2026Years({ ...state, setup: nextSetup }, pnlSnapshot, pnlComp);
-    const impact = computePushImpact(state, nextSetup, nextYears, targetYear);
-    setState((prev) => {
-      const updatedSetup = syncSetupSplitFromPnlPush(prev.setup, pnlSnapshot, pnlComp);
-      return {
-        ...prev,
-        setup: updatedSetup,
-        years: applyProjected2026Years({ ...prev, setup: updatedSetup }, pnlSnapshot, pnlComp),
-        pnl_balance_sheet: {
-          ...pnlSnapshot,
-          last_pushed_at: new Date().toISOString(),
-        },
-      };
-    });
-    return impact;
-  };
-
   const handleSaveGuardrailAck = (ack: GuardrailAcknowledgment) => {
     setState((prev) => ({
       ...prev,
@@ -930,13 +922,18 @@ export function App() {
           prev.setup
         );
       const updatedSetup = syncSetupSplitFromPnlPush(prev.setup, pnlSnapshot, pnlComp);
+      const pushedAt = new Date().toISOString();
       return {
         ...prev,
         setup: updatedSetup,
         years: applyProjected2026Years({ ...prev, setup: updatedSetup }, pnlSnapshot, pnlComp),
+        pnl_balance_sheet: {
+          ...pnlSnapshot,
+          last_pushed_at: pushedAt,
+        },
         cadence_forecaster: {
           ...baseCadence,
-          last_pushed_at: new Date().toISOString(),
+          last_pushed_at: pushedAt,
         },
       };
     });
@@ -1090,55 +1087,84 @@ export function App() {
     setProfileStore((prev) => deleteProfileFromStore(prev, profileId));
   };
 
-  const navItems: {
-    id: WorkspaceTab;
-    label: string;
-    icon: React.FC<{ className?: string }>;
-    visible: boolean;
-    count?: number;
+  const navSections: {
+    title: string;
+    items: {
+      id: WorkspaceTab;
+      label: string;
+      icon: React.FC<{ className?: string }>;
+      visible: boolean;
+      count?: number;
+    }[];
   }[] = useMemo(
     () => [
-      { id: 'horizon', label: 'Six-Year Horizon', icon: CalendarRange, visible: true },
-      { id: 'setup', label: 'Setup & Profile', icon: SlidersHorizontal, visible: true },
       {
-        id: 'pnl_bs',
-        label: 'P&L & Balance Sheet',
-        icon: Scale,
-        visible: state.setup.has_scorp,
+        title: 'Workspace',
+        items: [
+          { id: 'setup', label: 'Setup & Profile', icon: SlidersHorizontal, visible: true },
+        ],
       },
       {
-        id: 'cadence_forecaster',
-        label: 'Transaction Cadence Forecaster',
-        icon: CalendarClock,
-        visible: state.setup.has_scorp,
+        title: 'Planning & Strategy',
+        items: [
+          { id: 'horizon', label: 'Six-Year Horizon', icon: CalendarRange, visible: true },
+          {
+            id: 'dbp',
+            label: 'DBP & Retirement',
+            icon: Landmark,
+            visible:
+              state.setup.has_dbp || state.setup.has_401k_or_ira || state.setup.has_annuity,
+          },
+          {
+            id: 'cadence_forecaster',
+            label: 'Transaction Cadence Forecast',
+            icon: CalendarClock,
+            visible: state.setup.has_scorp,
+          },
+        ],
       },
-      { id: 'form1040', label: 'Form 1040', icon: FileSpreadsheet, visible: true },
-      { id: 'scorp', label: 'S-Corp (1120-S)', icon: Building2, visible: state.setup.has_scorp },
       {
-        id: 'dbp',
-        label: 'DBP & Retirement',
-        icon: Landmark,
-        visible: state.setup.has_dbp || state.setup.has_401k_or_ira || state.setup.has_annuity,
+        title: 'Tax Forms & Verification',
+        items: [
+          { id: 'form1040', label: 'Form 1040', icon: FileSpreadsheet, visible: true },
+          {
+            id: 'scorp',
+            label: 'S-Corp (1120-S)',
+            icon: Building2,
+            visible: state.setup.has_scorp,
+          },
+          {
+            id: 'multistate',
+            label: 'Multi-State & PTE',
+            icon: MapPin,
+            visible:
+              state.setup.multi_state_active ||
+              state.setup.residency_change_active ||
+              state.setup.has_pte,
+          },
+          {
+            id: 'forms',
+            label: 'IRS Forms Map',
+            icon: Compass,
+            visible: true,
+            count: formsMap.length,
+          },
+          { id: 'scenarios', label: 'Scenarios & AI', icon: GitCompareArrows, visible: true },
+        ],
       },
-      {
-        id: 'multistate',
-        label: 'Multi-State & PTE',
-        icon: MapPin,
-        visible:
-          state.setup.multi_state_active ||
-          state.setup.residency_change_active ||
-          state.setup.has_pte,
-      },
-      { id: 'forms', label: 'IRS Forms Map', icon: Compass, visible: true, count: formsMap.length },
-      { id: 'scenarios', label: 'Scenarios & AI', icon: GitCompareArrows, visible: true },
     ],
     [state.setup, formsMap.length]
+  );
+
+  const navItems = useMemo(
+    () => navSections.flatMap((section) => section.items),
+    [navSections]
   );
 
   // Redirect away from a tab if the active profile or module checklist hides it
   useEffect(() => {
     const activeItem = navItems.find((i) => i.id === activeTab);
-    if (activeItem && !activeItem.visible) {
+    if (!activeItem || !activeItem.visible) {
       setActiveTab('horizon');
     }
   }, [activeTab, navItems]);
@@ -1172,35 +1198,44 @@ export function App() {
         Window {state.setup.forecast_years[0]}–{state.setup.forecast_years[5]}
       </div>
 
-      <nav className="flex-1 overflow-y-auto px-3 py-3 space-y-0.5" aria-label="Primary modules">
-        {navItems
-          .filter((item) => item.visible)
-          .map((item) => {
-            const Icon = item.icon;
-            const active = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => handleSelectNav(item.id)}
-                className={`w-full flex items-center justify-between px-3 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
-                  active
-                    ? 'bg-teal-50 text-teal-900'
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                }`}
-              >
-                <span className="flex items-center gap-2.5 truncate">
-                  <Icon
-                    className={`w-4 h-4 shrink-0 ${active ? 'text-teal-800' : 'text-slate-400'}`}
-                  />
-                  <span className="truncate">{item.label}</span>
-                </span>
-                {item.count !== undefined && (
-                  <span className="font-mono text-[11px] text-slate-400">{item.count}</span>
-                )}
-              </button>
-            );
-          })}
+      <nav className="flex-1 overflow-y-auto px-3 py-3 space-y-4" aria-label="Primary modules">
+        {navSections.map((section) => {
+          const visibleItems = section.items.filter((item) => item.visible);
+          if (visibleItems.length === 0) return null;
+          return (
+            <div key={section.title} className="space-y-0.5">
+              <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                {section.title}
+              </div>
+              {visibleItems.map((item) => {
+                const Icon = item.icon;
+                const active = activeTab === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => handleSelectNav(item.id)}
+                    className={`w-full flex items-center justify-between px-3 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                      active
+                        ? 'bg-teal-50 text-teal-900'
+                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                    }`}
+                  >
+                    <span className="flex items-center gap-2.5 truncate">
+                      <Icon
+                        className={`w-4 h-4 shrink-0 ${active ? 'text-teal-800' : 'text-slate-400'}`}
+                      />
+                      <span className="truncate">{item.label}</span>
+                    </span>
+                    {item.count !== undefined && (
+                      <span className="font-mono text-[11px] text-slate-400">{item.count}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          );
+        })}
       </nav>
 
       <div className="p-3 border-t border-slate-200 space-y-1.5">
@@ -1431,28 +1466,6 @@ export function App() {
             />
           )}
 
-          {activeTab === 'pnl_bs' && (
-            <PnlBalanceSheetView
-              setup={state.setup}
-              pnlState={activePnlState}
-              planningGoals={activePlanningGoals}
-              issues={issues}
-              guardrailAcknowledgments={state.guardrail_acknowledgments ?? {}}
-              year2025Computed={computed.find((c) => c.tax_year === 2025) ?? computed[0]}
-              year2026Computed={
-                computed.find((c) => c.tax_year === state.setup.current_tax_year) ?? computed[1]
-              }
-              computedYears={computed}
-              onUpdatePnlState={handleUpdatePnlState}
-              onUpdatePlanningGoals={handleUpdatePlanningGoals}
-              onPushTo2026Schedule={handlePushPnlTo2026Schedule}
-              onResetFrom2026Schedule={handleResetPnlFrom2026Schedule}
-              onNavigate={setActiveTab}
-              onExportShadowReturn={handleExportShadowReturn}
-              exportingShadowReturn={exportingShadowReturn}
-            />
-          )}
-
           {activeTab === 'cadence_forecaster' && (
             <TransactionCadenceView
               setup={state.setup}
@@ -1469,6 +1482,8 @@ export function App() {
               onUpdatePlanningGoals={handleUpdatePlanningGoals}
               onPushTo2026Schedule={handlePushCadenceTo2026Schedule}
               onNavigate={setActiveTab}
+              onExportShadowReturn={handleExportShadowReturn}
+              exportingShadowReturn={exportingShadowReturn}
             />
           )}
 
@@ -1492,6 +1507,8 @@ export function App() {
               selectedYear={selectedYear}
               onSelectYear={setSelectedYear}
               onUpdateYear={handleUpdateYear}
+              pnlState={activePnlState}
+              onUpdatePnlState={handleUpdatePnlState}
             />
           )}
 
