@@ -7,6 +7,7 @@ import type {
   TaxYearRecord,
 } from '../types/tax';
 import { formatCurrency, formatPercent } from '../utils/format';
+import { formatTaxBalanceDue, getYearTaxBalances } from '../utils/taxPayments';
 import { resolveIrmaaThresholdForYear, setIrmaaThresholdOverride } from '../engine/irmaa';
 import { SAMPLE_GENERIC_RETURN_TEXT } from '../data/profiles';
 import { NumericField } from './NumericField';
@@ -655,8 +656,16 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
             </span>
           </div>
 
-          <dl className="divide-y divide-slate-100 text-xs">
-            {[
+          {(() => {
+            const fedBalances = getYearTaxBalances(comp, setup);
+            const summaryRows: Array<{
+              label: string;
+              code: string;
+              value: string;
+              bold?: boolean;
+              accent?: boolean;
+              positive?: boolean;
+            }> = [
               { label: 'Total Income', code: 'total_income', value: formatCurrency(comp.form_1040_out.total_income) },
               {
                 label: 'Adjustments to Income (Sch 1)',
@@ -708,6 +717,18 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
                 accent: true,
               },
               {
+                label: 'Federal Taxes Paid (Withholding + 1040-ES)',
+                code: 'federal_taxes_paid_total',
+                value: formatCurrency(fedBalances.federalPaid),
+              },
+              {
+                label: 'Federal Net Tax Due / (Refund)',
+                code: 'federal_net_tax_due_or_refund',
+                value: formatTaxBalanceDue(fedBalances.federalNetDue),
+                bold: true,
+                positive: fedBalances.federalNetDue <= 0 && fedBalances.federalTax > 0,
+              },
+              {
                 label: 'Marginal Federal Tax Rate',
                 code: 'marginal_tax_rate',
                 value: formatPercent(comp.form_1040_out.marginal_tax_rate, 0),
@@ -717,28 +738,35 @@ export const Form1040View: React.FC<Form1040ViewProps> = ({
                 code: 'effective_tax_rate',
                 value: formatPercent(comp.form_1040_out.effective_tax_rate, 2),
               },
-            ].map((row) => (
-              <div key={row.code} className="py-2.5 flex items-center justify-between gap-4">
-                <div>
-                  <dt className={row.bold ? 'font-semibold text-slate-900' : 'text-slate-600'}>
-                    {row.label}
-                  </dt>
-                  <div className="text-[11px] font-mono text-slate-400">{row.code}</div>
-                </div>
-                <dd
-                  className={`font-mono tabular-nums ${
-                    row.accent
-                      ? 'text-base font-semibold text-teal-800'
-                      : row.bold
-                      ? 'text-sm font-semibold text-slate-900'
-                      : 'text-slate-800'
-                  }`}
-                >
-                  {row.value}
-                </dd>
-              </div>
-            ))}
-          </dl>
+            ];
+            return (
+              <dl className="divide-y divide-slate-100 text-xs">
+                {summaryRows.map((row) => (
+                  <div key={row.code} className="py-2.5 flex items-center justify-between gap-4">
+                    <div>
+                      <dt className={row.bold ? 'font-semibold text-slate-900' : 'text-slate-600'}>
+                        {row.label}
+                      </dt>
+                      <div className="text-[11px] font-mono text-slate-400">{row.code}</div>
+                    </div>
+                    <dd
+                      className={`font-mono tabular-nums ${
+                        row.accent
+                          ? 'text-base font-semibold text-teal-800'
+                          : row.positive
+                          ? 'text-sm font-semibold text-emerald-700'
+                          : row.bold
+                          ? 'text-sm font-semibold text-slate-900'
+                          : 'text-slate-800'
+                      }`}
+                    >
+                      {row.value}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            );
+          })()}
 
           {setup.has_ss_medicare !== false && (() => {
             const covYear = comp.form_1040_out.irmaa_coverage_year;

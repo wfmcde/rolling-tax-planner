@@ -167,6 +167,8 @@ export interface Form1040Inputs {
   federal_tax_withholding?: number;
   /** Federal Form 1040-ES estimated tax payments (Form 1040 Line 26) */
   federal_estimated_tax_payments?: number;
+  /** Fallback state tax payments when no state_filings are configured yet (e.g., Blank User) */
+  unallocated_state_tax_payments?: number;
   /** Optional filed-return override strictly for Year 1 locked actuals reconciliation */
   locked_taxable_income_override?: number;
   locked_federal_tax_override?: number;

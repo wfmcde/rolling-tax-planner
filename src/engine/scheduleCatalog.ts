@@ -1,8 +1,21 @@
 import type { ComputedTaxYear, SetupConfig } from '../types/tax';
 import { formatCompactCurrency, formatCurrency, formatPercent } from '../utils/format';
 import { getSetupPersonNames, getSetupStates } from '../utils/setupHelpers';
+import {
+  formatTaxBalanceDue,
+  getYearTaxBalances,
+  getYearTaxPayments,
+} from '../utils/taxPayments';
 import { resolveIrmaaThresholdForYear } from './irmaa';
 import { DEFAULT_PROFILE_SEED, isDefaultSeedSetup } from '../data/profiles';
+
+function formatCompactBalanceDue(amount: number): string {
+  const rounded = Math.round(amount);
+  if (rounded < 0) {
+    return `(${formatCompactCurrency(Math.abs(rounded))})`;
+  }
+  return formatCompactCurrency(rounded);
+}
 
 function getDefaultFiledRef(
   taxYear: number,
@@ -18,7 +31,8 @@ export type ScheduleSectionId =
   | 'scorp_basis'
   | 'retirement_health'
   | 'personal_taxable'
-  | 'tax_cashflow';
+  | 'tax_cashflow'
+  | 'taxes_paid';
 
 export interface ScheduleSectionMeta {
   id: ScheduleSectionId;
@@ -41,7 +55,13 @@ export type ScheduleEditField =
   | 'capital_contributions'
   | 'dbp_contribution'
   | 'sehi_medicare_premiums'
-  | 'irmaa_threshold';
+  | 'irmaa_threshold'
+  | 'federal_taxes_paid'
+  | 'federal_tax_withholding'
+  | 'federal_estimated_tax_payments'
+  | 'state_taxes_paid'
+  | 'primary_state_taxes_paid'
+  | 'secondary_state_taxes_paid';
 
 export interface ScheduleCellResult {
   /** Primary formatted value displayed right-aligned in monospace tabular numerals */
@@ -129,7 +149,13 @@ export const SCHEDULE_SECTIONS: ScheduleSectionMeta[] = [
     id: 'tax_cashflow',
     title: 'Group 5 — Tax Liability, Rates & Cash Flow',
     shortTitle: 'Group 5 · Taxes, Rates & Cash Flow',
-    description: 'Federal, employee/employer FICA, state taxes, combined totals, rates, safe harbor estimates, and net household cash flow.',
+    description: 'Federal, employee/employer FICA, state taxes, combined totals, payments & balance due, rates, safe harbor estimates, and net household cash flow.',
+  },
+  {
+    id: 'taxes_paid',
+    title: 'Group 6 — Taxes Paid (Withholding & Estimates)',
+    shortTitle: 'Group 6 · Taxes Paid',
+    description: 'Editable annual federal and state withholding & estimated tax payments, synced with Form 1040 and Multi-State filings and structured for future Quicken/CSV import.',
   },
 ];
 
@@ -699,9 +725,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'dbp_contribution',
     section: 'retirement_health',
-    label: 'DBP Contribution',
+    label: 'Defined Benefit Plan Contributions',
     code: 'dbp_actual_contribution',
-    description: 'Defined Benefit Plan deductible contribution (defaults to $0 starting in Termination Year + 1).',
+    description:
+      'Defined Benefit Plan deductible contribution (inline editable; defaults to $0 starting in Termination Year + 1). Expand to view DBP + Profit Share tax savings.',
+    bold: true,
     summable: true,
     editField: 'dbp_contribution',
     computeCell: (c, _i, _all, setup) => {
@@ -733,8 +761,55 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     },
   },
   {
+    id: 'dbp_ps_tax_reduction',
+    section: 'retirement_health',
+    parentId: 'dbp_contribution',
+    label: 'DBP + Profit Share Tax Reduction',
+    code: 'dbp_and_ps_tax_reduction',
+    description: 'Estimated federal tax shield from entity-deductible DBP and Employer 401(k) profit-sharing contributions.',
+    summable: true,
+    computeCell: (c) => {
+      const shield = c.form_1040_out.dbp_and_ps_tax_reduction;
+      const isZeroFedTax =
+        c.form_1040_out.taxable_income <= 0 && c.form_1040_out.federal_income_tax <= 0;
+      return {
+        display: formatCurrency(shield),
+        numericValue: shield,
+        subLabel:
+          isZeroFedTax
+            ? '$0 · 0% marginal'
+            : shield > 0
+            ? `@ ${formatPercent(c.form_1040_out.marginal_tax_rate, 0)} marginal`
+            : 'No active shield',
+        subTone: shield > 0 ? 'positive' : 'neutral',
+      };
+    },
+  },
+  {
+    id: 'total_401k_contributions',
+    section: 'retirement_health',
+    label: '401(k) Contributions',
+    code: 'total_401k_contributions',
+    description:
+      'Auto-calculated combined Employer 401(k) Profit Sharing / Match plus Employee 401(k) Elective Deferrals (expand to view employer vs. employee breakdown).',
+    bold: true,
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const emp = c.form_1040_out.employer_401k_total;
+      const ee = c.form_1040_out.employee_401k_total;
+      const total = emp + ee;
+      return {
+        display: formatCurrency(total),
+        numericValue: total,
+        subLabel: !setup.has_401k_or_ira ? 'Inactive' : 'Employer + Employee',
+        subTone: 'neutral',
+      };
+    },
+  },
+  {
     id: 'employer_401k_ps',
     section: 'retirement_health',
+    parentId: 'total_401k_contributions',
     label: 'Employer 401(k) Profit Sharing / Match',
     code: 'employer_401k_total',
     description: 'Employer profit sharing: 6% IRC §404(a)(7) combined-plan cap while DBP is active; rises to 25% of cash W-2 wages once DBP is terminated (subject to IRS §415(c)).',
@@ -763,6 +838,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'employee_401k_deferrals',
     section: 'retirement_health',
+    parentId: 'total_401k_contributions',
     label: 'Employee 401(k) Elective Deferrals',
     code: 'employee_401k_total',
     description: 'Maximized per person from W-2 minus employee FICA, capped at annual IRS 402(g) + age 50+/60–63 catch-up limits.',
@@ -790,35 +866,13 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     },
   },
   {
-    id: 'dbp_ps_tax_reduction',
-    section: 'retirement_health',
-    label: 'DBP Contribution + Profit Share Tax Reduction',
-    code: 'dbp_and_ps_tax_reduction',
-    description: 'Estimated federal tax shield from entity-deductible DBP and Employer 401(k) profit-sharing contributions.',
-    summable: true,
-    computeCell: (c) => {
-      const shield = c.form_1040_out.dbp_and_ps_tax_reduction;
-      const isZeroFedTax =
-        c.form_1040_out.taxable_income <= 0 && c.form_1040_out.federal_income_tax <= 0;
-      return {
-        display: formatCurrency(shield),
-        numericValue: shield,
-        subLabel:
-          isZeroFedTax
-            ? '$0 · 0% marginal'
-            : shield > 0
-            ? `@ ${formatPercent(c.form_1040_out.marginal_tax_rate, 0)} marginal`
-            : 'No active shield',
-        subTone: shield > 0 ? 'positive' : 'neutral',
-      };
-    },
-  },
-  {
     id: 'sehi_medicare_premiums',
     section: 'retirement_health',
-    label: 'SEHI Medicare Premiums',
+    label: 'Medicare Premiums (SEHI)',
     code: 'sehi_medicare_premiums_effective',
-    description: 'Pulls enrolled Medicare / health premiums from Setup (exact in Current Tax Year, escalated by Medicare inflation in Current Year + 1); inline editable for 2026–2030.',
+    description:
+      'Pulls enrolled Medicare / health premiums from Setup (exact in Current Tax Year, escalated by Medicare inflation in Current Year + 1); inline editable with override & reset controls. Expand to view the Schedule 1 Line 17 deduction.',
+    bold: true,
     summable: true,
     editField: 'sehi_medicare_premiums',
     computeCell: (c, _i, _all, setup) => {
@@ -836,7 +890,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
 
       let subLabel: string | undefined;
       if (c.is_locked_actuals) {
-        subLabel = '2025 Actuals';
+        subLabel = `${c.tax_year} Actuals`;
       } else if (isOverridden) {
         subLabel = undefined;
       } else if (setupMedCombined > 0) {
@@ -862,7 +916,8 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'sehi_medicare_deduction',
     section: 'retirement_health',
-    label: 'SEHI Medicare Deduction (Sched 1 Line 17)',
+    parentId: 'sehi_medicare_premiums',
+    label: 'SEHI Deduction (Schedule 1, Line 17)',
     code: 'sehi_medicare_deduction',
     description:
       'Above-the-line >2% S-Corp shareholder health & Medicare deduction (IRS Form 7206 Line 11 / IRC § 162(l)(5)), capped at combined W-2 Box 5 Medicare wages (gross W-2 before 401(k) deferrals, excluding the S-Corp 2% health insurance add-back).',
@@ -1222,6 +1277,124 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     },
   },
   {
+    id: 'total_taxes_paid',
+    section: 'tax_cashflow',
+    label: 'Taxes Paid (Federal + State)',
+    code: 'total_taxes_paid',
+    description: 'Combined federal and state withholding and estimated tax payments synced from Group 6, Form 1040, and Multi-State & PTE.',
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const b = getYearTaxBalances(c, setup);
+      const hasStateActivity = b.stateTax > 0 || b.statePaid > 0;
+      const subLabel =
+        b.combinedPaid > 0
+          ? hasStateActivity
+            ? `Fed ${formatCompactCurrency(b.federalPaid)} · State ${formatCompactCurrency(b.statePaid)}`
+            : `Fed ${formatCompactCurrency(b.federalPaid)}`
+          : undefined;
+      return {
+        display: formatCurrency(b.combinedPaid),
+        numericValue: b.combinedPaid,
+        subLabel,
+        subTone: b.combinedPaid > 0 ? 'accent' : 'neutral',
+      };
+    },
+  },
+  {
+    id: 'net_tax_due_or_refund',
+    section: 'tax_cashflow',
+    label: 'Net Tax Due / (Refund)',
+    code: 'net_tax_due_or_refund',
+    description: 'Remaining combined tax balance due or (refund) after subtracting Federal and State taxes paid from Total Federal and State Taxes.',
+    bold: true,
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const b = getYearTaxBalances(c, setup);
+      const hasStateActivity = b.stateTax > 0 || b.statePaid > 0;
+      let subLabel: string | undefined;
+      let subTone: CellTone = 'neutral';
+      if (b.combinedNetDue < 0) {
+        subLabel = hasStateActivity
+          ? `Refund · Fed ${formatCompactBalanceDue(b.federalNetDue)} · St ${formatCompactBalanceDue(b.stateNetDue)}`
+          : 'Refund';
+        subTone = 'positive';
+      } else if (b.combinedNetDue === 0 && b.combinedTax > 0) {
+        subLabel = 'Paid in full';
+        subTone = 'positive';
+      } else if (hasStateActivity) {
+        subLabel = `Fed ${formatCompactBalanceDue(b.federalNetDue)} · State ${formatCompactBalanceDue(b.stateNetDue)}`;
+        subTone = b.combinedPaid > 0 ? 'neutral' : 'neutral';
+      } else if (b.combinedPaid > 0 && b.combinedNetDue > 0) {
+        subLabel = 'Balance due';
+        subTone = 'warning';
+      }
+      return {
+        display: formatTaxBalanceDue(b.combinedNetDue),
+        numericValue: b.combinedNetDue,
+        subLabel,
+        subTone,
+      };
+    },
+  },
+  {
+    id: 'federal_net_tax_due',
+    section: 'tax_cashflow',
+    parentId: 'net_tax_due_or_refund',
+    label: 'Federal Net Tax Due / (Refund)',
+    code: 'federal_net_tax_due_or_refund',
+    description: 'Federal Income Tax Liability minus Federal Taxes Paid (Form 1040 withholding + 1040-ES estimates).',
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const b = getYearTaxBalances(c, setup);
+      let subLabel: string | undefined;
+      let subTone: CellTone = 'neutral';
+      if (b.federalNetDue < 0) {
+        subLabel = `Refund · Paid ${formatCompactCurrency(b.federalPaid)}`;
+        subTone = 'positive';
+      } else if (b.federalNetDue === 0 && b.federalTax > 0) {
+        subLabel = 'Paid in full';
+        subTone = 'positive';
+      } else if (b.federalPaid > 0) {
+        subLabel = `Paid ${formatCompactCurrency(b.federalPaid)}`;
+      }
+      return {
+        display: formatTaxBalanceDue(b.federalNetDue),
+        numericValue: b.federalNetDue,
+        subLabel,
+        subTone,
+      };
+    },
+  },
+  {
+    id: 'state_net_tax_due',
+    section: 'tax_cashflow',
+    parentId: 'net_tax_due_or_refund',
+    label: 'State Net Tax Due / (Refund)',
+    code: 'state_net_tax_due_or_refund',
+    description: 'Total State Tax minus State Taxes Paid (withholding and estimated payments across active state filings).',
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const b = getYearTaxBalances(c, setup);
+      let subLabel: string | undefined;
+      let subTone: CellTone = 'neutral';
+      if (b.stateNetDue < 0) {
+        subLabel = `Refund · Paid ${formatCompactCurrency(b.statePaid)}`;
+        subTone = 'positive';
+      } else if (b.stateNetDue === 0 && b.stateTax > 0) {
+        subLabel = 'Paid in full';
+        subTone = 'positive';
+      } else if (b.statePaid > 0) {
+        subLabel = `Paid ${formatCompactCurrency(b.statePaid)}`;
+      }
+      return {
+        display: formatTaxBalanceDue(b.stateNetDue),
+        numericValue: b.stateNetDue,
+        subLabel,
+        subTone,
+      };
+    },
+  },
+  {
     id: 'effective_marginal_rate',
     section: 'tax_cashflow',
     label: 'Effective / Marginal Tax',
@@ -1289,6 +1462,160 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
       display: formatCurrency(c.estimated_net_cash_flow),
       numericValue: c.estimated_net_cash_flow,
     }),
+  },
+
+  // =========================================================================
+  // Group 6 — Taxes Paid (Withholding & Estimates)
+  // =========================================================================
+  {
+    id: 'federal_taxes_paid',
+    section: 'taxes_paid',
+    label: 'Federal Taxes Paid (Withholding & Estimates)',
+    code: 'federal_taxes_paid_total',
+    description: 'Annual federal tax payments (W-2/1099 withholding + 1040-ES estimates). Inline editable directly or by component; synced with Form 1040 Lines 25d & 26.',
+    bold: true,
+    summable: true,
+    editField: 'federal_taxes_paid',
+    computeCell: (c, _i, _all, setup) => {
+      const p = getYearTaxPayments(c, setup);
+      let subLabel: string | undefined;
+      if (p.federalTotal > 0) {
+        subLabel = `W/H ${formatCompactCurrency(p.federalWithholding)} · Est ${formatCompactCurrency(p.federalEstimates)}`;
+      } else if (c.is_locked_actuals) {
+        subLabel = `${c.tax_year} Actuals`;
+      } else {
+        subLabel = 'Withholding & 1040-ES';
+      }
+      return {
+        display: formatCurrency(p.federalTotal),
+        numericValue: p.federalTotal,
+        rawEditValue: p.federalTotal,
+        subLabel,
+        subTone: p.federalTotal > 0 ? 'accent' : 'neutral',
+      };
+    },
+  },
+  {
+    id: 'federal_tax_withholding',
+    section: 'taxes_paid',
+    parentId: 'federal_taxes_paid',
+    label: 'Federal W-2 / 1099 Withholding',
+    code: 'federal_tax_withholding',
+    description: 'Federal income tax withheld on W-2 and 1099 statements (Form 1040 Line 25d).',
+    summable: true,
+    editField: 'federal_tax_withholding',
+    computeCell: (c, _i, _all, setup) => {
+      const p = getYearTaxPayments(c, setup);
+      return {
+        display: formatCurrency(p.federalWithholding),
+        numericValue: p.federalWithholding,
+        rawEditValue: p.federalWithholding,
+        subLabel: 'Form 1040 Ln 25d',
+        subTone: 'neutral',
+      };
+    },
+  },
+  {
+    id: 'federal_estimated_tax_payments',
+    section: 'taxes_paid',
+    parentId: 'federal_taxes_paid',
+    label: 'Federal 1040-ES Estimated Payments',
+    code: 'federal_estimated_tax_payments',
+    description: 'Federal quarterly estimated tax payments and prior-year overpayments applied (Form 1040 Line 26).',
+    summable: true,
+    editField: 'federal_estimated_tax_payments',
+    computeCell: (c, _i, _all, setup) => {
+      const p = getYearTaxPayments(c, setup);
+      return {
+        display: formatCurrency(p.federalEstimates),
+        numericValue: p.federalEstimates,
+        rawEditValue: p.federalEstimates,
+        subLabel: 'Form 1040 Ln 26',
+        subTone: 'neutral',
+      };
+    },
+  },
+  {
+    id: 'state_taxes_paid',
+    section: 'taxes_paid',
+    label: 'State Taxes Paid (Withholding & Estimates)',
+    code: 'state_taxes_paid_total',
+    description: 'Annual state tax withholding and estimated payments across active state filings. Synced with Multi-State & PTE.',
+    bold: true,
+    summable: true,
+    editField: 'state_taxes_paid',
+    computeCell: (c, _i, _all, setup) => {
+      const p = getYearTaxPayments(c, setup);
+      const { primaryStateCode, secondaryStateCode, hasPrimaryState, hasSecondaryState } =
+        getSetupStates(setup);
+      let subLabel: string | undefined;
+      if (p.stateTotal > 0 && p.primaryStateCode && p.secondaryStateCode && hasSecondaryState) {
+        subLabel = `${p.primaryStateCode} ${formatCompactCurrency(p.primaryStatePaid)} · ${p.secondaryStateCode} ${formatCompactCurrency(p.secondaryStatePaid)}`;
+      } else if (c.is_locked_actuals) {
+        subLabel = `${c.tax_year} Actuals`;
+      } else if (hasPrimaryState && hasSecondaryState) {
+        subLabel = `${primaryStateCode} & ${secondaryStateCode} W/H & Est`;
+      } else if (hasPrimaryState) {
+        subLabel = `${primaryStateCode} Withholding & Est`;
+      } else {
+        subLabel = 'State Withholding & Est';
+      }
+      return {
+        display: formatCurrency(p.stateTotal),
+        numericValue: p.stateTotal,
+        rawEditValue: p.stateTotal,
+        subLabel,
+        subTone: p.stateTotal > 0 ? 'accent' : 'neutral',
+      };
+    },
+  },
+  {
+    id: 'primary_state_taxes_paid',
+    section: 'taxes_paid',
+    parentId: 'state_taxes_paid',
+    label: 'Primary State Taxes Paid',
+    getLabel: (s) => {
+      const { primaryStateName, hasPrimaryState } = getSetupStates(s);
+      return hasPrimaryState ? `${primaryStateName} Taxes Paid` : 'Primary State Taxes Paid';
+    },
+    code: 'primary_state_tax_withholding_and_estimates',
+    description: 'Primary state withholding and estimated tax payments synced to the primary state filing.',
+    summable: true,
+    editField: 'primary_state_taxes_paid',
+    computeCell: (c, _i, _all, setup) => {
+      const p = getYearTaxPayments(c, setup);
+      return {
+        display: formatCurrency(p.primaryStatePaid),
+        numericValue: p.primaryStatePaid,
+        rawEditValue: p.primaryStatePaid,
+        subLabel: p.primaryStateCode ? `${p.primaryStateCode} W/H & Est` : undefined,
+        subTone: 'neutral',
+      };
+    },
+  },
+  {
+    id: 'secondary_state_taxes_paid',
+    section: 'taxes_paid',
+    parentId: 'state_taxes_paid',
+    label: 'Secondary State Taxes Paid',
+    getLabel: (s) => {
+      const { secondaryStateName, hasSecondaryState } = getSetupStates(s);
+      return hasSecondaryState ? `${secondaryStateName} Taxes Paid` : 'Secondary State Taxes Paid';
+    },
+    code: 'secondary_state_tax_withholding_and_estimates',
+    description: 'Secondary state withholding and estimated tax payments synced to the secondary state filing.',
+    summable: true,
+    editField: 'secondary_state_taxes_paid',
+    computeCell: (c, _i, _all, setup) => {
+      const p = getYearTaxPayments(c, setup);
+      return {
+        display: formatCurrency(p.secondaryStatePaid),
+        numericValue: p.secondaryStatePaid,
+        rawEditValue: p.secondaryStatePaid,
+        subLabel: p.secondaryStateCode ? `${p.secondaryStateCode} W/H & Est` : undefined,
+        subTone: 'neutral',
+      };
+    },
   },
 ];
 

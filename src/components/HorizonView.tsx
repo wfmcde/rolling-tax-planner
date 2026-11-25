@@ -65,6 +65,13 @@ import {
   updateProfileBirthMonth,
 } from '../utils/personTax';
 import { getSetupStates } from '../utils/setupHelpers';
+import {
+  applyFederalEstimates,
+  applyFederalTaxesPaidTotal,
+  applyFederalWithholding,
+  applyStatePaymentByCode,
+  applyStateTaxesPaidTotal,
+} from '../utils/taxPayments';
 import { ScheduleRowPickerDrawer } from './ScheduleRowPickerDrawer';
 import { TaxReductionLeversDrawer } from './TaxReductionLeversDrawer';
 import { VerificationCheckpointsCard } from './VerificationCheckpointsCard';
@@ -392,6 +399,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         if (
           !showRetirement &&
           (item.id === 'dbp_contribution' ||
+            item.id === 'total_401k_contributions' ||
             item.id === 'employer_401k_ps' ||
             item.id === 'employee_401k_deferrals' ||
             item.id === 'dbp_ps_tax_reduction')
@@ -409,6 +417,15 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
           return false;
         }
         if (!showMultiState && !setup.home_state && item.id === 'ca_state_tax') {
+          return false;
+        }
+        const hasTwoStatesForPayments = Boolean(
+          (setup.multi_state_active || setup.secondary_state) && setup.home_state
+        );
+        if (
+          !hasTwoStatesForPayments &&
+          (item.id === 'primary_state_taxes_paid' || item.id === 'secondary_state_taxes_paid')
+        ) {
           return false;
         }
         return true;
@@ -732,6 +749,30 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
               sehi_medicare_override: parsed,
             },
           };
+        case 'federal_taxes_paid':
+          return parsed === null ? prev : applyFederalTaxesPaidTotal(prev, parsed);
+        case 'federal_tax_withholding':
+          return parsed === null ? prev : applyFederalWithholding(prev, parsed);
+        case 'federal_estimated_tax_payments':
+          return parsed === null ? prev : applyFederalEstimates(prev, parsed);
+        case 'state_taxes_paid':
+          return parsed === null ? prev : applyStateTaxesPaidTotal(prev, setup, parsed);
+        case 'primary_state_taxes_paid': {
+          if (parsed === null) return prev;
+          const { primaryStateCode } = getSetupStates(setup);
+          const targetCode = primaryStateCode || prev.state_filings[0]?.state_code || '';
+          return applyStatePaymentByCode(prev, targetCode, parsed);
+        }
+        case 'secondary_state_taxes_paid': {
+          if (parsed === null) return prev;
+          const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
+          const pCode = primaryStateCode || prev.state_filings[0]?.state_code || '';
+          const targetCode =
+            secondaryStateCode ||
+            prev.state_filings.find((sf) => sf.state_code !== pCode)?.state_code ||
+            '';
+          return applyStatePaymentByCode(prev, targetCode, parsed);
+        }
         default:
           return prev;
       }
@@ -1510,7 +1551,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
             <table className="w-full text-left border-collapse min-w-[820px]">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50/80">
-                  <th className="py-3 px-4 text-xs font-semibold text-slate-600 w-[264px] min-w-[264px]">
+                  <th className="py-3 px-4 text-xs font-semibold text-slate-600 w-[272px] min-w-[272px]">
                     Line Item
                   </th>
                   {computed.map((c) => {
@@ -1563,6 +1604,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                       }
 
                       const isCollapsibleParent = collapsibleParentChildMap.has(row.id);
+                      const isEditableParent = isCollapsibleParent && Boolean(row.editField);
                       const isGroupExpanded = isCollapsibleParent && Boolean(expandedGroups[row.id]);
 
                       const rowLabel = getScheduleRowLabel(row, setup);
@@ -1577,14 +1619,24 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                           ? 'bg-teal-50/70 hover:bg-teal-50'
                           : isCollapsibleParent
                           ? isGroupExpanded
-                            ? 'bg-slate-50/70 hover:bg-teal-50/40 cursor-pointer select-none group'
-                            : 'hover:bg-teal-50/40 cursor-pointer select-none group'
+                            ? `bg-slate-50/70 hover:bg-teal-50/40 group ${
+                                isEditableParent ? '' : 'cursor-pointer select-none'
+                              }`
+                            : `hover:bg-teal-50/40 group ${
+                                isEditableParent ? '' : 'cursor-pointer select-none'
+                              }`
                           : isGroupedChild
                           ? 'bg-slate-50/45 hover:bg-slate-100/60'
                           : 'hover:bg-slate-50/70';
 
                       const isPrimaryHighlight = row.highlight === 'primary';
-                      const isCompactGroup2 = row.section === 'scorp_basis';
+                      const isCompactRow =
+                        row.section === 'scorp_basis' ||
+                        row.section === 'taxes_paid' ||
+                        row.id === 'total_taxes_paid' ||
+                        row.id === 'net_tax_due_or_refund' ||
+                        row.id === 'federal_net_tax_due' ||
+                        row.id === 'state_net_tax_due';
                       const isSsRow = row.editField === 'ss_debra' || row.editField === 'ss_bill';
                       const ssPerson: 'debra' | 'bill' =
                         row.editField === 'ss_debra' ? 'debra' : 'bill';
@@ -1592,15 +1644,20 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                       return (
                         <tr
                           key={row.id}
-                          onClick={isCollapsibleParent ? () => toggleGroup(row.id) : undefined}
+                          onClick={
+                            isCollapsibleParent && !isEditableParent
+                              ? () => toggleGroup(row.id)
+                              : undefined
+                          }
                           className={`border-b ${
                             isPrimaryHighlight ? 'border-slate-800' : 'border-slate-100'
                           } transition-colors ${rowBg}`}
                         >
                           <td
-                            className={`${isCompactGroup2 ? 'py-1.5' : 'py-2'} align-top ${
+                            onClick={isEditableParent ? () => toggleGroup(row.id) : undefined}
+                            className={`${isCompactRow ? 'py-1.5' : 'py-2'} align-top ${
                               isGroupedChild ? 'pl-8 pr-4' : 'px-4'
-                            }`}
+                            } ${isEditableParent ? 'cursor-pointer select-none' : ''}`}
                           >
                             <div
                               className={
@@ -1757,7 +1814,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                             },
                                           });
                                         }}
-                                        className="w-11 text-right text-[10px] font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded px-1 py-0 leading-tight focus:outline-none focus:border-teal-700"
+                                        className="min-w-[4.25rem] w-[4.25rem] text-right text-[10px] font-mono tabular-nums text-slate-800 bg-slate-50 border border-slate-200 rounded px-1.5 py-0 leading-tight focus:outline-none focus:border-teal-700"
                                       />
                                       <span>%</span>
                                     </label>
@@ -1786,7 +1843,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                               <td
                                 key={c.tax_year}
                                 className={`${
-                                  isCompactGroup2 ? 'py-1.5' : 'py-2'
+                                  isCompactRow ? 'py-1.5' : 'py-2'
                                 } px-3 last:pr-4 text-right align-top ${
                                   !isPrimaryHighlight && c.record_mode === 'actuals'
                                     ? 'bg-slate-50/50'
@@ -1800,6 +1857,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                       inputMode="numeric"
                                       autoFocus
                                       value={editingCell.draft}
+                                      onClick={(e) => e.stopPropagation()}
                                       onChange={(e) =>
                                         setEditingCell({
                                           ...editingCell,
@@ -1828,14 +1886,15 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                   ) : editable && row.editField ? (
                                     <button
                                       type="button"
-                                      onClick={() =>
+                                      onClick={(e) => {
+                                        e.stopPropagation();
                                         setEditingCell({
                                           rowId: row.id,
                                           taxYear: c.tax_year,
                                           draft: String(cell.rawEditValue ?? 0),
                                           initialValue: cell.rawEditValue ?? 0,
-                                        })
-                                      }
+                                        });
+                                      }}
                                       title={
                                         row.editField === 'irmaa_threshold'
                                           ? `Click to override ${c.tax_year} coverage threshold (leave blank to reset to formula)`
@@ -1848,7 +1907,9 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                           ? 'Click to enter dollar override (leave blank to reset to Setup formula)'
                                           : `Click to edit ${rowLabel} for ${c.tax_year}`
                                       }
-                                      className="font-mono text-xs tabular-nums whitespace-nowrap text-slate-900 border-b border-dashed border-teal-600/60 hover:border-teal-800 hover:bg-teal-50/70 rounded-sm px-1 transition-colors"
+                                      className={`font-mono text-xs tabular-nums whitespace-nowrap text-slate-900 border-b border-dashed border-teal-600/60 hover:border-teal-800 hover:bg-teal-50/70 rounded-sm px-1 transition-colors ${
+                                        row.bold ? 'font-semibold' : ''
+                                      }`}
                                     >
                                       {cell.display}
                                     </button>
@@ -1894,9 +1955,10 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     </span>
                                     <button
                                       type="button"
-                                      onClick={() =>
-                                        handleResetCellOverride(row.editField!, c.tax_year)
-                                      }
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleResetCellOverride(row.editField!, c.tax_year);
+                                      }}
                                       title={`Reset ${rowLabel} (${c.tax_year}) back to formula`}
                                       aria-label={`Reset ${rowLabel} ${c.tax_year} override back to formula`}
                                       className="inline-flex items-center gap-0.5 text-[9px] font-medium text-teal-800 hover:text-teal-950 hover:underline leading-none whitespace-nowrap"
@@ -1952,7 +2014,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
 
                                 {/* Status / Alert Badge */}
                                 {cell.badge && (
-                                  <div className={`${isCompactGroup2 ? 'mt-0.5' : 'mt-1'} flex justify-end`}>
+                                  <div className={`${isCompactRow ? 'mt-0.5' : 'mt-1'} flex justify-end`}>
                                     {row.id === 'total_joint_agi' ? (
                                       <IrmaaHoverTooltip text={IRMAA_LOOKBACK_TOOLTIP}>
                                         <span
@@ -1968,7 +2030,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     ) : (
                                       <span
                                         className={`inline-block text-[10px] font-medium leading-tight px-1.5 ${
-                                          isCompactGroup2 ? 'py-0' : 'py-0.5'
+                                          isCompactRow ? 'py-0' : 'py-0.5'
                                         } rounded border whitespace-nowrap ${
                                           BADGE_TONE_CLASS[cell.badge.tone]
                                         }`}
@@ -1988,7 +2050,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                   ) && (
                                     <div
                                       className={`${
-                                        isCompactGroup2
+                                        isCompactRow
                                           ? 'text-[9.5px] leading-tight whitespace-nowrap'
                                           : 'text-[10px] leading-snug whitespace-normal'
                                       } mt-0.5 ${toneClass}`}
