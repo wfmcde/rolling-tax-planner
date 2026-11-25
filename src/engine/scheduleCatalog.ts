@@ -80,6 +80,8 @@ export interface ScheduleCellResult {
   filedRef?: string;
   /** Optional filed-return reference shown in a compact hover tooltip instead of an extra stacked row */
   filedRefTooltip?: string;
+  /** Optional compact breakdown detail shown in a hover tooltip to keep cells within 2 lines max */
+  detailTooltip?: string;
   /** Optional compact inline status/flag badge */
   badge?: {
     text: string;
@@ -224,8 +226,7 @@ function computeDynamicStateCell(
       display: '$0',
       numericValue: 0,
       badge: { text: resLabel, tone: 'positive' },
-      subLabel: '0% state tax',
-      subTone: 'neutral',
+      detailTooltip: `${stateCode} · 0% state income tax`,
     };
   }
 
@@ -253,14 +254,13 @@ function computeDynamicStateCell(
 
     const bizTotal = entityTax + pteTax;
     const bizTag = pteTax > 0 ? '100S/PTE' : '100S';
-    const subLabel = `${bizTag} ${formatCurrency(bizTotal)} · ${formCode} ${formatCurrency(persTax)}`;
+    const detailTooltip = `${bizTag} ${formatCurrency(bizTotal)} · ${formCode} ${formatCurrency(persTax)}`;
 
     return {
       display: formatCurrency(totalTax),
       numericValue: totalTax,
       badge: { text: badgeText, tone: badgeTone },
-      subLabel,
-      subTone: 'neutral',
+      detailTooltip,
     };
   }
 
@@ -277,25 +277,24 @@ function computeDynamicStateCell(
       ? 'warning'
       : 'neutral';
 
-  let subLabel: string;
+  let detailTooltip: string;
   if (pteTax > 0) {
-    subLabel = `PTE ${formatCurrency(pteTax)} · Pers ${formatCurrency(persTax)}`;
+    detailTooltip = `PTE ${formatCurrency(pteTax)} · Pers ${formatCurrency(persTax)}`;
   } else if (filing.credit_for_taxes_paid_to_other_states > 0) {
-    subLabel = `Pers ${formatCurrency(persTax)} (OSTC -${formatCurrency(
+    detailTooltip = `Pers ${formatCurrency(persTax)} · OSTC -${formatCurrency(
       filing.credit_for_taxes_paid_to_other_states
-    )})`;
+    )}`;
   } else if (entityTax > 0) {
-    subLabel = `Entity ${formatCurrency(entityTax)} · Pers ${formatCurrency(persTax)}`;
+    detailTooltip = `Entity ${formatCurrency(entityTax)} · Pers ${formatCurrency(persTax)}`;
   } else {
-    subLabel = `Pers ${formatCurrency(persTax)}`;
+    detailTooltip = `${stateCode} Pers ${formatCurrency(persTax)}`;
   }
 
   return {
     display: formatCurrency(totalTax),
     numericValue: totalTax,
     badge: { text: badgeText, tone: badgeTone },
-    subLabel,
-    subTone: filing.credit_for_taxes_paid_to_other_states > 0 ? 'positive' : 'neutral',
+    detailTooltip,
   };
 }
 
@@ -979,7 +978,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         numericValue: -allowed,
         subLabel,
         subTone,
-        filedRef: getDefaultFiledRef(
+        filedRefTooltip: getDefaultFiledRef(
           c.tax_year,
           setup,
           -DEFAULT_PROFILE_SEED.verification_benchmarks_2025.enhanced_senior_deduction
@@ -999,14 +998,9 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
       return {
         display: val > 0 ? formatCurrency(-val) : '$0',
         numericValue: -val,
-        subLabel:
-          c.tax_year === 2025 && isDefaultSeedSetup(setup)
-            ? undefined
-            : val > 0
-            ? 'Form 8995 (20%)'
-            : 'Not applicable',
+        subLabel: val > 0 ? 'Form 8995 (20%)' : 'Not applicable',
         subTone: val > 0 ? 'positive' : 'neutral',
-        filedRef: getDefaultFiledRef(
+        filedRefTooltip: getDefaultFiledRef(
           c.tax_year,
           setup,
           -DEFAULT_PROFILE_SEED.verification_benchmarks_2025.qbi_deduction
@@ -1029,13 +1023,11 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         display: formatCurrency(taxable),
         numericValue: taxable,
         subLabel:
-          c.tax_year === 2025 && gross === 0 && isDefaultSeedSetup(setup)
-            ? undefined
-            : gross > 0
+          gross > 0
             ? `${pct}% of ${formatCompactCurrency(gross)}`
             : 'No active SS',
         subTone: 'neutral',
-        filedRef: getDefaultFiledRef(
+        filedRefTooltip: getDefaultFiledRef(
           c.tax_year,
           setup,
           DEFAULT_PROFILE_SEED.verification_benchmarks_2025.taxable_social_security
@@ -1057,7 +1049,8 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     editField: 'irmaa_threshold',
     computeCell: (c, _i, _all, setup) => {
       const resolved = resolveIrmaaThresholdForYear(c.tax_year, setup);
-      const lookbackNote = `${resolved.coverageYear} Cov · Tests ${resolved.lookbackMagiYear} MAGI`;
+      const shortLookback = String(resolved.lookbackMagiYear).slice(-2);
+      const lookbackNote = `${resolved.coverageYear} Cov · Tests '${shortLookback} MAGI`;
       const formulaHint = resolved.isOverridden
         ? `Formula: ${formatCompactCurrency(resolved.formulaThreshold)}`
         : resolved.sourceLabel;
@@ -1084,6 +1077,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     summable: true,
     computeCell: (c, _i, _all, setup) => {
       const agi = c.form_1040_out.adjusted_gross_income;
+      const currentMagi = agi + c.form_1040_in.tax_exempt_interest;
       const surcharge = c.form_1040_out.irmaa_annual_surcharge;
       const lookbackYear = c.form_1040_out.irmaa_lookback_year;
       const lookbackMagi = c.form_1040_out.irmaa_lookback_magi;
@@ -1092,6 +1086,13 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
       const futureCovYear = c.form_1040_out.irmaa_future_coverage_year;
       const futureThreshold = c.form_1040_out.irmaa_future_tier1_threshold;
       const currentExceedsFuture = c.form_1040_out.irmaa_current_magi_exceeds_cliff;
+      const futureHeadroom = futureThreshold - currentMagi;
+      const approachingFutureCliff =
+        !currentExceedsFuture && futureHeadroom >= 0 && futureHeadroom <= 10000;
+
+      const shortYear = String(c.tax_year).slice(-2);
+      const shortLookback = String(lookbackYear).slice(-2);
+      const shortFutureCov = String(futureCovYear).slice(-2);
 
       let badge: ScheduleCellResult['badge'];
       let subLabel: string | undefined;
@@ -1103,28 +1104,35 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
             text: `IRMAA +${formatCompactCurrency(surcharge)}`,
             tone: 'danger',
           };
-          subLabel = `${c.tax_year} Cov (${lookbackYear} MAGI)`;
+          subLabel = `'${shortYear} Cov ('${shortLookback} MAGI)`;
           subTone = 'danger';
         } else if (lookbackExceeds) {
           badge = {
             text: `${c.tax_year} IRMAA >${formatCompactCurrency(covThreshold)}`,
             tone: 'warning',
           };
-          subLabel = `${lookbackYear} MAGI > ${c.tax_year} Cov`;
+          subLabel = `'${shortLookback} MAGI > '${shortYear} Cov`;
           subTone = 'warning';
         } else if (currentExceedsFuture) {
           badge = {
             text: `${futureCovYear} Cliff >${formatCompactCurrency(futureThreshold)}`,
             tone: 'warning',
           };
-          subLabel = `${c.tax_year} MAGI → ${futureCovYear} Cov`;
+          subLabel = `'${shortYear} MAGI → '${shortFutureCov} Cov`;
+          subTone = 'warning';
+        } else if (approachingFutureCliff) {
+          badge = {
+            text: `Near IRMAA (${formatCompactCurrency(futureHeadroom)})`,
+            tone: 'warning',
+          };
+          subLabel = `≤${formatCompactCurrency(futureThreshold)} ('${shortFutureCov} Cov)`;
           subTone = 'warning';
         } else {
           badge = {
             text: 'IRMAA: Shielded',
             tone: 'positive',
           };
-          subLabel = `≤${formatCompactCurrency(futureThreshold)} (${futureCovYear} Cov)`;
+          subLabel = `≤${formatCompactCurrency(futureThreshold)} ('${shortFutureCov} Cov)`;
           subTone = 'neutral';
         }
       }
@@ -1135,7 +1143,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         badge,
         subLabel,
         subTone,
-        filedRef: getDefaultFiledRef(
+        filedRefTooltip: getDefaultFiledRef(
           c.tax_year,
           setup,
           DEFAULT_PROFILE_SEED.verification_benchmarks_2025.agi
@@ -1170,7 +1178,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         display: formatCurrency(c.form_1040_out.taxable_income),
         numericValue: c.form_1040_out.taxable_income,
         badge,
-        filedRef: getDefaultFiledRef(
+        filedRefTooltip: getDefaultFiledRef(
           c.tax_year,
           setup,
           DEFAULT_PROFILE_SEED.verification_benchmarks_2025.taxable_income
@@ -1198,7 +1206,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
           ? `Incl. ${formatCompactCurrency(c.form_1040_out.niit_tax)} NIIT`
           : undefined,
       subTone: c.form_1040_out.niit_tax > 0 ? 'warning' : 'neutral',
-      filedRef: getDefaultFiledRef(
+      filedRefTooltip: getDefaultFiledRef(
         c.tax_year,
         setup,
         DEFAULT_PROFILE_SEED.verification_benchmarks_2025.federal_tax
@@ -1206,8 +1214,29 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     }),
   },
   {
+    id: 'total_fica_payroll_tax',
+    section: 'tax_cashflow',
+    label: 'Total FICA / Payroll Taxes',
+    code: 'total_fica_payroll_tax',
+    description: 'Combined personal (employee SS & Medicare) and business (employer payroll) FICA taxes.',
+    bold: true,
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const personal = c.form_1040_out.personal_fica_tax;
+      const business = setup.has_scorp ? c.scorp_out.employer_payroll_taxes : 0;
+      const total = personal + business;
+      return {
+        display: formatCurrency(total),
+        numericValue: total,
+        subLabel: setup.has_scorp ? 'Pers + Bus Payroll' : 'Employee SS & Med',
+        subTone: 'neutral',
+      };
+    },
+  },
+  {
     id: 'personal_fica_tax',
     section: 'tax_cashflow',
+    parentId: 'total_fica_payroll_tax',
     label: 'Personal FICA / Payroll Taxes',
     code: 'personal_fica_tax',
     description: 'Employee Social Security (6.2% up to wage base), Medicare (1.45%), and 0.9% Additional Medicare withheld.',
@@ -1222,6 +1251,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'business_fica_tax',
     section: 'tax_cashflow',
+    parentId: 'total_fica_payroll_tax',
     label: 'Business FICA / Payroll Taxes',
     code: 'employer_payroll_taxes',
     description: 'Employer-side payroll taxes (Form 1120-S payroll tax line / Employer FICA + FUTA).',
@@ -1234,8 +1264,56 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     }),
   },
   {
+    id: 'total_state_taxes',
+    section: 'tax_cashflow',
+    label: 'Total State Taxes',
+    code: 'total_state_tax',
+    description: 'Combined active state taxes (entity/franchise, PTE, and personal income tax across configured states).',
+    bold: true,
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const states = getSetupStates(setup);
+      const filings = c.state_filings_out;
+      let subLabel: string | undefined;
+
+      if (filings.length >= 2) {
+        const ordered = [
+          states.primaryStateCode
+            ? filings.find((sf) => sf.state_code === states.primaryStateCode)
+            : filings[0],
+          states.secondaryStateCode
+            ? filings.find((sf) => sf.state_code === states.secondaryStateCode)
+            : filings[1],
+        ].filter((sf): sf is NonNullable<typeof sf> => Boolean(sf));
+        const shown = ordered.length >= 2 ? ordered.slice(0, 2) : filings.slice(0, 2);
+        subLabel = shown
+          .map((sf) => `${sf.state_code} ${formatCompactCurrency(sf.state_income_tax_liability)}`)
+          .join(' · ');
+      } else if (filings.length === 1) {
+        const sf = filings[0];
+        const resTag =
+          sf.residency_status === 'resident'
+            ? 'Res'
+            : sf.residency_status === 'part_year_resident'
+            ? 'Part-Yr'
+            : 'Non-Res';
+        subLabel = `${sf.state_code} ${resTag}`;
+      } else if (states.hasPrimaryState) {
+        subLabel = `${states.primaryStateCode} Active`;
+      }
+
+      return {
+        display: formatCurrency(c.total_state_tax),
+        numericValue: c.total_state_tax,
+        subLabel,
+        subTone: 'neutral',
+      };
+    },
+  },
+  {
     id: 'ca_state_tax',
     section: 'tax_cashflow',
+    parentId: 'total_state_taxes',
     label: 'Primary State Tax',
     getLabel: (s) => {
       const { primaryStateName, hasPrimaryState } = getSetupStates(s);
@@ -1249,6 +1327,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'az_state_tax',
     section: 'tax_cashflow',
+    parentId: 'total_state_taxes',
     label: 'Secondary State Tax',
     getLabel: (s) => {
       const { secondaryStateName, hasSecondaryState } = getSetupStates(s);
@@ -1419,8 +1498,25 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     },
   },
   {
+    id: 'quarterly_safe_harbor',
+    section: 'tax_cashflow',
+    label: 'Quarterly Estimated Tax Safe Harbor',
+    code: 'quarterly_safe_harbor',
+    description: 'Quarterly IRS estimated tax safe-harbor target (expand for Statutory Minimum Penalty Shield and Suggested 1040-ES details).',
+    bold: true,
+    summable: false,
+    computeCell: (c, idx, all) => {
+      const sh = getSafeHarborInfo(c, idx, all);
+      return {
+        display: `${formatCurrency(Math.round(sh.amount / 4))}/qtr`,
+        badge: { text: sh.basisLabel, tone: sh.tone },
+      };
+    },
+  },
+  {
     id: 'statutory_min_penalty_shield',
     section: 'tax_cashflow',
+    parentId: 'quarterly_safe_harbor',
     label: 'Statutory Minimum Penalty Shield',
     code: 'safe_harbor_minimum',
     description: 'IRS quarterly underpayment safe harbor (lesser of 90% current-year or 100%/110% prior-year federal tax).',
@@ -1436,6 +1532,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'suggested_1040es',
     section: 'tax_cashflow',
+    parentId: 'quarterly_safe_harbor',
     label: 'Suggested 1040-ES (Pay-As-You-Go)',
     code: 'suggested_1040es_quarterly',
     description: 'Suggested quarterly federal estimated tax installment (25% of annual federal tax / safe harbor).',

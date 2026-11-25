@@ -413,10 +413,13 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         ) {
           return false;
         }
+        if (!setup.has_scorp && item.id === 'total_fica_payroll_tax') {
+          return false;
+        }
         if (!showMultiState && item.id === 'az_state_tax') {
           return false;
         }
-        if (!showMultiState && !setup.home_state && item.id === 'ca_state_tax') {
+        if (!showMultiState && !setup.home_state && (item.id === 'ca_state_tax' || item.id === 'total_state_taxes')) {
           return false;
         }
         const hasTwoStatesForPayments = Boolean(
@@ -1632,11 +1635,9 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                       const isPrimaryHighlight = row.highlight === 'primary';
                       const isCompactRow =
                         row.section === 'scorp_basis' ||
-                        row.section === 'taxes_paid' ||
-                        row.id === 'total_taxes_paid' ||
-                        row.id === 'net_tax_due_or_refund' ||
-                        row.id === 'federal_net_tax_due' ||
-                        row.id === 'state_net_tax_due';
+                        row.section === 'personal_taxable' ||
+                        row.section === 'tax_cashflow' ||
+                        row.section === 'taxes_paid';
                       const isSsRow = row.editField === 'ss_debra' || row.editField === 'ss_bill';
                       const ssPerson: 'debra' | 'bill' =
                         row.editField === 'ss_debra' ? 'debra' : 'bill';
@@ -1913,14 +1914,20 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     >
                                       {cell.display}
                                     </button>
-                                  ) : cell.filedRefTooltip ? (
+                                  ) : cell.filedRefTooltip || cell.detailTooltip ? (
                                     <IrmaaHoverTooltip
-                                      text={`${c.tax_year} Return · ${cell.filedRefTooltip}`}
+                                      text={
+                                        cell.filedRefTooltip
+                                          ? `${c.tax_year} Return · ${cell.filedRefTooltip}`
+                                          : cell.detailTooltip!
+                                      }
                                       compact
                                     >
                                       <span
                                         tabIndex={0}
-                                        aria-label={`${rowLabel} ${c.tax_year}: ${cell.display} (${cell.filedRefTooltip})`}
+                                        aria-label={`${rowLabel} ${c.tax_year}: ${cell.display} (${
+                                          cell.filedRefTooltip ?? cell.detailTooltip
+                                        })`}
                                         className={`font-mono text-xs tabular-nums whitespace-nowrap border-b border-dotted border-slate-300 hover:border-teal-600 cursor-help focus:outline-none focus:ring-1 focus:ring-teal-600 rounded-sm ${
                                           isPrimaryHighlight
                                             ? 'font-semibold text-white'
@@ -2019,9 +2026,11 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                       <IrmaaHoverTooltip text={IRMAA_LOOKBACK_TOOLTIP}>
                                         <span
                                           tabIndex={0}
-                                          className={`inline-flex items-center gap-1 text-[10px] font-medium leading-tight px-1.5 py-0.5 rounded border whitespace-nowrap cursor-help focus:outline-none focus:ring-1 focus:ring-teal-600 ${
-                                            BADGE_TONE_CLASS[cell.badge.tone]
-                                          }`}
+                                          className={`inline-flex items-center gap-1 text-[10px] leading-tight px-1.5 py-[1px] rounded border whitespace-nowrap cursor-help focus:outline-none focus:ring-1 focus:ring-teal-600 ${
+                                            cell.badge.tone === 'warning' || cell.badge.tone === 'danger'
+                                              ? 'font-semibold'
+                                              : 'font-medium'
+                                          } ${BADGE_TONE_CLASS[cell.badge.tone]}`}
                                         >
                                           <span>{cell.badge.text}</span>
                                           <Info className="w-2.5 h-2.5 opacity-70 shrink-0" aria-hidden="true" />
@@ -2053,16 +2062,24 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                         isCompactRow
                                           ? 'text-[9.5px] leading-tight whitespace-nowrap'
                                           : 'text-[10px] leading-snug whitespace-normal'
+                                      } ${
+                                        cell.subTone === 'warning' || cell.subTone === 'danger'
+                                          ? 'font-medium'
+                                          : ''
                                       } mt-0.5 ${toneClass}`}
                                     >
                                       {cell.subLabel}
                                     </div>
                                   )}
 
-                                {/* Subtle Filed 2025 Return Reference Sub-Label */}
+                                {/* Subtle Filed 2025 Return Reference / Compact Cadence Sub-Label */}
                                 {cell.filedRef && (
                                   <div
-                                    className={`text-[10px] font-mono tabular-nums leading-tight mt-0.5 whitespace-nowrap ${
+                                    className={`${
+                                      isCompactRow
+                                        ? 'text-[9.5px] leading-tight mt-[1px]'
+                                        : 'text-[10px] leading-tight mt-0.5'
+                                    } font-mono tabular-nums whitespace-nowrap ${
                                       isPrimaryHighlight ? 'text-slate-300' : 'text-slate-400'
                                     }`}
                                   >
