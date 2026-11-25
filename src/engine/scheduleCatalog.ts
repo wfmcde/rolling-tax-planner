@@ -58,6 +58,8 @@ export interface ScheduleCellResult {
   subTone?: CellTone;
   /** Optional subtle filed-return reference sub-label shown for Year 1 (2025) comparison */
   filedRef?: string;
+  /** Optional filed-return reference shown in a compact hover tooltip instead of an extra stacked row */
+  filedRefTooltip?: string;
   /** Optional compact inline status/flag badge */
   badge?: {
     text: string;
@@ -68,6 +70,8 @@ export interface ScheduleCellResult {
 export interface ScheduleLineItem {
   id: string;
   section: ScheduleSectionId;
+  /** Optional parent row id when this line item belongs to an expandable/collapsible parent group */
+  parentId?: string;
   label: string;
   getLabel?: (setup: SetupConfig) => string;
   code: string;
@@ -274,8 +278,27 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   // Group 1 — Income & Compensation Inputs
   // =========================================================================
   {
+    id: 'scorp_gross_revenue',
+    section: 'income_comp',
+    label: 'Total S-Corp Gross Revenue',
+    code: 'gross_receipts_revenue',
+    description: 'Auto-calculated sum of S-Corp gross receipts across active states (expand to edit individual state revenues).',
+    bold: true,
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const s1 = setup.has_scorp ? c.scorp_in.ca_revenue : 0;
+      const s2 = setup.has_scorp ? c.scorp_in.az_revenue : 0;
+      const total = setup.has_scorp ? s1 + s2 : 0;
+      return {
+        display: formatCurrency(total),
+        numericValue: total,
+      };
+    },
+  },
+  {
     id: 'ca_scorp_revenue',
     section: 'income_comp',
+    parentId: 'scorp_gross_revenue',
     label: 'Primary State S-Corp Revenue',
     getLabel: (s) => {
       const { primaryStateName, hasPrimaryState } = getSetupStates(s);
@@ -303,6 +326,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'az_scorp_revenue',
     section: 'income_comp',
+    parentId: 'scorp_gross_revenue',
     label: 'Secondary State S-Corp Revenue',
     getLabel: (s) => {
       const { secondaryStateName, hasSecondaryState } = getSetupStates(s);
@@ -330,40 +354,30 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     },
   },
   {
-    id: 'scorp_gross_revenue',
+    id: 'total_w2_comp',
     section: 'income_comp',
-    label: 'Total S-Corp Gross Revenue',
-    code: 'gross_receipts_revenue',
-    description: 'Auto-calculated sum of S-Corp gross receipts with live state apportionment split.',
+    label: 'Total W-2 Compensation',
+    code: 'total_w2_compensation',
+    description: 'Auto-calculated combined cash W-2 compensation (expand to edit individual W-2 compensation inputs).',
     bold: true,
     summable: true,
     computeCell: (c, _i, _all, setup) => {
-      const s1 = setup.has_scorp ? c.scorp_in.ca_revenue : 0;
-      const s2 = setup.has_scorp ? c.scorp_in.az_revenue : 0;
-      const total = setup.has_scorp ? s1 + s2 : 0;
-      const pct1 = total > 0 ? ((s1 / total) * 100).toFixed(1) : '0.0';
-      const pct2 = total > 0 ? ((s2 / total) * 100).toFixed(1) : '0.0';
-      const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
-      const badgeText = !setup.has_scorp
-        ? 'S-Corp off'
-        : setup.multi_state_active && secondaryStateCode
-        ? `${primaryStateCode || 'S1'} ${pct1}% / ${secondaryStateCode} ${pct2}%`
-        : primaryStateCode
-        ? `100% ${primaryStateCode}`
-        : 'Single State';
+      const primaryVal = setup.has_scorp ? c.scorp_in.bill_w2_wages : c.form_1040_in.w2_wages_total;
+      const spouseVal =
+        setup.has_scorp && setup.filing_status === 'married_filing_jointly'
+          ? c.scorp_in.debra_w2_wages
+          : 0;
+      const total = primaryVal + spouseVal;
       return {
         display: formatCurrency(total),
         numericValue: total,
-        badge: {
-          text: badgeText,
-          tone: setup.has_scorp ? 'accent' : 'neutral',
-        },
       };
     },
   },
   {
     id: 'bill_w2_comp',
     section: 'income_comp',
+    parentId: 'total_w2_comp',
     label: 'Primary W-2 Compensation',
     getLabel: (s) => `${getPersonNames(s).primaryName} W-2 Compensation`,
     code: 'bill_w2_wages',
@@ -385,6 +399,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'debra_w2_comp',
     section: 'income_comp',
+    parentId: 'total_w2_comp',
     label: 'Spouse W-2 Compensation',
     getLabel: (s) => `${getPersonNames(s).spouseName} W-2 Compensation`,
     code: 'debra_w2_wages',
@@ -412,10 +427,35 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     },
   },
   {
+    id: 'total_social_security',
+    section: 'income_comp',
+    label: 'Total Social Security',
+    code: 'social_security_gross_effective',
+    description: 'Auto-calculated combined annual gross Social Security benefits (expand to edit individual schedules and status toggles).',
+    bold: true,
+    summable: true,
+    computeCell: (c, _i, _all, setup) => {
+      const primaryVal = c.form_1040_out.primary_ss_gross;
+      const spouseVal =
+        setup.filing_status === 'married_filing_jointly' ? c.form_1040_out.spouse_ss_gross : 0;
+      const total = primaryVal + spouseVal;
+      return {
+        display: formatCurrency(total),
+        numericValue: total,
+      };
+    },
+  },
+  {
     id: 'ss_bill',
     section: 'income_comp',
-    label: 'SS Primary',
-    getLabel: (s) => `SS ${getPersonNames(s).primaryName}`,
+    parentId: 'total_social_security',
+    label: 'Primary Social Security',
+    getLabel: (s) => {
+      const { primaryName } = getPersonNames(s);
+      return primaryName === 'Primary'
+        ? 'Primary Social Security'
+        : `Primary (${primaryName}) Social Security`;
+    },
     code: 'primary_ss_gross',
     description: 'Primary Taxpayer annual gross Social Security benefit with On / Suspended / Off toggle and inline dollar override.',
     summable: true,
@@ -452,8 +492,14 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'ss_debra',
     section: 'income_comp',
-    label: 'SS Spouse',
-    getLabel: (s) => `SS ${getPersonNames(s).spouseName}`,
+    parentId: 'total_social_security',
+    label: 'Spouse Social Security',
+    getLabel: (s) => {
+      const { spouseName } = getPersonNames(s);
+      return spouseName === 'Spouse'
+        ? 'Spouse Social Security'
+        : `Spouse (${spouseName}) Social Security`;
+    },
     code: 'spouse_ss_gross',
     description: 'Spouse annual gross Social Security benefit with On / Suspended / Off toggle and inline dollar override.',
     summable: true,
@@ -496,7 +542,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'scorp_operating_expenses',
     section: 'scorp_basis',
-    label: 'S-Corp Operating Expenses (Excl. Payroll & Ret.)',
+    label: 'S-Corp Operating Expenses',
     code: 'effective_operating_expenses',
     description:
       'Non-payroll, non-retirement S-Corp operating expenses (excludes W-2 wages, employer payroll taxes, >2% SEHI, DBP, and employer 401(k)). Unlocked future forecast years auto-scale proportionally with Gross Revenue unless switched to Fixed mode or manually overridden per year.',
@@ -515,15 +561,15 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
       if (!setup.has_scorp) {
         subLabel = 'S-Corp off';
       } else if (c.is_locked_actuals) {
-        subLabel = `${pctOfRev}% of rev · ${c.tax_year} Actuals`;
+        subLabel = `${pctOfRev}% rev · Act`;
       } else if (isOverridden) {
-        subLabel = `${pctOfRev}% of rev`;
+        subLabel = `${pctOfRev}% rev`;
       } else if (isScaled) {
-        subLabel = `${ratioPct}% of rev (auto)`;
+        subLabel = `${ratioPct}% rev (auto)`;
       } else if (c.tax_year <= setupBaseYear) {
-        subLabel = `${pctOfRev}% of rev (${setupBaseYear} Base)`;
+        subLabel = `${pctOfRev}% rev (base)`;
       } else {
-        subLabel = `${pctOfRev}% of rev (fixed)`;
+        subLabel = `${pctOfRev}% rev (fixed)`;
       }
 
       return {
@@ -539,9 +585,9 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
   {
     id: 'scorp_k1_profit',
     section: 'scorp_basis',
-    label: 'S-Corp K-1 Pass-Through Profit (Flows to 1040)',
+    label: 'S-Corp K-1 Profit (Line 22)',
     code: 'schedule_k1_ordinary_income',
-    description: 'Form 1120-S ordinary business income passing through via Schedule K-1 Box 1 (net of operating expenses, cash W-2, S-Corp >2% SEHI, employer payroll taxes, DBP, employer 401(k), and PTE).',
+    description: 'Form 1120-S Line 22 ordinary business income passing through to Form 1040 via Schedule K-1 Box 1 (net of operating expenses, cash W-2, S-Corp >2% SEHI, employer payroll taxes, DBP, employer 401(k), and PTE).',
     bold: true,
     summable: true,
     computeCell: (c, _i, _all, setup) => {
@@ -614,7 +660,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
           ? `Beg ${formatCompactCurrency(c.scorp_in.stock_basis_beginning)}`
           : undefined,
         subTone: setup.has_scorp && val <= 0 ? 'warning' : 'neutral',
-        filedRef: getDefaultFiledRef(
+        filedRefTooltip: getDefaultFiledRef(
           c.tax_year,
           setup,
           DEFAULT_PROFILE_SEED.verification_benchmarks_2025.ending_stock_basis
@@ -638,7 +684,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
           excess > 0
             ? { text: 'Basis Exceeded', tone: 'danger' }
             : { text: 'Basis OK', tone: 'positive' },
-        filedRef: getDefaultFiledRef(
+        filedRefTooltip: getDefaultFiledRef(
           c.tax_year,
           setup,
           DEFAULT_PROFILE_SEED.verification_benchmarks_2025.excess_dist_gain

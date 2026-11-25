@@ -111,8 +111,9 @@ const IRMAA_LOOKBACK_TOOLTIP =
 
 const IrmaaHoverTooltip: React.FC<{
   text: string;
+  compact?: boolean;
   children: React.ReactNode;
-}> = ({ text, children }) => {
+}> = ({ text, compact = false, children }) => {
   const [coords, setCoords] = useState<{
     left: number;
     top: number;
@@ -121,17 +122,17 @@ const IrmaaHoverTooltip: React.FC<{
 
   const showFromElement = (el: HTMLElement) => {
     const rect = el.getBoundingClientRect();
-    const tooltipWidth = 288;
+    const tooltipWidth = compact ? 180 : 288;
     const margin = 12;
     const centerX = rect.left + rect.width / 2;
     const clampedLeft = Math.max(
       margin,
       Math.min(window.innerWidth - tooltipWidth - margin, centerX - tooltipWidth / 2)
     );
-    const showBelow = rect.top < 115;
+    const showBelow = rect.top < (compact ? 64 : 115);
     setCoords({
       left: clampedLeft,
-      top: showBelow ? rect.bottom + 8 : rect.top - 8,
+      top: showBelow ? rect.bottom + 6 : rect.top - 6,
       placement: showBelow ? 'bottom' : 'top',
     });
   };
@@ -153,7 +154,11 @@ const IrmaaHoverTooltip: React.FC<{
             top: `${coords.top}px`,
             transform: coords.placement === 'top' ? 'translateY(-100%)' : undefined,
           }}
-          className="fixed z-50 w-72 px-3 py-2 rounded-md bg-slate-900 text-slate-50 border border-slate-700/80 shadow-lg text-[11px] font-normal leading-relaxed text-left whitespace-normal pointer-events-none"
+          className={`fixed z-50 rounded-md bg-slate-900 text-slate-50 border border-slate-700/80 shadow-lg text-[11px] font-normal pointer-events-none ${
+            compact
+              ? 'w-max max-w-xs px-2.5 py-1 font-mono tabular-nums whitespace-nowrap'
+              : 'w-72 px-3 py-2 leading-relaxed text-left whitespace-normal'
+          }`}
         >
           {text}
         </span>
@@ -191,6 +196,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
   exportingShadowReturn,
 }) => {
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [editingCell, setEditingCell] = useState<{
     rowId: string;
     taxYear: number;
@@ -367,7 +373,8 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         }
         if (
           !showSsMedicare &&
-          (item.id === 'ss_bill' ||
+          (item.id === 'total_social_security' ||
+            item.id === 'ss_bill' ||
             item.id === 'ss_debra' ||
             item.id === 'taxable_social_security' ||
             item.id === 'sehi_medicare_premiums' ||
@@ -428,6 +435,71 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
       ),
     })).filter((g) => g.rows.length > 0);
   }, [moduleEligibleItemIds, hiddenRowIds]);
+
+  const collapsibleParentChildMap = useMemo(() => {
+    const visibleIdSet = new Set<string>();
+    for (const { rows } of visibleSections) {
+      for (const r of rows) {
+        visibleIdSet.add(r.id);
+      }
+    }
+    const map = new Map<string, string[]>();
+    for (const { rows } of visibleSections) {
+      for (const r of rows) {
+        if (r.parentId && visibleIdSet.has(r.parentId)) {
+          const list = map.get(r.parentId) ?? [];
+          list.push(r.id);
+          map.set(r.parentId, list);
+        }
+      }
+    }
+    return map;
+  }, [visibleSections]);
+
+  const eligibleCollapsibleGroupIds = useMemo(
+    () => Array.from(collapsibleParentChildMap.keys()),
+    [collapsibleParentChildMap]
+  );
+
+  const allGroupsExpanded =
+    eligibleCollapsibleGroupIds.length > 0 &&
+    eligibleCollapsibleGroupIds.every((id) => Boolean(expandedGroups[id]));
+
+  const toggleGroup = (parentId: string) => {
+    setExpandedGroups((prev) => {
+      const nextExpanded = !prev[parentId];
+      if (!nextExpanded && editingCell) {
+        const childIds = collapsibleParentChildMap.get(parentId) ?? [];
+        if (childIds.includes(editingCell.rowId)) {
+          setEditingCell(null);
+        }
+      }
+      return {
+        ...prev,
+        [parentId]: nextExpanded,
+      };
+    });
+  };
+
+  const handleToggleAllGroups = () => {
+    if (allGroupsExpanded) {
+      if (editingCell) {
+        for (const childIds of collapsibleParentChildMap.values()) {
+          if (childIds.includes(editingCell.rowId)) {
+            setEditingCell(null);
+            break;
+          }
+        }
+      }
+      setExpandedGroups({});
+    } else {
+      const next: Record<string, boolean> = {};
+      for (const id of eligibleCollapsibleGroupIds) {
+        next[id] = true;
+      }
+      setExpandedGroups(next);
+    }
+  };
 
   const isCellEditable = (editField: ScheduleEditField | undefined, c: ComputedTaxYear): boolean => {
     if (!editField) return false;
@@ -1375,6 +1447,18 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                 <span>CPA Print Package</span>
               </button>
             )}
+            {eligibleCollapsibleGroupIds.length > 0 && (
+              <button
+                type="button"
+                onClick={handleToggleAllGroups}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:border-teal-700 hover:text-teal-900 transition-colors whitespace-nowrap"
+              >
+                <span aria-hidden="true" className="text-[11px] leading-none text-teal-700">
+                  {allGroupsExpanded ? '▾' : '▸'}
+                </span>
+                <span>{allGroupsExpanded ? 'Collapse All' : 'Expand All'}</span>
+              </button>
+            )}
             <div className="relative">
               <button
                 type="button"
@@ -1426,7 +1510,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
             <table className="w-full text-left border-collapse min-w-[820px]">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50/80">
-                  <th className="py-3 px-4 text-xs font-semibold text-slate-600 w-[250px]">
+                  <th className="py-3 px-4 text-xs font-semibold text-slate-600 w-[264px] min-w-[264px]">
                     Line Item
                   </th>
                   {computed.map((c) => {
@@ -1434,7 +1518,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                     return (
                       <th
                         key={c.tax_year}
-                        className="py-2.5 px-3 last:pr-4 text-right min-w-[104px]"
+                        className="py-2.5 px-3 last:pr-4 text-right min-w-[108px]"
                       >
                         <button
                           type="button"
@@ -1471,6 +1555,16 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                       </td>
                     </tr>
                     {rows.map((row) => {
+                      const isGroupedChild = Boolean(
+                        row.parentId && collapsibleParentChildMap.has(row.parentId)
+                      );
+                      if (isGroupedChild && row.parentId && !expandedGroups[row.parentId]) {
+                        return null;
+                      }
+
+                      const isCollapsibleParent = collapsibleParentChildMap.has(row.id);
+                      const isGroupExpanded = isCollapsibleParent && Boolean(expandedGroups[row.id]);
+
                       const rowLabel = getScheduleRowLabel(row, setup);
                       const cells = computed.map((c, idx) =>
                         row.computeCell(c, idx, computed, setup)
@@ -1481,9 +1575,16 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                           ? 'bg-slate-900 text-white hover:bg-slate-900'
                           : row.highlight === 'secondary'
                           ? 'bg-teal-50/70 hover:bg-teal-50'
+                          : isCollapsibleParent
+                          ? isGroupExpanded
+                            ? 'bg-slate-50/70 hover:bg-teal-50/40 cursor-pointer select-none group'
+                            : 'hover:bg-teal-50/40 cursor-pointer select-none group'
+                          : isGroupedChild
+                          ? 'bg-slate-50/45 hover:bg-slate-100/60'
                           : 'hover:bg-slate-50/70';
 
                       const isPrimaryHighlight = row.highlight === 'primary';
+                      const isCompactGroup2 = row.section === 'scorp_basis';
                       const isSsRow = row.editField === 'ss_debra' || row.editField === 'ss_bill';
                       const ssPerson: 'debra' | 'bill' =
                         row.editField === 'ss_debra' ? 'debra' : 'bill';
@@ -1491,66 +1592,104 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                       return (
                         <tr
                           key={row.id}
+                          onClick={isCollapsibleParent ? () => toggleGroup(row.id) : undefined}
                           className={`border-b ${
                             isPrimaryHighlight ? 'border-slate-800' : 'border-slate-100'
                           } transition-colors ${rowBg}`}
                         >
-                          <td className="py-2 px-4 align-top">
-                            <div className="flex items-center gap-1.5">
-                              <span
-                                className={`text-xs leading-snug ${
-                                  isPrimaryHighlight
-                                    ? 'font-semibold text-white'
-                                    : row.bold
-                                    ? 'font-semibold text-slate-900'
-                                    : 'text-slate-700'
-                                }`}
-                              >
-                                {rowLabel}
-                              </span>
-                              {row.id === 'irmaa_starting_threshold' && (
-                                <IrmaaHoverTooltip text={IRMAA_LOOKBACK_TOOLTIP}>
+                          <td
+                            className={`${isCompactGroup2 ? 'py-1.5' : 'py-2'} align-top ${
+                              isGroupedChild ? 'pl-8 pr-4' : 'px-4'
+                            }`}
+                          >
+                            <div
+                              className={
+                                isGroupedChild ? 'border-l-2 border-teal-600/30 pl-2.5' : undefined
+                              }
+                            >
+                              <div className="flex items-center gap-1.5">
+                                {isCollapsibleParent ? (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleGroup(row.id);
+                                    }}
+                                    aria-expanded={isGroupExpanded}
+                                    className="inline-flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-teal-700 rounded-sm"
+                                  >
+                                    <span
+                                      aria-hidden="true"
+                                      className={`inline-flex items-center justify-center w-3.5 text-xs leading-none transition-colors ${
+                                        isGroupExpanded
+                                          ? 'text-teal-700'
+                                          : 'text-slate-500 group-hover:text-teal-700'
+                                      }`}
+                                    >
+                                      {isGroupExpanded ? '▾' : '▸'}
+                                    </span>
+                                    <span className="text-xs leading-snug font-semibold text-slate-900">
+                                      {rowLabel}
+                                    </span>
+                                  </button>
+                                ) : (
                                   <span
-                                    tabIndex={0}
-                                    aria-label="How Medicare IRMAA 2-year lookback works"
-                                    className="inline-flex items-center justify-center text-slate-400 hover:text-teal-700 focus:text-teal-700 focus:outline-none cursor-help"
+                                    className={`text-xs leading-snug ${
+                                      isPrimaryHighlight
+                                        ? 'font-semibold text-white'
+                                        : row.bold
+                                        ? 'font-semibold text-slate-900'
+                                        : isGroupedChild
+                                        ? 'text-slate-600'
+                                        : 'text-slate-700'
+                                    }`}
                                   >
-                                    <Info className="w-3.5 h-3.5 shrink-0" />
+                                    {rowLabel}
                                   </span>
-                                </IrmaaHoverTooltip>
-                              )}
-                              {row.editField && (
-                                <Pencil
-                                  className="w-2.5 h-2.5 text-teal-600/70 shrink-0"
-                                  aria-label="Inline editable 2026–2030"
-                                />
-                              )}
-                            </div>
-                            {isSsRow &&
-                              (ssPerson === 'bill' ||
-                                setup.filing_status === 'married_filing_jointly') && (
-                                <div className="mt-1 flex items-center gap-1 text-[10px] text-slate-500">
-                                  <span>Birth mo:</span>
-                                  <select
-                                    aria-label={`${rowLabel} birth month for FRA and age-70 proration`}
-                                    value={
-                                      ssPerson === 'bill'
-                                        ? getPersonBirthMonth(setup.primary_profile, 1)
-                                        : getPersonBirthMonth(setup.spouse_profile, 1)
-                                    }
-                                    onChange={(e) =>
-                                      handleSsBirthMonthChange(ssPerson, Number(e.target.value))
-                                    }
-                                    className="text-[10px] font-mono text-slate-700 bg-slate-50 border border-slate-200 rounded px-1 py-0.2 focus:outline-none focus:border-teal-700 cursor-pointer"
-                                  >
-                                    {MONTH_SHORT_NAMES.map((mLabel, mIdx) => (
-                                      <option key={mLabel} value={mIdx + 1}>
-                                        {mLabel}
-                                      </option>
-                                    ))}
-                                  </select>
-                                </div>
-                              )}
+                                )}
+                                {row.id === 'irmaa_starting_threshold' && (
+                                  <IrmaaHoverTooltip text={IRMAA_LOOKBACK_TOOLTIP}>
+                                    <span
+                                      tabIndex={0}
+                                      aria-label="How Medicare IRMAA 2-year lookback works"
+                                      className="inline-flex items-center justify-center text-slate-400 hover:text-teal-700 focus:text-teal-700 focus:outline-none cursor-help"
+                                    >
+                                      <Info className="w-3.5 h-3.5 shrink-0" />
+                                    </span>
+                                  </IrmaaHoverTooltip>
+                                )}
+                                {row.editField && (
+                                  <Pencil
+                                    className="w-2.5 h-2.5 text-teal-600/70 shrink-0"
+                                    aria-label="Inline editable 2026–2030"
+                                  />
+                                )}
+                              </div>
+                              {isSsRow &&
+                                (ssPerson === 'bill' ||
+                                  setup.filing_status === 'married_filing_jointly') && (
+                                  <div className="mt-1 flex items-center gap-1 text-[10px] text-slate-500">
+                                    <span>Birth mo:</span>
+                                    <select
+                                      aria-label={`${rowLabel} birth month for FRA and age-70 proration`}
+                                      value={
+                                        ssPerson === 'bill'
+                                          ? getPersonBirthMonth(setup.primary_profile, 1)
+                                          : getPersonBirthMonth(setup.spouse_profile, 1)
+                                      }
+                                      onChange={(e) =>
+                                        handleSsBirthMonthChange(ssPerson, Number(e.target.value))
+                                      }
+                                      className="text-[10px] font-mono text-slate-700 bg-slate-50 border border-slate-200 rounded px-1 py-0.2 focus:outline-none focus:border-teal-700 cursor-pointer"
+                                    >
+                                      {MONTH_SHORT_NAMES.map((mLabel, mIdx) => (
+                                        <option key={mLabel} value={mIdx + 1}>
+                                          {mLabel}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                )}
                             {row.id === 'scorp_operating_expenses' && setup.has_scorp && (() => {
                               const opexMode =
                                 setup.assumptions.opex_scaling_mode ?? 'revenue_proportional';
@@ -1559,10 +1698,10 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                               );
                               const futureStartYear = setup.current_tax_year + 1;
                               return (
-                                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">
+                                <div className="mt-0.5 flex flex-nowrap items-center gap-1 text-[10px] text-slate-500 whitespace-nowrap">
                                   <span>{futureStartYear}+:</span>
                                   <div
-                                    className="inline-flex items-center rounded border border-slate-200 bg-slate-50 p-0.5 gap-0.5"
+                                    className="inline-flex items-center rounded border border-slate-200 bg-slate-50 p-0.5 gap-0.5 shrink-0"
                                     role="group"
                                     aria-label="Forecast Operating Expenses scaling mode"
                                   >
@@ -1598,7 +1737,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     })}
                                   </div>
                                   {opexMode === 'revenue_proportional' && (
-                                    <label className="inline-flex items-center gap-0.5 font-mono text-slate-700">
+                                    <label className="inline-flex items-center gap-0.5 font-mono text-slate-700 shrink-0">
                                       <input
                                         type="number"
                                         aria-label="Forecast operating expense ratio percent of revenue"
@@ -1618,7 +1757,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                             },
                                           });
                                         }}
-                                        className="w-12 text-right text-[10px] font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded px-1 py-0.2 focus:outline-none focus:border-teal-700"
+                                        className="w-11 text-right text-[10px] font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded px-1 py-0 leading-tight focus:outline-none focus:border-teal-700"
                                       />
                                       <span>%</span>
                                     </label>
@@ -1626,6 +1765,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                 </div>
                               );
                             })()}
+                            </div>
                           </td>
 
                           {computed.map((c, idx) => {
@@ -1645,7 +1785,9 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                             return (
                               <td
                                 key={c.tax_year}
-                                className={`py-2 px-3 last:pr-4 text-right align-top ${
+                                className={`${
+                                  isCompactGroup2 ? 'py-1.5' : 'py-2'
+                                } px-3 last:pr-4 text-right align-top ${
                                   !isPrimaryHighlight && c.record_mode === 'actuals'
                                     ? 'bg-slate-50/50'
                                     : ''
@@ -1710,6 +1852,25 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     >
                                       {cell.display}
                                     </button>
+                                  ) : cell.filedRefTooltip ? (
+                                    <IrmaaHoverTooltip
+                                      text={`${c.tax_year} Return · ${cell.filedRefTooltip}`}
+                                      compact
+                                    >
+                                      <span
+                                        tabIndex={0}
+                                        aria-label={`${rowLabel} ${c.tax_year}: ${cell.display} (${cell.filedRefTooltip})`}
+                                        className={`font-mono text-xs tabular-nums whitespace-nowrap border-b border-dotted border-slate-300 hover:border-teal-600 cursor-help focus:outline-none focus:ring-1 focus:ring-teal-600 rounded-sm ${
+                                          isPrimaryHighlight
+                                            ? 'font-semibold text-white'
+                                            : row.bold
+                                            ? 'font-semibold text-slate-900'
+                                            : 'text-slate-700'
+                                        }`}
+                                      >
+                                        {cell.display}
+                                      </span>
+                                    </IrmaaHoverTooltip>
                                   ) : (
                                     <div
                                       className={`font-mono text-xs tabular-nums whitespace-nowrap ${
@@ -1791,7 +1952,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
 
                                 {/* Status / Alert Badge */}
                                 {cell.badge && (
-                                  <div className="mt-1 flex justify-end">
+                                  <div className={`${isCompactGroup2 ? 'mt-0.5' : 'mt-1'} flex justify-end`}>
                                     {row.id === 'total_joint_agi' ? (
                                       <IrmaaHoverTooltip text={IRMAA_LOOKBACK_TOOLTIP}>
                                         <span
@@ -1806,7 +1967,9 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                       </IrmaaHoverTooltip>
                                     ) : (
                                       <span
-                                        className={`inline-block text-[10px] font-medium leading-tight px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                                        className={`inline-block text-[10px] font-medium leading-tight px-1.5 ${
+                                          isCompactGroup2 ? 'py-0' : 'py-0.5'
+                                        } rounded border whitespace-nowrap ${
                                           BADGE_TONE_CLASS[cell.badge.tone]
                                         }`}
                                       >
@@ -1824,7 +1987,11 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     (cell.subLabel === 'On' || cell.subLabel === 'Off')
                                   ) && (
                                     <div
-                                      className={`text-[10px] leading-snug mt-0.5 whitespace-normal ${toneClass}`}
+                                      className={`${
+                                        isCompactGroup2
+                                          ? 'text-[9.5px] leading-tight whitespace-nowrap'
+                                          : 'text-[10px] leading-snug whitespace-normal'
+                                      } mt-0.5 ${toneClass}`}
                                     >
                                       {cell.subLabel}
                                     </div>

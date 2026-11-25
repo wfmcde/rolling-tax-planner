@@ -214,10 +214,13 @@ export const ScheduleRowPickerDrawer: React.FC<ScheduleRowPickerPopoverProps> = 
                 <div className="space-y-0.5">
                   {matched.map((item) => {
                     const isVisible = !hiddenRowIds.has(item.id);
+                    const isChild = Boolean(item.parentId);
                     return (
                       <label
                         key={item.id}
-                        className="flex items-center justify-between gap-2.5 py-1 px-1.5 -mx-1.5 rounded hover:bg-slate-50 cursor-pointer"
+                        className={`flex items-center justify-between gap-2.5 py-1 pr-1.5 -mx-1.5 rounded hover:bg-slate-50 cursor-pointer ${
+                          isChild ? 'pl-6' : 'pl-1.5'
+                        }`}
                       >
                         <span className="flex items-center gap-2 min-w-0">
                           <input
@@ -228,7 +231,11 @@ export const ScheduleRowPickerDrawer: React.FC<ScheduleRowPickerPopoverProps> = 
                           />
                           <span
                             className={`text-xs truncate ${
-                              isVisible ? 'text-slate-800' : 'text-slate-400 line-through'
+                              isVisible
+                                ? item.bold
+                                  ? 'font-medium text-slate-900'
+                                  : 'text-slate-700'
+                                : 'text-slate-400 line-through'
                             }`}
                           >
                             {getScheduleRowLabel(item, setup)}
