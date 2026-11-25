@@ -5,7 +5,7 @@ import type {
   SetupConfig,
   TaxYearRecord,
 } from '../types/tax';
-import { getAgeInTaxYear } from '../utils/personTax';
+import { getAgeInTaxYear, sumEnteredMedicareMonthly } from '../utils/personTax';
 
 /**
  * Pure statutory IRC §415(b) / §417(e) / §404(o) Defined Benefit Plan
@@ -137,9 +137,73 @@ export function resolveDbpActuarialConfig(setup: SetupConfig): DbpActuarialConfi
   };
 }
 
-export function getSyncedYearW2Salary(setup: SetupConfig, yr: TaxYearRecord): number {
+/**
+ * Resolves S-Corp >2% shareholder health insurance (SEHI / Medicare) included in
+ * W-2 Box 1 pensionable compensation per IRS Notice 2008-1.
+ * - Locked actuals or detailed filed 1120-S years already reflect filed W-2 Box 1 wages ($0 add-back).
+ * - Non-S-Corp profiles have $0 S-Corp SEHI add-back.
+ * - Forecast S-Corp years use live `sehi_medicare_premiums_effective` from `ComputedTaxYear`,
+ *   or mirror `taxEngine.ts` fallback logic when called without `computed`.
+ */
+export function getSyncedYearSehi(
+  setup: SetupConfig,
+  yr: TaxYearRecord,
+  comp?: ComputedTaxYear
+): number {
+  if (!setup.has_scorp) return 0;
+  if (yr.is_locked_actuals || yr.scorp_1120s.use_detailed_1120s_deductions) return 0;
+
+  if (comp) {
+    return Math.max(0, round0(comp.form_1040_out.sehi_medicare_premiums_effective ?? 0));
+  }
+
+  const f1040In = yr.form_1040;
+  if (
+    typeof f1040In.sehi_medicare_override === 'number' &&
+    Number.isFinite(f1040In.sehi_medicare_override)
+  ) {
+    return Math.max(0, round0(f1040In.sehi_medicare_override));
+  }
+
+  const setupBaseYear =
+    setup.current_tax_year ?? (setup.forecast_years[1] ?? setup.anchor_actuals_year + 1);
+  const yearsFromSetupBase = Math.max(0, yr.tax_year - setupBaseYear);
+  const medInflationRate = setup.assumptions?.medicare_inflation_rate ?? 0.055;
+  const medInflationFactor = Math.pow(1 + medInflationRate, yearsFromSetupBase);
+
+  const primaryEnrolled = Boolean(setup.primary_profile?.medicare.enrolled);
+  const spouseEnrolled =
+    setup.filing_status === 'married_filing_jointly' &&
+    Boolean(setup.spouse_profile?.medicare.enrolled);
+
+  const primaryAnnual =
+    primaryEnrolled && setup.primary_profile
+      ? round0(sumEnteredMedicareMonthly(setup.primary_profile.medicare) * 12 * medInflationFactor)
+      : 0;
+  const spouseAnnual =
+    spouseEnrolled && setup.spouse_profile
+      ? round0(sumEnteredMedicareMonthly(setup.spouse_profile.medicare) * 12 * medInflationFactor)
+      : 0;
+
+  const setupMedicareCombined = primaryAnnual + spouseAnnual;
+  if (setupMedicareCombined > 0) {
+    return setupMedicareCombined;
+  }
+
+  return Math.max(0, round0(f1040In.health_insurance_premiums ?? 0));
+}
+
+export function getSyncedYearW2Salary(
+  setup: SetupConfig,
+  yr: TaxYearRecord,
+  comp?: ComputedTaxYear
+): number {
   if (setup.has_scorp) {
-    return Math.max(0, round0((yr.scorp_1120s.bill_w2_wages ?? 0) + (yr.scorp_1120s.debra_w2_wages ?? 0)));
+    const baseW2 = Math.max(
+      0,
+      round0((yr.scorp_1120s.bill_w2_wages ?? 0) + (yr.scorp_1120s.debra_w2_wages ?? 0))
+    );
+    return baseW2 + getSyncedYearSehi(setup, yr, comp);
   }
   return Math.max(0, round0(yr.form_1040.w2_wages_total ?? 0));
 }
@@ -162,6 +226,8 @@ export interface DbpActuarialYearRow {
   dbpStatus: DbpStatus;
   participantAge: number | null;
   participantCount: number;
+  baseW2Salary: number;
+  sehiIncluded: number;
   w2Salary: number;
   trailing3Avg: number;
   rollingHigh3: number;
@@ -171,6 +237,11 @@ export interface DbpActuarialYearRow {
   annuity415b: number;
   factor417e: number;
   statutoryCeiling: number;
+  fullStatutoryCeiling: number;
+  fundingTarget: number;
+  targetNormalCost: number;
+  cushionAmount404o: number;
+  deductibleTarget404o: number;
   boyAssets: number;
   trustGrowthDollars: number;
   preContribAssets: number;
@@ -207,7 +278,19 @@ export function computeDbpActuarialWaterfall(
   const isJoint = setup.filing_status === 'married_filing_jointly';
   const rows: DbpActuarialYearRow[] = [];
 
-  const w2History: number[] = years.map((yr) => getSyncedYearW2Salary(setup, yr));
+  const compByYear = new Map<number, ComputedTaxYear>();
+  if (computed) {
+    for (const c of computed) {
+      compByYear.set(c.tax_year, c);
+    }
+  }
+
+  const sehiHistory: number[] = years.map((yr) =>
+    getSyncedYearSehi(setup, yr, compByYear.get(yr.tax_year))
+  );
+  const w2History: number[] = years.map((yr) =>
+    getSyncedYearW2Salary(setup, yr, compByYear.get(yr.tax_year))
+  );
   let runningHigh3 = config.historical_high_3_w2;
   let runningAssets = setup.has_dbp || config.boy_assets_anchor > 0 ? config.boy_assets_anchor : 0;
 
@@ -233,6 +316,8 @@ export function computeDbpActuarialWaterfall(
     const participantCount = spouseActive ? 2 : 1;
 
     const w2Salary = w2History[idx];
+    const sehiIncluded = sehiHistory[idx];
+    const baseW2Salary = Math.max(0, w2Salary - sehiIncluded);
 
     // Rolling 3-consecutive-year average compensation (IRC §415(b)(3))
     let trailing3Avg: number;
@@ -266,25 +351,38 @@ export function computeDbpActuarialWaterfall(
     const statutoryDollarCap = perParticipantDollarCap * participantCount;
 
     // IRC §415(b) Annual Annuity = min(Rolling High-3, Dollar Cap) × 10-yr phase-in %
-    const annuity415b = setup.has_dbp
-      ? round0(Math.min(rollingHigh3, statutoryDollarCap) * phaseInPct)
-      : 0;
+    const maxAnnualAnnuity = Math.min(rollingHigh3, statutoryDollarCap);
+    const annuity415b = setup.has_dbp ? round0(maxAnnualAnnuity * phaseInPct) : 0;
 
     // IRC §417(e) Unisex lump-sum factor at attained age & valuation interest rate
     const factor417e = compute417eUnisexFactor(participantAge, config.valuation_interest_rate);
 
-    // Statutory Lump-Sum Ceiling = 415(b) Annuity × 417(e) Unisex Factor
+    // Current-year phased-in §415(b) Lump-Sum Ceiling & Ultimate 100% §415(b) Lump-Sum Ceiling
     const statutoryCeiling = setup.has_dbp ? round0(annuity415b * factor417e) : 0;
+    const fullStatutoryCeiling = setup.has_dbp ? round0(maxAnnualAnnuity * factor417e) : 0;
+
+    // IRC §430 / §404(o) Funding Target (BOY accrued benefit), Target Normal Cost (current-year accrual),
+    // and 50% IRC §404(o)(3)(A) Cushion Amount, subject to the IRC §404(j)(1)(A) / §415(b) 100% ultimate lump-sum cap:
+    // Max Deductible Limit = min((1.50 × Funding Target) + Target Normal Cost, Full 100% §415(b) Ceiling) − Plan Assets
+    const priorPhaseInPct = Math.min(10, Math.max(0, planYear - 1)) / 10;
+    const currentAccrualPct = planYear <= 10 ? Math.max(0, phaseInPct - priorPhaseInPct) : 0;
+    const fundingTarget = setup.has_dbp ? round0(fullStatutoryCeiling * priorPhaseInPct) : 0;
+    const targetNormalCost = setup.has_dbp ? round0(fullStatutoryCeiling * currentAccrualPct) : 0;
+    const cushionAmount404o = setup.has_dbp ? round0(fundingTarget * 0.5) : 0;
+    const uncapped404oTarget = fundingTarget + cushionAmount404o + targetNormalCost;
+    const deductibleTarget404o = setup.has_dbp
+      ? Math.min(uncapped404oTarget, fullStatutoryCeiling)
+      : 0;
 
     const boyAssets = isTerminated ? 0 : runningAssets;
     const trustGrowthDollars = isTerminated ? 0 : round0(boyAssets * config.trust_growth_rate);
     const preContribAssets = isTerminated ? 0 : Math.max(0, boyAssets + trustGrowthDollars);
 
-    // Dynamic 404 Max Limit = remaining deductible room up to Statutory Ceiling
+    // Dynamic 404(o) Max Limit = remaining deductible room including 50% IRC §404(o) cushion
     const dynamic404Max =
       !setup.has_dbp || isTerminated || isFrozen
         ? 0
-        : Math.max(0, statutoryCeiling - preContribAssets);
+        : Math.max(0, deductibleTarget404o - preContribAssets);
 
     const plannedDbp = setup.has_dbp ? Math.max(0, round0(dbpIn.dbp_actual_contribution)) : 0;
 
@@ -299,10 +397,14 @@ export function computeDbpActuarialWaterfall(
           yr.tax_year === setup.dbp_planned_termination_year));
 
     const rolloverOutAmount = isExitYear ? eoyAssets : 0;
-    const headroomToCeiling = isTerminated ? 0 : statutoryCeiling - eoyAssets;
+
+    // Exit or frozen years are bounded by current phased-in §415(b) ceiling (termination lump sum);
+    // continuing active years may fund via the 50% §404(o) cushion up to the 100% ultimate §415(b) ceiling.
+    const reversionCeiling = isExitYear || isFrozen ? statutoryCeiling : fullStatutoryCeiling;
+    const headroomToCeiling = isTerminated ? 0 : reversionCeiling - eoyAssets;
     const fundingRatioPct =
-      statutoryCeiling > 0 && !isTerminated
-        ? Number(((eoyAssets / statutoryCeiling) * 100).toFixed(1))
+      reversionCeiling > 0 && !isTerminated
+        ? Number(((eoyAssets / reversionCeiling) * 100).toFixed(1))
         : 0;
 
     // Status classification (paired with explicit human-readable text label)
@@ -319,7 +421,7 @@ export function computeDbpActuarialWaterfall(
       statusLabel = 'Terminated';
       statusNote = plannedDbp > 0 ? 'Warning: contribution scheduled after termination' : 'Rolled out to IRA';
     } else if (isFrozen) {
-      if (statutoryCeiling > 0 && eoyAssets > statutoryCeiling) {
+      if (reversionCeiling > 0 && eoyAssets > reversionCeiling) {
         statusCode = 'over_ceiling';
         statusLabel = 'Frozen · Over Ceiling';
         statusNote = 'Trust growth pushed frozen assets above §415(b) ceiling';
@@ -332,14 +434,14 @@ export function computeDbpActuarialWaterfall(
       statusCode = 'locked_actual';
       statusLabel = 'Locked Actual';
       statusNote = 'Filed prior-year actual contribution';
-    } else if (statutoryCeiling > 0 && eoyAssets > statutoryCeiling + 1) {
+    } else if (reversionCeiling > 0 && eoyAssets > reversionCeiling + 1) {
       statusCode = 'over_ceiling';
       statusLabel = 'Over Ceiling';
-      statusNote = `Exceeds §415(b) ceiling by $${(eoyAssets - statutoryCeiling).toLocaleString()} (reversion risk)`;
+      statusNote = `Exceeds §415(b) ceiling by $${(eoyAssets - reversionCeiling).toLocaleString()} (reversion risk)`;
     } else if (plannedDbp > dynamic404Max + 1) {
       statusCode = 'over_404';
       statusLabel = 'Over 404 Max';
-      statusNote = `Planned DBP exceeds Dynamic 404 limit by $${(plannedDbp - dynamic404Max).toLocaleString()}`;
+      statusNote = `Planned DBP exceeds Dynamic 404(o) limit by $${(plannedDbp - dynamic404Max).toLocaleString()}`;
     } else if (isExitYear) {
       statusCode = 'yr10_exit';
       statusLabel = planYear === 10 ? 'Yr 10 Exit' : 'Target Exit';
@@ -361,6 +463,8 @@ export function computeDbpActuarialWaterfall(
       dbpStatus,
       participantAge,
       participantCount,
+      baseW2Salary,
+      sehiIncluded,
       w2Salary,
       trailing3Avg,
       rollingHigh3,
@@ -370,6 +474,11 @@ export function computeDbpActuarialWaterfall(
       annuity415b,
       factor417e,
       statutoryCeiling,
+      fullStatutoryCeiling,
+      fundingTarget,
+      targetNormalCost,
+      cushionAmount404o,
+      deductibleTarget404o,
       boyAssets,
       trustGrowthDollars,
       preContribAssets,
@@ -431,7 +540,8 @@ export interface DbpPresetResult {
  */
 export function applyTargetYr10ExitPreset(
   setup: SetupConfig,
-  years: TaxYearRecord[]
+  years: TaxYearRecord[],
+  computed?: ComputedTaxYear[]
 ): DbpPresetResult {
   const config = resolveDbpActuarialConfig(setup);
   const anchorYear = years[0]?.tax_year ?? setup.anchor_actuals_year;
@@ -474,7 +584,7 @@ export function applyTargetYr10ExitPreset(
     };
   });
 
-  const probe = computeDbpActuarialWaterfall(nextSetup, zeroProbeYears);
+  const probe = computeDbpActuarialWaterfall(nextSetup, zeroProbeYears, computed);
   const unlockedActiveIndices = probe.rows
     .map((r, i) => ({ r, i }))
     .filter(({ r }) => !r.isLockedActuals && r.taxYear <= effectiveTermYear);
@@ -505,7 +615,7 @@ export function applyTargetYr10ExitPreset(
     if (yr.is_locked_actuals) continue;
     if (yr.tax_year > effectiveTermYear) continue;
 
-    const currentWaterfall = computeDbpActuarialWaterfall(nextSetup, workingYears);
+    const currentWaterfall = computeDbpActuarialWaterfall(nextSetup, workingYears, computed);
     const row = currentWaterfall.rows[idx];
     const maxAllowed = row.dynamic404Max;
     const isFinalActive = yr.tax_year === effectiveTermYear;
@@ -523,7 +633,7 @@ export function applyTargetYr10ExitPreset(
   }
 
   // Final pass to stamp exact projected rollover amount in exit year
-  const finalWf = computeDbpActuarialWaterfall(nextSetup, workingYears);
+  const finalWf = computeDbpActuarialWaterfall(nextSetup, workingYears, computed);
   const exitRow = finalWf.rows.find((r) => r.taxYear === effectiveTermYear);
   const nextYears = workingYears.map((yr) => {
     if (yr.is_locked_actuals) return yr;
@@ -555,7 +665,8 @@ export function applyTargetYr10ExitPreset(
  */
 export function applyMaxOut404Preset(
   setup: SetupConfig,
-  years: TaxYearRecord[]
+  years: TaxYearRecord[],
+  computed?: ComputedTaxYear[]
 ): DbpPresetResult {
   const termYear = setup.dbp_planned_termination_year;
   const nextSetup: SetupConfig = {
@@ -588,7 +699,7 @@ export function applyMaxOut404Preset(
     if (yr.is_locked_actuals) continue;
     if (termYear !== null && yr.tax_year > termYear) continue;
 
-    const wf = computeDbpActuarialWaterfall(nextSetup, workingYears);
+    const wf = computeDbpActuarialWaterfall(nextSetup, workingYears, computed);
     const row = wf.rows[idx];
     const maxLimit = row.dynamic404Max;
     totalAdded += maxLimit;
@@ -599,7 +710,7 @@ export function applyMaxOut404Preset(
     };
   }
 
-  const finalWf = computeDbpActuarialWaterfall(nextSetup, workingYears);
+  const finalWf = computeDbpActuarialWaterfall(nextSetup, workingYears, computed);
   const nextYears = workingYears.map((yr) => {
     if (yr.is_locked_actuals) return yr;
     if (termYear !== null && yr.tax_year === termYear) {
@@ -631,7 +742,8 @@ export function applyMaxOut404Preset(
  */
 export function applyFreezePostYr10Preset(
   setup: SetupConfig,
-  years: TaxYearRecord[]
+  years: TaxYearRecord[],
+  computed?: ComputedTaxYear[]
 ): DbpPresetResult {
   const config = resolveDbpActuarialConfig(setup);
   const anchorYear = years[0]?.tax_year ?? setup.anchor_actuals_year;
@@ -673,7 +785,7 @@ export function applyFreezePostYr10Preset(
   for (let idx = 0; idx < workingYears.length; idx++) {
     const yr = workingYears[idx];
     if (yr.is_locked_actuals || yr.tax_year > yr10TaxYear) continue;
-    const wf = computeDbpActuarialWaterfall(nextSetup, workingYears);
+    const wf = computeDbpActuarialWaterfall(nextSetup, workingYears, computed);
     const row = wf.rows[idx];
     const capped = Math.min(yr.dbp_and_retirement.dbp_actual_contribution, row.dynamic404Max);
     yr.dbp_and_retirement = {

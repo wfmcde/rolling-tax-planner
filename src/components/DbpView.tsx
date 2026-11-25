@@ -157,13 +157,17 @@ export const DbpView: React.FC<DbpViewProps> = ({
 
   /**
    * Bi-directional W-2 Salary sync with Six-Year Horizon:
-   * - S-Corp MFJ: preserves existing spouse W-2 split ratio (50/50 if currently $0),
-   *   updating bill_w2_wages, debra_w2_wages, officer_w2_wages, and form_1040.w2_wages_total.
-   * - Single/HOH: assigns 100% to primary W-2.
+   * - S-Corp MFJ: cell displays W-2 Box 1 pensionable comp (Base Gross W-2 + >2% Owner SEHI);
+   *   subtracts SEHI before updating Base Gross W-2 split (preserving existing spouse ratio, 50/50 if $0).
+   * - Single/HOH: assigns 100% of Base Gross W-2 to primary W-2.
    * - Non-S-Corp: updates form_1040.w2_wages_total directly.
    */
-  const commitSyncedW2Salary = (taxYear: number, nextTotalW2: number) => {
-    const cleanW2 = Math.max(0, Math.round(nextTotalW2));
+  const commitSyncedW2Salary = (
+    taxYear: number,
+    nextTotalW2Box1: number,
+    sehiIncluded: number
+  ) => {
+    const cleanBox1 = Math.max(0, Math.round(nextTotalW2Box1));
     onUpdateYear(taxYear, (prev) => {
       if (prev.is_locked_actuals) return prev;
       if (!setup.has_scorp) {
@@ -171,17 +175,18 @@ export const DbpView: React.FC<DbpViewProps> = ({
           ...prev,
           form_1040: {
             ...prev.form_1040,
-            w2_wages_total: cleanW2,
+            w2_wages_total: cleanBox1,
           },
         };
       }
+      const cleanBaseW2 = Math.max(0, cleanBox1 - Math.max(0, Math.round(sehiIncluded)));
       const isJoint = setup.filing_status === 'married_filing_jointly';
       const prevPrimary = prev.scorp_1120s.bill_w2_wages ?? 0;
       const prevSpouse = prev.scorp_1120s.debra_w2_wages ?? 0;
       const prevTotal = prevPrimary + prevSpouse;
       const primaryRatio = !isJoint ? 1 : prevTotal > 0 ? prevPrimary / prevTotal : 0.5;
-      const nextPrimary = Math.round(cleanW2 * primaryRatio);
-      const nextSpouse = isJoint ? Math.max(0, cleanW2 - nextPrimary) : 0;
+      const nextPrimary = Math.round(cleanBaseW2 * primaryRatio);
+      const nextSpouse = isJoint ? Math.max(0, cleanBaseW2 - nextPrimary) : 0;
 
       return {
         ...prev,
@@ -189,11 +194,11 @@ export const DbpView: React.FC<DbpViewProps> = ({
           ...prev.scorp_1120s,
           bill_w2_wages: nextPrimary,
           debra_w2_wages: nextSpouse,
-          officer_w2_wages: cleanW2,
+          officer_w2_wages: cleanBaseW2,
         },
         form_1040: {
           ...prev.form_1040,
-          w2_wages_total: cleanW2,
+          w2_wages_total: cleanBaseW2,
         },
       };
     });
@@ -234,10 +239,10 @@ export const DbpView: React.FC<DbpViewProps> = ({
   const handleRunPreset = (preset: 'yr10_exit' | 'max_404' | 'freeze_post_10') => {
     const result =
       preset === 'yr10_exit'
-        ? applyTargetYr10ExitPreset(setup, years)
+        ? applyTargetYr10ExitPreset(setup, years, computed)
         : preset === 'max_404'
-        ? applyMaxOut404Preset(setup, years)
-        : applyFreezePostYr10Preset(setup, years);
+        ? applyMaxOut404Preset(setup, years, computed)
+        : applyFreezePostYr10Preset(setup, years, computed);
     onApplyPresetState(result.nextSetup, result.nextYears);
     setPresetBanner(result.summaryText);
   };
@@ -633,8 +638,17 @@ export const DbpView: React.FC<DbpViewProps> = ({
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs font-mono tabular-nums">
-              <div className="flex items-baseline gap-1">
-                <span className="font-sans text-[11px] text-slate-400">W-2</span>
+              <div
+                className="flex items-baseline gap-1"
+                title={
+                  selectedRow.sehiIncluded > 0
+                    ? `Base W-2 ${formatCurrency(selectedRow.baseW2Salary)} + S-Corp >2% Owner Health (SEHI) ${formatCurrency(selectedRow.sehiIncluded)}`
+                    : 'Pensionable W-2 Box 1 Compensation'
+                }
+              >
+                <span className="font-sans text-[11px] text-slate-400">
+                  {selectedRow.sehiIncluded > 0 ? 'W-2+SEHI' : 'W-2'}
+                </span>
                 <span className="text-white font-semibold">
                   {formatCurrency(selectedRow.w2Salary)}
                 </span>
@@ -666,10 +680,23 @@ export const DbpView: React.FC<DbpViewProps> = ({
                 <span className="text-slate-200">{selectedRow.factor417e.toFixed(2)}</span>
               </div>
               <span className="text-slate-500">=</span>
-              <div className="flex items-baseline gap-1">
+              <div
+                className="flex items-baseline gap-1"
+                title={`Phased-in §415(b) Ceiling: ${formatCurrency(selectedRow.statutoryCeiling)} · Full 100% §415(b) Ceiling: ${formatCurrency(selectedRow.fullStatutoryCeiling)}`}
+              >
                 <span className="font-sans text-[11px] text-slate-400">Ceiling</span>
                 <span className="text-white font-semibold">
                   {formatCurrency(selectedRow.statutoryCeiling)}
+                </span>
+              </div>
+              <span className="text-slate-600 px-0.5">|</span>
+              <div
+                className="flex items-baseline gap-1"
+                title={`IRC §404(o): min(1.50 × FT ${formatCurrency(selectedRow.fundingTarget)} + TNC ${formatCurrency(selectedRow.targetNormalCost)} = ${formatCurrency(selectedRow.fundingTarget + selectedRow.cushionAmount404o + selectedRow.targetNormalCost)}, 100% §415(b) ${formatCurrency(selectedRow.fullStatutoryCeiling)})`}
+              >
+                <span className="font-sans text-[11px] text-slate-400">404(o) Target</span>
+                <span className="text-white font-semibold">
+                  {formatCurrency(selectedRow.deductibleTarget404o)}
                 </span>
               </div>
               <span className="text-slate-500">−</span>
@@ -727,12 +754,7 @@ export const DbpView: React.FC<DbpViewProps> = ({
                   setup.has_dbp &&
                   row.dbpStatus !== 'terminated' &&
                   row.plannedDbp > row.dynamic404Max + 1;
-                const isOverCeiling =
-                  !row.isLockedActuals &&
-                  setup.has_dbp &&
-                  row.dbpStatus !== 'terminated' &&
-                  row.statutoryCeiling > 0 &&
-                  row.eoyAssets > row.statutoryCeiling + 1;
+                const isOverCeiling = row.statusCode === 'over_ceiling';
 
                 return (
                   <tr
@@ -756,18 +778,29 @@ export const DbpView: React.FC<DbpViewProps> = ({
                       </div>
                     </td>
 
-                    {/* 2. W-2 Salary (bi-directionally synced with Horizon) */}
-                    <td className="py-2.5 px-2 align-top text-right">
+                    {/* 2. W-2 Salary (bi-directionally synced with Horizon; S-Corp includes >2% SEHI) */}
+                    <td
+                      className="py-2.5 px-2 align-top text-right"
+                      title={
+                        row.sehiIncluded > 0
+                          ? `Base Gross W-2 ${formatCurrency(row.baseW2Salary)} + S-Corp >2% Owner Health (SEHI) ${formatCurrency(row.sehiIncluded)}`
+                          : undefined
+                      }
+                    >
                       {renderInlineMatrixCell(
                         `w2:${row.taxYear}`,
                         row.w2Salary,
                         row.isLockedActuals,
                         false,
-                        (val) => commitSyncedW2Salary(row.taxYear, val),
+                        (val) => commitSyncedW2Salary(row.taxYear, val, row.sehiIncluded),
                         'text-slate-900 font-medium'
                       )}
                       <div className="text-[10px] text-slate-400 mt-0.5 font-mono tabular-nums">
-                        {row.isLockedActuals ? 'Locked' : 'Horizon sync'}
+                        {row.isLockedActuals
+                          ? 'Locked'
+                          : row.sehiIncluded > 0
+                          ? `+${formatCurrency(row.sehiIncluded)} SEHI`
+                          : 'Horizon sync'}
                       </div>
                     </td>
 
@@ -818,7 +851,14 @@ export const DbpView: React.FC<DbpViewProps> = ({
                     </td>
 
                     {/* 6. Dynamic 404 Max Limit */}
-                    <td className="py-2.5 px-2 align-top text-right font-mono tabular-nums">
+                    <td
+                      className="py-2.5 px-2 align-top text-right font-mono tabular-nums"
+                      title={
+                        row.deductibleTarget404o > 0
+                          ? `IRC §404(o): min(1.50 × FT ${formatCurrency(row.fundingTarget)} + TNC ${formatCurrency(row.targetNormalCost)}, 100% §415(b) ${formatCurrency(row.fullStatutoryCeiling)}) − Pre-Contrib Assets ${formatCurrency(row.preContribAssets)}`
+                          : undefined
+                      }
+                    >
                       <div
                         className={`font-semibold ${
                           row.dynamic404Max > 0 ? 'text-teal-900' : 'text-slate-400'
@@ -826,7 +866,7 @@ export const DbpView: React.FC<DbpViewProps> = ({
                       >
                         {formatCurrency(row.dynamic404Max)}
                       </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5">IRC §404</div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">IRC §404(o)</div>
                     </td>
 
                     {/* 7. Planned DBP (bi-directionally synced with Horizon) */}
@@ -888,7 +928,7 @@ export const DbpView: React.FC<DbpViewProps> = ({
                       </div>
                       <div className="text-[10px] text-slate-500 mt-0.5 leading-tight truncate">
                         {row.statusCode === 'over_ceiling'
-                          ? `+${formatCurrency(row.eoyAssets - row.statutoryCeiling)}`
+                          ? `+${formatCurrency(Math.abs(row.headroomToCeiling))}`
                           : row.statusCode === 'over_404'
                           ? `+${formatCurrency(row.plannedDbp - row.dynamic404Max)}`
                           : row.dbpStatus === 'terminated' || row.statusCode === 'inactive'
