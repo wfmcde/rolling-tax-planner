@@ -802,10 +802,14 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
 
   const activeEvaluatedGoals = useMemo(
     () =>
-      evaluateAllPlanningGoals(planningGoals, computed, pnlState, setup).filter(
-        (g) => g.goal.enabled
-      ),
-    [planningGoals, computed, pnlState, setup]
+      evaluateAllPlanningGoals(
+        planningGoals,
+        computed,
+        pnlState,
+        setup,
+        year2026Computed
+      ).filter((g) => g.goal.enabled),
+    [planningGoals, computed, pnlState, setup, year2026Computed]
   );
 
   const cpaReportMeta = useMemo<CpaReportMetadata>(() => {
@@ -1499,6 +1503,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           goals={planningGoals}
           computed={computed}
           pnlState={pnlState}
+          yearProjectedComputed={year2026Computed}
           onUpdateGoals={onUpdatePlanningGoals}
         />
       </div>

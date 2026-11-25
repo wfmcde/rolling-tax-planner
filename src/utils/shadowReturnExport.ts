@@ -566,9 +566,9 @@ function extractYearInputs(
   const endCash = r0(bs?.operating_cash_ye_override ?? bs?.operating_cash_ytd ?? begCash);
   const apCcEoy = r0(bs?.cc_ap_ye ?? 0);
   const pensionPayableEoy = r0(bs?.pension_payable_ye ?? 0);
-  const begAaa = isDefault2026
-    ? seed.projected_2026_overrides.beg_aaa
-    : r0(prevComp ? prevComp.scorp_out.aaa_balance_ending : scIn.aaa_balance_beginning);
+  const begAaa = r0(
+    prevComp ? prevComp.scorp_out.aaa_balance_ending : scIn.aaa_balance_beginning
+  );
 
   const begBasisTotal = r0(prevComp ? prevComp.scorp_out.stock_basis_ending : scIn.stock_basis_beginning);
   const primaryBegStockBasis =

@@ -1193,8 +1193,16 @@ export function calculateSixYearPlan(
         Math.max(0, basisAfterDist - nondeductibleExp - lossReduction)
       );
 
+      // IRS Form 1120-S Schedule M-2 (Accumulated Adjustments Account):
+      // Ending AAA = Beginning AAA + Ordinary Business Income (Line 22)
+      //   + Schedule K Interest Income (Box 4) - 50% Nondeductible Meals (Sch M-1 / Box 16c)
+      //   - Distributions (Box 16d)
       aaaEnding = round0(
-        aaaBeginning + ordinaryIncome1120s - scorpIn.scorp_distributions_total
+        aaaBeginning +
+          ordinaryIncome1120s +
+          schedKInterest -
+          nondeductibleExp -
+          scorpIn.scorp_distributions_total
       );
 
       reasonableCompRatio = computeReasonableCompRatio(combinedOfficerW2, ordinaryIncome1120s);

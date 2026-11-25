@@ -649,9 +649,15 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
                 bold: true,
               },
               {
-                label: 'Ending AAA Balance',
+                label: 'Beginning AAA Balance (Schedule M-2 Line 1)',
+                code: 'aaa_balance_beginning',
+                val: formatCurrency(comp.scorp_in.aaa_balance_beginning),
+              },
+              {
+                label: 'Ending AAA Balance (Schedule M-2 Line 8)',
                 code: 'aaa_balance_ending',
                 val: formatCurrency(comp.scorp_out.aaa_balance_ending),
+                bold: true,
               },
               {
                 label: 'Excess Distribution Capital Gain',

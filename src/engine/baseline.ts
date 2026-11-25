@@ -560,7 +560,7 @@ export function createInitialBaselineState(): PlannerState {
       bill_stock_basis_beginning: rawYear1.scorp_1120s.bill_stock_basis_beginning,
       debra_stock_basis_beginning: rawYear1.scorp_1120s.debra_stock_basis_beginning,
       shareholder_loans_beginning: 0,
-      aaa_balance_beginning: year1BegBasis,
+      aaa_balance_beginning: DEFAULT_PROFILE_SEED.default_2025_beg_aaa,
       ca_franchise_tax_input: rawYear1.scorp_1120s.ca_franchise_tax_input,
       state_sourcing_breakdown: [
         {
@@ -1011,11 +1011,20 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
       };
     }
 
+    const migratedAaaBeg =
+      isDefaultSeedEntityEarly &&
+      yr.tax_year === 2025 &&
+      yr.is_locked_actuals &&
+      yr.scorp_1120s.aaa_balance_beginning === DEFAULT_PROFILE_SEED.legacy_2025_beg_aaa
+        ? DEFAULT_PROFILE_SEED.default_2025_beg_aaa
+        : yr.scorp_1120s.aaa_balance_beginning;
+
     return {
       ...yr,
       form_1040: migratedForm1040,
       scorp_1120s: {
         ...yr.scorp_1120s,
+        aaa_balance_beginning: migratedAaaBeg,
         ca_revenue: caRev,
         az_revenue: azRev,
         gross_receipts_revenue: caRev + azRev,

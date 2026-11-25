@@ -1,4 +1,5 @@
 import type {
+  ComputedTaxYear,
   CustomGoalMetricKey,
   FilingStatus,
   PlanningGoalGuardrail,
@@ -131,6 +132,212 @@ export function getLinkedIrmaaCeilingForProjectionYear(
   };
 }
 
+export interface ProjectedJointMagiBreakdown {
+  projectedMagi: number;
+  projectedAgi: number;
+  k1OrdinaryIncome: number;
+  w2Box1Taxable: number;
+  grossW2: number;
+  employee401kTotal: number;
+  sehiAddback: number;
+  sehiDeduction: number;
+  taxableSocialSecurity: number;
+  grossSocialSecurity: number;
+  personalInterestAndDividends: number;
+  otherForm1040Income: number;
+  taxExemptInterest: number;
+  otherAdjustments: number;
+}
+
+function computePersonFicaForMagi(wages: number, ssWageBase: number): number {
+  if (wages <= 0) return 0;
+  const ss = Math.min(wages, ssWageBase) * 0.062;
+  const med = wages * 0.0145;
+  return Math.round(ss + med);
+}
+
+function computePersonEe401kForMagi(
+  wages: number,
+  age: number | null,
+  ssWageBase: number,
+  scale: number,
+  enabled: boolean
+): number {
+  if (!enabled || wages <= 0) return 0;
+  const base402g = Math.round((23500 * scale) / 500) * 500;
+  const catchUp =
+    age !== null && age >= 60 && age <= 63
+      ? Math.round((11250 * scale) / 250) * 250
+      : age !== null && age >= 50
+      ? Math.round((7500 * scale) / 500) * 500
+      : 0;
+  const empFica = computePersonFicaForMagi(wages, ssWageBase);
+  const netW2Available = Math.max(0, wages - empFica);
+  return Math.round(Math.min(netW2Available, base402g + catchUp));
+}
+
+function computeSocialSecurityTaxableForMagi(
+  ssGross: number,
+  nonSsAgiPlusTaxExempt: number,
+  filingStatus: FilingStatus
+): number {
+  if (ssGross <= 0) return 0;
+  const provisional = nonSsAgiPlusTaxExempt + 0.5 * ssGross;
+  const base1 =
+    filingStatus === 'married_filing_jointly'
+      ? 32000
+      : filingStatus === 'married_filing_separately'
+      ? 0
+      : 25000;
+  const base2 =
+    filingStatus === 'married_filing_jointly'
+      ? 44000
+      : filingStatus === 'married_filing_separately'
+      ? 0
+      : 34000;
+  if (provisional <= base1) return 0;
+  if (provisional <= base2) {
+    return Math.round(Math.min(0.5 * ssGross, 0.5 * (provisional - base1)));
+  }
+  const tier1Max =
+    filingStatus === 'married_filing_jointly'
+      ? 6000
+      : filingStatus === 'married_filing_separately'
+      ? 0
+      : 4500;
+  const tier2 = 0.85 * (provisional - base2) + Math.min(tier1Max, 0.5 * ssGross);
+  return Math.round(Math.min(0.85 * ssGross, tier2));
+}
+
+/**
+ * Dynamically projects Form 1040 Joint MAGI from the active Transaction Cadence / P&L projection
+ * combined with the projection year's personal Form 1040 items (Social Security, interest/dividends,
+ * capital gains, IRA/annuity, Schedule 1 items) using the same IRS ordering as taxEngine.ts.
+ */
+export function computeProjectedJointMagi(
+  computed: ComputedPnlBalanceSheet,
+  pnlState: PnlBalanceSheetState,
+  setup?: SetupConfig,
+  yearProjectedComputed?: ComputedTaxYear
+): ProjectedJointMagiBreakdown {
+  const projectionYear = pnlState.projection_year || setup?.current_tax_year || 2026;
+  const filingStatus: FilingStatus = setup?.filing_status ?? 'married_filing_jointly';
+  const isMfj = filingStatus === 'married_filing_jointly';
+  const hasScorp = setup ? setup.has_scorp : true;
+  const has401k = setup ? setup.has_401k_or_ira : true;
+
+  const inflationRate = setup?.assumptions.inflation_rate ?? 0.025;
+  const scale = Math.pow(1 + inflationRate, Math.max(0, projectionYear - 2025));
+  const ssWageBase = Math.round(176100 * scale);
+  const primaryAge = setup?.primary_birth_year ? projectionYear - setup.primary_birth_year : null;
+  const spouseAge =
+    isMfj && setup?.spouse_birth_year ? projectionYear - setup.spouse_birth_year : null;
+
+  const f1040In = yearProjectedComputed?.form_1040_in;
+
+  const projBillW2 = hasScorp
+    ? Math.max(0, computed.lines.bill_officer_w2.projected)
+    : Math.max(0, f1040In?.w2_wages_total ?? 0);
+  const projDebraW2 =
+    hasScorp && isMfj ? Math.max(0, computed.lines.debra_salaries_wages.projected) : 0;
+  const grossW2 = round2(projBillW2 + projDebraW2);
+
+  const ee401kPrimary = computePersonEe401kForMagi(
+    projBillW2,
+    primaryAge,
+    ssWageBase,
+    scale,
+    has401k
+  );
+  const ee401kSpouse = computePersonEe401kForMagi(
+    projDebraW2,
+    spouseAge,
+    ssWageBase,
+    scale,
+    has401k && isMfj
+  );
+  const employee401kTotal = round2(ee401kPrimary + ee401kSpouse);
+
+  const sehiAddback = hasScorp ? round2(Math.max(0, computed.lines.sehi_medicare.projected)) : 0;
+  const w2Box1Taxable = f1040In?.use_explicit_w2_box1
+    ? round2(f1040In.w2_wages_total)
+    : round2(Math.max(0, grossW2 - employee401kTotal + sehiAddback));
+  const sehiDeduction =
+    hasScorp && sehiAddback > 0 ? round2(Math.min(sehiAddback, grossW2)) : 0;
+
+  const k1OrdinaryIncome = hasScorp
+    ? round2(computed.ordinaryBusinessIncome.projected)
+    : round2(f1040In?.schedule_k1_ordinary_income ?? 0);
+
+  const taxableInterest = f1040In?.taxable_interest ?? 0;
+  const ordinaryDividends = f1040In?.ordinary_dividends ?? 0;
+  const taxExemptInterest = round2(f1040In?.tax_exempt_interest ?? 0);
+  const personalInterestAndDividends = round2(taxableInterest + ordinaryDividends);
+
+  const excessDistGain = hasScorp ? Math.max(0, computed.projectedExcessDistributionGain) : 0;
+  const effectiveLtcg = f1040In
+    ? f1040In.schedule_d_includes_excess_gain
+      ? f1040In.long_term_capital_gain_loss
+      : f1040In.long_term_capital_gain_loss + excessDistGain
+    : excessDistGain;
+  const netCapitalGainLoss = Math.max(
+    -3000,
+    (f1040In?.short_term_capital_gain_loss ?? 0) + effectiveLtcg
+  );
+  const annuityTaxable =
+    setup?.has_annuity && yearProjectedComputed
+      ? Math.max(
+          f1040In?.pensions_and_annuities_taxable ?? 0,
+          Math.round(yearProjectedComputed.dbp_in.annuity_payout_amount * 0.75)
+        )
+      : f1040In?.pensions_and_annuities_taxable ?? 0;
+
+  const otherForm1040Income = round2(
+    netCapitalGainLoss +
+      (f1040In?.schedule_1_other_income ?? 0) +
+      (f1040In?.schedule_k1_other_items ?? 0) +
+      (f1040In?.ira_distributions_taxable ?? 0) +
+      annuityTaxable
+  );
+  const otherAdjustments = round2(f1040In?.schedule_1_adjustments_input ?? 0);
+
+  const grossSocialSecurity = round2(
+    yearProjectedComputed?.form_1040_out.social_security_gross_effective ?? 0
+  );
+  const incomeBeforeSS = round2(
+    w2Box1Taxable + personalInterestAndDividends + k1OrdinaryIncome + otherForm1040Income
+  );
+  const adjustmentsToIncome = round2(sehiDeduction + otherAdjustments);
+  const nonSsAgi = round2(incomeBeforeSS - adjustmentsToIncome);
+  const taxableSocialSecurity = round2(
+    computeSocialSecurityTaxableForMagi(
+      grossSocialSecurity,
+      nonSsAgi + taxExemptInterest,
+      filingStatus
+    )
+  );
+
+  const projectedAgi = round2(Math.max(0, incomeBeforeSS + taxableSocialSecurity - adjustmentsToIncome));
+  const projectedMagi = round2(projectedAgi + taxExemptInterest);
+
+  return {
+    projectedMagi,
+    projectedAgi,
+    k1OrdinaryIncome,
+    w2Box1Taxable,
+    grossW2,
+    employee401kTotal,
+    sehiAddback,
+    sehiDeduction,
+    taxableSocialSecurity,
+    grossSocialSecurity,
+    personalInterestAndDividends,
+    otherForm1040Income,
+    taxExemptInterest,
+    otherAdjustments,
+  };
+}
+
 export function buildIncomeCeilingWhyItMatters(
   projectionYear: number,
   coverageYear: number,
@@ -141,10 +348,11 @@ export function buildIncomeCeilingWhyItMatters(
 ): string {
   const targetStr = formatCurrencyExact(effectiveTarget);
   const linkedStr = formatCurrencyExact(linkedThreshold);
+  const magiTerm = filingStatusLabel === 'Married Filing Jointly' ? 'Joint MAGI' : 'MAGI';
   if (isGoalTargetOverridden && Math.abs(effectiveTarget - linkedThreshold) > 0.005) {
-    return `${projectionYear} income sets the two-year lookback for ${coverageYear} Medicare IRMAA Tier 1 (${filingStatusLabel}: ≤ ${linkedStr}); custom guardrail target set to ≤ ${targetStr} to keep pass-through / ordinary business income below your threshold and avoid IRMAA surcharges or benefit triggers.`;
+    return `${projectionYear} Form 1040 ${magiTerm} sets the two-year lookback for ${coverageYear} Medicare IRMAA Tier 1 (${filingStatusLabel}: ≤ ${linkedStr}); custom guardrail target set to ≤ ${targetStr} to keep projected household MAGI below your threshold and avoid Medicare IRMAA surcharges or benefit triggers.`;
   }
-  return `${projectionYear} income sets the two-year lookback for ${coverageYear} Medicare IRMAA Tier 1 (${filingStatusLabel}: ≤ ${targetStr}). Keeping pass-through / ordinary business income at or below this threshold helps avoid Medicare IRMAA surcharges, higher tax brackets, and benefit phaseouts.`;
+  return `${projectionYear} Form 1040 ${magiTerm} sets the two-year lookback for ${coverageYear} Medicare IRMAA Tier 1 (${filingStatusLabel}: ≤ ${targetStr}). Keeping projected Form 1040 ${magiTerm} (K-1 OBI, W-2 Box 1, SEHI adjustment, taxable Social Security, and personal interest/dividends) at or below this threshold avoids Medicare IRMAA surcharges and higher tax brackets.`;
 }
 
 export function getStatusLabel(status: PlanningGuardrailStatus): 'Within Guardrail' | 'Watch' | 'Over Target' {
@@ -291,7 +499,9 @@ export function resolvePlanningGoals(
 
     const isLegacyOrEmptyWhy =
       !goal.why_it_matters_custom &&
-      (!goal.why_it_matters.trim() || goal.why_it_matters.trim() === LEGACY_INCOME_CEILING_WHY);
+      (!goal.why_it_matters.trim() ||
+        goal.why_it_matters.trim() === LEGACY_INCOME_CEILING_WHY ||
+        goal.why_it_matters.includes('pass-through / ordinary business income'));
 
     const whyCustom =
       goal.why_it_matters_custom === true
@@ -427,7 +637,8 @@ export function evaluatePlanningGoal(
   goal: PlanningGoalGuardrail,
   computed: ComputedPnlBalanceSheet,
   pnlState: PnlBalanceSheetState,
-  setup?: SetupConfig
+  setup?: SetupConfig,
+  yearProjectedComputed?: ComputedTaxYear
 ): EvaluatedPlanningGoal {
   const targetDisplay = fmtTarget(goal);
 
@@ -441,7 +652,13 @@ export function evaluatePlanningGoal(
       Math.abs(goal.target_value - linked.threshold) > 0.005;
 
     const target = isGoalTargetOverridden ? (goal.target_value as number) : linked.threshold;
-    const actual = computed.ordinaryBusinessIncome.projected;
+    const magiBreakdown = computeProjectedJointMagi(
+      computed,
+      pnlState,
+      setup,
+      yearProjectedComputed
+    );
+    const actual = magiBreakdown.projectedMagi;
     const diff = round2(actual - target);
     const absDiff = Math.abs(diff);
     const res = evaluateNumericAgainstTarget(actual, target, goal.comparator, 'currency');
@@ -466,11 +683,15 @@ export function evaluatePlanningGoal(
 
     const targetFormatted = formatCurrencyExact(target);
     const actualFormatted = formatCurrencyExact(actual);
+    const magiLabel =
+      linked.filingStatus === 'married_filing_jointly'
+        ? 'Form 1040 Joint MAGI'
+        : 'Form 1040 MAGI';
     const benchmarkNote = isGoalTargetOverridden
-      ? `Projected ${linked.projectionYear} 1120-S Line 22: ${actualFormatted}; ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort}) is ${formatCurrencyExact(
+      ? `Projected ${linked.projectionYear} ${magiLabel}: ${actualFormatted}; ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort}) is ${formatCurrencyExact(
           linked.threshold
         )}`
-      : `Projected ${linked.projectionYear} 1120-S Line 22: ${actualFormatted} vs. ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort} · 2-yr lookback)`;
+      : `Projected ${linked.projectionYear} ${magiLabel}: ${actualFormatted} vs. ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort} · 2-yr lookback)`;
 
     const varianceSummary =
       diff > 0.005
@@ -678,7 +899,8 @@ export function evaluateAllPlanningGoals(
   goals: PlanningGoalGuardrail[],
   computed: ComputedPnlBalanceSheet,
   pnlState: PnlBalanceSheetState,
-  setup?: SetupConfig
+  setup?: SetupConfig,
+  yearProjectedComputed?: ComputedTaxYear
 ): EvaluatedPlanningGoal[] {
-  return goals.map((g) => evaluatePlanningGoal(g, computed, pnlState, setup));
+  return goals.map((g) => evaluatePlanningGoal(g, computed, pnlState, setup, yearProjectedComputed));
 }

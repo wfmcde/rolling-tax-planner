@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import type {
+  ComputedTaxYear,
   CustomGoalMetricKey,
   PlanningGoalGuardrail,
   PlanningGuardrailComparator,
@@ -36,6 +37,7 @@ interface PlanningGoalsPanelProps {
   goals: PlanningGoalGuardrail[];
   computed: ComputedPnlBalanceSheet;
   pnlState: PnlBalanceSheetState;
+  yearProjectedComputed?: ComputedTaxYear;
   onUpdateGoals: (updater: (prev: PlanningGoalGuardrail[]) => PlanningGoalGuardrail[]) => void;
 }
 
@@ -61,6 +63,7 @@ export const PlanningGoalsPanel: React.FC<PlanningGoalsPanelProps> = ({
   goals,
   computed,
   pnlState,
+  yearProjectedComputed,
   onUpdateGoals,
 }) => {
   const [expanded, setExpanded] = useState(true);
@@ -78,8 +81,8 @@ export const PlanningGoalsPanel: React.FC<PlanningGoalsPanelProps> = ({
   const [customWhy, setCustomWhy] = useState('');
 
   const evaluated = useMemo(
-    () => evaluateAllPlanningGoals(goals, computed, pnlState, setup),
-    [goals, computed, pnlState, setup]
+    () => evaluateAllPlanningGoals(goals, computed, pnlState, setup, yearProjectedComputed),
+    [goals, computed, pnlState, setup, yearProjectedComputed]
   );
 
   const activeEvaluated = useMemo(

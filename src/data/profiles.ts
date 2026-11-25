@@ -98,6 +98,10 @@ export const DEFAULT_PROFILE_SEED = {
   default_pension_payable_ye: 0,
   /** Legacy 2026 accrued pension payable seed used strictly for one-time migration */
   legacy_2026_pension_payable_ye: 64571.0,
+  /** Default 2025 filed Form 1120-S Schedule M-2 Line 1 Beginning AAA balance */
+  default_2025_beg_aaa: -39908,
+  /** Legacy 2025 Beginning AAA seed (mistakenly initialized to beginning stock basis 11016) used strictly for one-time migration */
+  legacy_2025_beg_aaa: 11016,
   /** Legacy 2026 Cadence Line 17 manual override seed used strictly for one-time migration to live Horizon sync */
   legacy_2026_cadence_retirement_overrides: {
     dbp_contribution: 61000.0,

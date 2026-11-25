@@ -1587,7 +1587,8 @@ export function App() {
           activePlanningGoals,
           horizonPnlComp,
           activePnlState,
-          state.setup
+          state.setup,
+          y26
         );
         const horizonReportMeta = {
           moduleName: 'Six-Year Tax Horizon & CPA Package',
