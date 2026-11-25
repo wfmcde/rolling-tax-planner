@@ -6,6 +6,8 @@ import type {
   CadenceGroupingMode,
   CadenceTransactionRow,
   ComputedTaxYear,
+  GlCapitalContributionEntry,
+  GlCapitalContributionSummary,
   PayeeAliasRule,
   PnlBalanceSheetState,
   PnlLineAmounts,
@@ -187,6 +189,8 @@ export interface ComputedCadenceForecast {
     member_draws_ytd: number;
     capital_contributions_ytd: number;
   };
+  /** Matched GL/ledger Capital Contributions (Basis Added) aggregated by tax year (excluding opening balances) */
+  capitalContributions: GlCapitalContributionSummary;
   /** QBO Reconciliation Check metrics */
   reconciliation: {
     ytdRevenue: number;
@@ -195,6 +199,7 @@ export interface ComputedCadenceForecast {
     ytdCash: number;
     ytdCreditCards: number;
     ytdMemberDraws: number;
+    ytdCapitalContributions: number;
     items: QboReconciliationItem[];
     allMatched: boolean;
   };
@@ -385,28 +390,31 @@ export function classifyTransactionAccount(
     return { kind: 'bs', bsRole: 'pension_payable', subAccount: leaf };
   }
 
-  // Member Draws (including any sub-account directly under Member Draws)
-  if (
-    /member\s*draws?|shareholder\s*dist|owner.*draw/i.test(leafLower) ||
-    /member\s*draws?|shareholder\s*dist|owner.*draw/i.test(parentLower)
-  ) {
+  // Equity Classification Helpers: keep Capital Contributions cleanly separated from Member Draws / Distributions
+  // and exclude Opening Balance Equity / Retained Earnings from capital contributions.
+  const isMemberDrawsText = (text: string) => isMemberDrawsAccountName(text);
+  const isOpeningEquityText = (text: string) =>
+    /opening\s*balance\s*equity|retained\s*earnings|owner['’]?s?\s*equity|common\s*stock/i.test(text);
+  const isCapitalContributionText = (text: string) => isCapitalContributionAccountName(text);
+
+  // Check leaf account first so specific sub-accounts always win over parent folders
+  // (e.g. "Member Equity : Member Draws" -> member_draws; "Member Equity : Retained Earnings" -> opening_equity)
+  if (isMemberDrawsText(leafLower)) {
     return { kind: 'bs', bsRole: 'member_draws', subAccount: leaf };
   }
-
-  // Capital Contributions
-  if (
-    /capital\s*contrib|paid[- ]in\s*capital|member\s*contrib|owner.*contrib/i.test(leafLower) ||
-    /capital\s*contrib|paid[- ]in\s*capital|member\s*contrib|owner.*contrib/i.test(parentLower)
-  ) {
+  if (isOpeningEquityText(leafLower)) {
+    return { kind: 'bs', bsRole: 'opening_equity', subAccount: leaf };
+  }
+  if (isCapitalContributionText(leafLower)) {
     return { kind: 'bs', bsRole: 'capital_contributions', subAccount: leaf };
   }
-
-  // Equity Accounts (Member Equity, Opening Balance Equity, Retained Earnings)
-  if (
-    /member\s*equity|opening\s*balance\s*equity|retained\s*earnings|owner'?s?\s*equity|common\s*stock|additional\s*paid[- ]in/i.test(
-      leafLower
-    )
-  ) {
+  if (isMemberDrawsText(parentLower)) {
+    return { kind: 'bs', bsRole: 'member_draws', subAccount: leaf };
+  }
+  if (isCapitalContributionText(parentLower)) {
+    return { kind: 'bs', bsRole: 'capital_contributions', subAccount: leaf };
+  }
+  if (isOpeningEquityText(parentLower)) {
     return { kind: 'bs', bsRole: 'opening_equity', subAccount: leaf };
   }
 
@@ -825,19 +833,19 @@ export function parseTransactionMatrix(matrix: unknown[][]): ParsedQboTransactio
       continue;
     }
 
-    // 3. Detect QBO General Ledger "Beginning Balance" rows (Date="Beginning Balance", Balance=51,551.38)
+    // 3. Detect QBO General Ledger "Beginning Balance" / "Opening Balance" carryforward rows
     const isBegBalRow =
-      /^beginning\s+balance$/i.test(dateCellStr) ||
-      /^beginning\s+balance$/i.test(firstCell) ||
-      /^beginning\s+balance$/i.test(typeCellStr) ||
-      /^beginning\s+balance$/i.test(memoCellStr);
+      /^(?:beginning|opening)\s+balance$/i.test(dateCellStr) ||
+      /^(?:beginning|opening)\s+balance$/i.test(firstCell) ||
+      /^(?:beginning|opening)\s+balance$/i.test(typeCellStr) ||
+      /^(?:beginning|opening)\s+balance$/i.test(memoCellStr);
 
     if (isBegBalRow) {
       sawBeginningBalanceRow = true;
       // Handle rare QBO layout where account name in Col A and "Beginning Balance" in Col B appear on the same row
       if (
         firstCell.length > 0 &&
-        !/^beginning\s+balance$/i.test(firstCell) &&
+        !/^(?:beginning|opening)\s+balance$/i.test(firstCell) &&
         parseNumericToken(firstCell) === null
       ) {
         sectionStack.push({ name: firstCell, indent: firstIndent, hadDirectRows: false });
@@ -901,8 +909,10 @@ export function parseTransactionMatrix(matrix: unknown[][]): ParsedQboTransactio
       continue;
     }
 
-    // 5. Parse Amount & optional running Balance
+    // 5. Parse Amount & optional Debit / Credit / running Balance
     let amount: number | null = null;
+    let parsedDebit: number | undefined;
+    let parsedCredit: number | undefined;
     if (colMap.amount !== -1) {
       amount = parseNumericToken(row[colMap.amount]);
     }
@@ -910,6 +920,8 @@ export function parseTransactionMatrix(matrix: unknown[][]): ParsedQboTransactio
       const deb = colMap.debit !== -1 ? parseNumericToken(row[colMap.debit]) ?? 0 : 0;
       const cred = colMap.credit !== -1 ? parseNumericToken(row[colMap.credit]) ?? 0 : 0;
       if (deb !== 0 || cred !== 0) {
+        parsedDebit = round2(deb);
+        parsedCredit = round2(cred);
         amount = round2(deb - cred);
       }
     }
@@ -952,6 +964,8 @@ export function parseTransactionMatrix(matrix: unknown[][]): ParsedQboTransactio
       account,
       split_account: split,
       amount: round2(amount),
+      ...(parsedDebit !== undefined ? { debit: parsedDebit } : {}),
+      ...(parsedCredit !== undefined ? { credit: parsedCredit } : {}),
       ...(runningBalance !== null ? { running_balance: runningBalance } : {}),
       ...(secPath ? { gl_section: secPath } : {}),
     });
@@ -1018,6 +1032,169 @@ export function parseQboTransactionArrayBuffer(
     detectedAsOfDate: null,
     detectedYear: null,
     ledgerFormat: 'transaction_list',
+  };
+}
+
+/**
+ * Case-insensitive matcher for shareholder / member / owner capital contribution equity accounts.
+ * Matches: member equity, paid-in capital, paid in capital, additional paid-in capital,
+ * shareholder contribution, member contribution, owner contribution, owner's investment,
+ * and capital contribution. Explicitly excludes opening balance equity and retained earnings.
+ */
+export function isCapitalContributionAccountName(accountText: string): boolean {
+  const s = (accountText ?? '').trim();
+  if (!s) return false;
+  if (/opening\s*balance\s*equity|retained\s*earnings/i.test(s)) return false;
+  return /\bmember\s*equity\b|(?:additional\s+)?paid[-\s]+in\s+capital|shareholder['’]?s?\s+contributions?|member['’]?s?\s+contributions?|owner['’]?s?\s+contributions?|owner['’]?s?\s+investments?|capital\s+contributions?/i.test(
+    s
+  );
+}
+
+/**
+ * Case-insensitive matcher for distribution / draw equity accounts mapped strictly to Member Draws.
+ * Matches: shareholder distribution(s), member draw(s), owner draw(s), owner distribution(s), and distributions.
+ */
+export function isMemberDrawsAccountName(accountText: string): boolean {
+  const s = (accountText ?? '').trim();
+  if (!s) return false;
+  if (/ira|pension|retirement|401\(?k\)?|expense|cost|fee/i.test(s)) return false;
+  return /member\s*draws?|shareholder\s*dist(?:ribution)?s?|owner['’]?s?\s*draws?|owner['’]?s?\s*dist(?:ribution)?s?|\bdistributions\b/i.test(
+    s
+  );
+}
+
+function isOpeningCarryforwardRow(tx: CadenceTransactionRow): boolean {
+  return (
+    Boolean(tx.is_beginning_balance) ||
+    /^(?:beginning|opening)\s+balance$/i.test(tx.transaction_type.trim()) ||
+    /^(?:beginning|opening)\s+balance$/i.test(tx.vendor.trim()) ||
+    /^(?:beginning|opening)\s+balance$/i.test(tx.memo.trim())
+  );
+}
+
+/**
+ * Signed equity capital contribution amount for a single period transaction:
+ * - Debit/Credit exports: Credit increases equity (+), Debit decreases equity (-) => credit - debit.
+ * - QBO signed Amount column: Equity credits are positive (+), reversals/debits are negative (-) => amount.
+ */
+function getCapitalContributionSignedAmount(tx: CadenceTransactionRow): number {
+  if (tx.credit !== undefined || tx.debit !== undefined) {
+    return round2((tx.credit ?? 0) - (tx.debit ?? 0));
+  }
+  return round2(tx.amount);
+}
+
+function buildCapitalContributionReference(tx: CadenceTransactionRow): string {
+  const typeLabel = tx.transaction_type.trim() || 'Transaction';
+  const numLabel = tx.num.trim();
+  if (numLabel) {
+    const formattedNum = /^\d+$/.test(numLabel) ? `#${numLabel}` : numLabel;
+    return `${typeLabel} · ${formattedNum}`;
+  }
+  return typeLabel;
+}
+
+/**
+ * Extracts and aggregates matched Capital Contributions (Basis Added) period entries by tax year.
+ * - In General Ledger mode, inspects strictly the Equity section leg (never double-counting Cash/Bank offset).
+ * - In Transaction List mode, inspects either Account or Split Account matching capital_contributions.
+ * - Ignores Beginning Balance / Opening Balance carryforwards so only actual period transactions are summed.
+ * - Keeps distribution/draw accounts strictly separated under Member Draws.
+ */
+export function extractGlCapitalContributions(
+  transactions: CadenceTransactionRow[],
+  ledgerFormat: 'general_ledger' | 'transaction_list' = 'general_ledger',
+  setup?: SetupConfig | null
+): GlCapitalContributionSummary {
+  const isGlMode =
+    ledgerFormat === 'general_ledger' ||
+    transactions.some((tx) => Boolean(tx.gl_section) || Boolean(tx.is_beginning_balance));
+
+  const seenSignatures = new Set<string>();
+  const entries: GlCapitalContributionEntry[] = [];
+  const rawNetByYear: Record<number, number> = {};
+  let ignoredOpeningCount = 0;
+  let ignoredOpeningAmount = 0;
+
+  for (const tx of transactions) {
+    const sig = [
+      tx.date,
+      tx.transaction_type.toLowerCase(),
+      tx.num.toLowerCase(),
+      tx.vendor.toLowerCase(),
+      (tx.gl_section || tx.account).toLowerCase(),
+      tx.split_account.toLowerCase(),
+      tx.amount.toFixed(2),
+      tx.running_balance !== undefined ? tx.running_balance.toFixed(2) : '',
+    ].join('|');
+    if (seenSignatures.has(sig)) continue;
+    seenSignatures.add(sig);
+
+    const primaryAccount = isGlMode ? tx.gl_section || tx.account : tx.account;
+    const acctRole = classifyTransactionAccount(primaryAccount, setup);
+    const splitRole = classifyTransactionAccount(tx.split_account, setup);
+
+    const isCapContribRow = isGlMode
+      ? acctRole.kind === 'bs' && acctRole.bsRole === 'capital_contributions'
+      : (acctRole.kind === 'bs' && acctRole.bsRole === 'capital_contributions') ||
+        (splitRole.kind === 'bs' &&
+          splitRole.bsRole === 'capital_contributions' &&
+          !(acctRole.kind === 'bs' && acctRole.bsRole === 'member_draws'));
+
+    if (!isCapContribRow) continue;
+
+    if (isOpeningCarryforwardRow(tx)) {
+      ignoredOpeningCount++;
+      ignoredOpeningAmount = round2(ignoredOpeningAmount + Math.abs(tx.amount));
+      continue;
+    }
+
+    const taxYear = Number(tx.date.slice(0, 4));
+    if (!Number.isFinite(taxYear) || taxYear < 2000 || taxYear > 2099) continue;
+
+    const signedAmount = getCapitalContributionSignedAmount(tx);
+    if (Math.abs(signedAmount) < 0.005) continue;
+
+    const matchedAccount =
+      acctRole.kind === 'bs' && acctRole.bsRole === 'capital_contributions'
+        ? primaryAccount
+        : tx.split_account;
+
+    entries.push({
+      id: tx.id,
+      tax_year: taxYear,
+      date: tx.date,
+      transaction_type: tx.transaction_type || 'Transaction',
+      num: tx.num || '',
+      reference: buildCapitalContributionReference(tx),
+      vendor: tx.vendor || '',
+      memo: tx.memo || '',
+      account: matchedAccount,
+      split_account:
+        matchedAccount === primaryAccount ? tx.split_account : primaryAccount,
+      amount: signedAmount,
+    });
+
+    rawNetByYear[taxYear] = round2((rawNetByYear[taxYear] ?? 0) + signedAmount);
+  }
+
+  entries.sort((a, b) => a.date.localeCompare(b.date));
+
+  const capital_contributions_added: Record<number, number> = {};
+  let total_added = 0;
+  for (const [yrStr, netVal] of Object.entries(rawNetByYear)) {
+    const yrNum = Number(yrStr);
+    const clamped = Math.max(0, round2(netVal));
+    capital_contributions_added[yrNum] = clamped;
+    total_added = round2(total_added + clamped);
+  }
+
+  return {
+    capital_contributions_added,
+    entries,
+    total_added,
+    ignored_opening_balance_count: ignoredOpeningCount,
+    ignored_opening_balance_amount: ignoredOpeningAmount,
   };
 }
 
@@ -1764,7 +1941,7 @@ export function computeCadenceForecast(
         const secKey = `${acctRole.bsRole}::${acctRole.subAccount.toLowerCase()}`;
         const stat = getOrCreateGlBsSection(secKey, acctRole.bsRole, acctRole.subAccount);
 
-        if (tx.is_beginning_balance || /beginning balance/i.test(tx.transaction_type)) {
+        if (isOpeningCarryforwardRow(tx)) {
           stat.explicitBeg = round2((stat.explicitBeg ?? 0) + tx.amount);
           auditRows.push({
             id: tx.id,
@@ -1775,16 +1952,21 @@ export function computeCadenceForecast(
             split_account: tx.split_account,
             amount: tx.amount,
             category: 'opening_balance',
-            reason: `GL Beginning Balance for ${acctRole.subAccount} (excluded from P&L)`,
+            reason: `GL Beginning Balance for ${acctRole.subAccount} (excluded from P&L and period totals)`,
           });
           continue;
         }
+
+        const effectiveBsAmount =
+          acctRole.bsRole === 'capital_contributions'
+            ? getCapitalContributionSignedAmount(tx)
+            : tx.amount;
 
         // Track inferred beginning balance from first dated row's running balance if no Beginning Balance row existed
         if (stat.firstTxInferredBeg === null && tx.running_balance !== undefined) {
           stat.firstTxInferredBeg = round2(tx.running_balance - tx.amount);
         }
-        stat.txSum = round2(stat.txSum + tx.amount);
+        stat.txSum = round2(stat.txSum + effectiveBsAmount);
         if (tx.running_balance !== undefined) {
           stat.lastRunningBalance = tx.running_balance;
         }
@@ -1935,10 +2117,10 @@ export function computeCadenceForecast(
       }
 
       if (pair.includes('capital_contributions')) {
-        const contribAmt = Math.abs(tx.amount);
-        capContribYtd = round2(capContribYtd + contribAmt);
+        const signedContrib = getCapitalContributionSignedAmount(tx);
+        capContribYtd = round2(capContribYtd + signedContrib);
         if (pair.includes('operating_cash')) {
-          cashDelta = round2(cashDelta + contribAmt);
+          cashDelta = round2(cashDelta + signedContrib);
         }
         continue;
       }
@@ -2189,7 +2371,9 @@ export function computeCadenceForecast(
     ccDelta = round2(ccEnd - ccBeg);
     pensionDelta = round2(pensionEnd - pensionBeg);
     memberDrawsYtd = round2(Math.abs(drawsNet));
-    capContribYtd = round2(Math.abs(contribNet));
+    capContribYtd = round2(Math.max(0, contribNet));
+  } else {
+    capContribYtd = round2(Math.max(0, capContribYtd));
   }
 
   // 6. Run Cadence Detection on Every Granular Stream (guarding against "Transfer to " / "Credit Card Payment" inside P&L)
@@ -2724,9 +2908,15 @@ export function computeCadenceForecast(
     capital_contributions_ytd: round2(capContribYtd),
   };
 
+  const effectiveCapitalContributionsYtd =
+    state.balance_sheet.capital_contributions_ytd > 0
+      ? round2(state.balance_sheet.capital_contributions_ytd)
+      : autoBsRollup.capital_contributions_ytd;
+
   const mergedBs: BalanceSheetProjectionInputs = {
     ...state.balance_sheet,
     as_of_date: asOfDate,
+    capital_contributions_ytd: effectiveCapitalContributionsYtd,
   };
 
   const synthesizedPnlState: PnlBalanceSheetState = {
@@ -2773,6 +2963,13 @@ export function computeCadenceForecast(
   const ytdCash = autoBsRollup.operating_cash_ytd;
   const ytdCreditCards = autoBsRollup.cc_ap_ytd;
   const ytdMemberDraws = autoBsRollup.member_draws_ytd;
+  const ytdCapitalContributions = effectiveCapitalContributionsYtd;
+
+  const capitalContributions = extractGlCapitalContributions(
+    state.transactions,
+    ledgerFormat,
+    setup
+  );
 
   const exp = state.qbo_expected;
   const makeRec = (id: string, label: string, computedVal: number, expectedVal?: number): QboReconciliationItem => {
@@ -2797,6 +2994,9 @@ export function computeCadenceForecast(
     makeRec('cash', 'Operating Cash / Checking', ytdCash, exp?.cash),
     makeRec('cc', 'Credit Cards / AP', ytdCreditCards, exp?.credit_cards),
     makeRec('draws', 'YTD Member Draws', ytdMemberDraws, exp?.member_draws),
+    ...(ytdCapitalContributions > 0 || capitalContributions.entries.length > 0
+      ? [makeRec('capital_contributions', 'Capital Contributions (Basis Added)', ytdCapitalContributions)]
+      : []),
   ];
 
   const aliasedStreamCount = granularStreams.filter((s) => s.isAliased).length;
@@ -2831,6 +3031,7 @@ export function computeCadenceForecast(
     pnlComputed,
     autoPnlByLine,
     autoBsRollup,
+    capitalContributions,
     reconciliation: {
       ytdRevenue,
       ytdBookExpenses,
@@ -2838,6 +3039,7 @@ export function computeCadenceForecast(
       ytdCash,
       ytdCreditCards,
       ytdMemberDraws,
+      ytdCapitalContributions,
       items: recItems,
       allMatched: recItems.every((i) => i.status !== 'variance'),
     },
@@ -2994,6 +3196,7 @@ export function buildStateFromImportedTransactions(
   // Run one pass to auto-populate Balance Sheet YTD & Beginning balances from the ledger
   const probe = computeCadenceForecast(draft, undefined, undefined, setup ?? undefined);
   const r = probe.autoBsRollup;
+  draft.capital_contributions_added = { ...probe.capitalContributions.capital_contributions_added };
   draft.balance_sheet = {
     ...draft.balance_sheet,
     as_of_date: asOfDate,

@@ -486,7 +486,20 @@ export function App() {
       let nextSetup = prev.setup;
       const nextYears = prev.years.map((prevYr) => {
         if (prevYr.tax_year !== taxYear) return prevYr;
-        const updatedYr = updater(prevYr);
+        const rawUpdatedYr = updater(prevYr);
+        const capContribChanged =
+          rawUpdatedYr.scorp_1120s.capital_contributions !==
+          prevYr.scorp_1120s.capital_contributions;
+        const updatedYr: TaxYearRecord = capContribChanged
+          ? {
+              ...rawUpdatedYr,
+              scorp_1120s: {
+                ...rawUpdatedYr.scorp_1120s,
+                capital_contributions_source:
+                  rawUpdatedYr.scorp_1120s.capital_contributions_source ?? 'manual',
+              },
+            }
+          : rawUpdatedYr;
 
         if (!updatedYr.is_locked_actuals) {
           const prevActiveStates = getActiveBusinessStates(prev.setup);
@@ -683,6 +696,49 @@ export function App() {
     });
   };
 
+  const handleSyncGlCapitalContributionsByYear = (byYear: Record<number, number>) => {
+    const entries = Object.entries(byYear)
+      .map(([yrStr, amt]) => [Number(yrStr), Math.round(Math.max(0, amt))] as const)
+      .filter(([yr]) => Number.isFinite(yr));
+    if (entries.length === 0) return;
+
+    const mapByYear = new Map<number, number>(entries);
+    setState((prev) => {
+      const nextYears = prev.years.map((yr) => {
+        if (yr.is_locked_actuals) return yr;
+        if (!mapByYear.has(yr.tax_year)) return yr;
+        const addedAmt = mapByYear.get(yr.tax_year) ?? 0;
+        return {
+          ...yr,
+          scorp_1120s: {
+            ...yr.scorp_1120s,
+            capital_contributions: addedAmt,
+            capital_contributions_source: 'gl_import' as const,
+          },
+        };
+      });
+
+      const nextPnlBalanceSheet =
+        prev.pnl_balance_sheet && mapByYear.has(prev.pnl_balance_sheet.projection_year)
+          ? {
+              ...prev.pnl_balance_sheet,
+              balance_sheet: {
+                ...prev.pnl_balance_sheet.balance_sheet,
+                capital_contributions_ytd:
+                  mapByYear.get(prev.pnl_balance_sheet.projection_year) ??
+                  prev.pnl_balance_sheet.balance_sheet.capital_contributions_ytd,
+              },
+            }
+          : prev.pnl_balance_sheet;
+
+      return {
+        ...prev,
+        years: nextYears,
+        pnl_balance_sheet: nextPnlBalanceSheet,
+      };
+    });
+  };
+
   const activeProjectionYear =
     state.pnl_balance_sheet?.projection_year ??
     state.cadence_forecaster?.projection_year ??
@@ -817,6 +873,10 @@ export function App() {
           officer_w2_wages: totalW2,
           scorp_distributions_total: drawsTotal,
           capital_contributions: capContrib,
+          capital_contributions_source:
+            capContrib > 0
+              ? yr.scorp_1120s.capital_contributions_source ?? 'gl_import'
+              : yr.scorp_1120s.capital_contributions_source,
           schedule_k_interest_income: schedKInterest,
           schedule_k_nondeductible_expenses: nondedMeals,
           state_sourcing_breakdown: nextBreakdown,
@@ -933,6 +993,12 @@ export function App() {
         },
         cadence_forecaster: {
           ...baseCadence,
+          balance_sheet: {
+            ...baseCadence.balance_sheet,
+            capital_contributions_ytd: pnlSnapshot.balance_sheet.capital_contributions_ytd,
+            capital_contributions_remaining:
+              pnlSnapshot.balance_sheet.capital_contributions_remaining,
+          },
           last_pushed_at: pushedAt,
         },
       };
@@ -1479,6 +1545,7 @@ export function App() {
               }
               computedYears={computed}
               onUpdateCadenceState={handleUpdateCadenceState}
+              onSyncGlCapitalContributionsByYear={handleSyncGlCapitalContributionsByYear}
               onUpdatePlanningGoals={handleUpdatePlanningGoals}
               onPushTo2026Schedule={handlePushCadenceTo2026Schedule}
               onNavigate={setActiveTab}

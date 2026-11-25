@@ -1368,14 +1368,41 @@ function classifyBalanceSheetLabel(
     return { target: 'cc_ap_ytd', confidence: 'high' };
   }
 
-  // Member Draws (absolute value applied when importing)
-  if (/member draws?|shareholder dist|owner.*draw|distribution/i.test(l)) {
+  // Split hierarchical QBO labels (e.g. "Member Equity : Member Draws") so leaf takes precedence
+  const leaf = l.split(':').map((p) => p.trim()).filter(Boolean).pop() ?? l;
+
+  // Member Draws / Distributions (check leaf first so "Member Equity : Member Draws" stays in member_draws_ytd)
+  if (
+    /member\s*draws?|shareholder\s*dist(?:ribution)?s?|owner['’]?s?\s*draws?|owner['’]?s?\s*dist(?:ribution)?s?|\bdistributions\b/i.test(
+      leaf
+    ) &&
+    !/ira|pension|retirement|401\(?k\)?/i.test(leaf)
+  ) {
     return { target: 'member_draws_ytd', confidence: 'high' };
   }
 
-  // Capital Contributions
-  if (/(capital contrib|paid[- ]in|owner.*contrib|member.*contrib|shareholder.*contrib)/i.test(l)) {
+  // Explicitly exclude Opening Balance Equity and Retained Earnings from capital contributions
+  if (/opening\s*balance\s*equity|retained\s*earnings/i.test(leaf)) {
+    return { target: 'ignore', confidence: 'high' };
+  }
+
+  // Capital Contributions (including Member Equity, Paid-In Capital, APIC, Owner's Investment)
+  if (
+    /\bmember\s*equity\b|(?:additional\s+)?paid[-\s]+in\s+capital|shareholder['’]?s?\s+contributions?|member['’]?s?\s+contributions?|owner['’]?s?\s+contributions?|owner['’]?s?\s+investments?|capital\s+contributions?/i.test(
+      leaf
+    )
+  ) {
     return { target: 'capital_contributions_ytd', confidence: 'high' };
+  }
+
+  // Fallback check on full path for nested Member Draws sub-accounts
+  if (
+    /member\s*draws?|shareholder\s*dist(?:ribution)?s?|owner['’]?s?\s*draws?|owner['’]?s?\s*dist(?:ribution)?s?|\bdistributions\b/i.test(
+      l
+    ) &&
+    !/ira|pension|retirement|401\(?k\)?/i.test(l)
+  ) {
+    return { target: 'member_draws_ytd', confidence: 'high' };
   }
 
   return { target: 'ignore', confidence: 'unmatched' };

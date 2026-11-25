@@ -942,11 +942,27 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
       Number.isFinite(yr.scorp_1120s.capital_contributions)
         ? Math.max(0, yr.scorp_1120s.capital_contributions)
         : 0;
+    const capContribSource = yr.scorp_1120s.capital_contributions_source;
+    const hasPersistedCapContribFromLedger =
+      Boolean(
+        raw.cadence_forecaster?.capital_contributions_added &&
+          (raw.cadence_forecaster.capital_contributions_added[yr.tax_year] ?? 0) > 0
+      ) ||
+      Boolean(
+        raw.cadence_forecaster &&
+          raw.cadence_forecaster.projection_year === yr.tax_year &&
+          (raw.cadence_forecaster.balance_sheet?.capital_contributions_ytd ?? 0) > 0
+      );
+    const isProtectedCapContrib =
+      capContribSource === 'gl_import' ||
+      capContribSource === 'manual' ||
+      hasPersistedCapContribFromLedger;
     if (
       isDefaultSeedEntityEarly &&
       yr.tax_year === 2026 &&
       !yr.is_locked_actuals &&
       seed2026 &&
+      !isProtectedCapContrib &&
       capContrib === DEFAULT_PROFILE_SEED.legacy_2026_capital_contributions
     ) {
       capContrib = seed2026.capital_contributions;

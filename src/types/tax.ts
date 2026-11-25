@@ -268,6 +268,8 @@ export interface SCorp1120SInputs {
   bill_distributions?: number;
   debra_distributions?: number;
   capital_contributions: number;
+  /** Tracks how capital_contributions was populated so GL-imported or manual values are never overwritten by legacy seed migrations */
+  capital_contributions_source?: 'manual' | 'gl_import' | 'seed';
   stock_basis_beginning: number;
   bill_stock_basis_beginning?: number;
   debra_stock_basis_beginning?: number;
@@ -583,9 +585,39 @@ export interface CadenceTransactionRow {
   account: string;
   split_account: string;
   amount: number;
+  debit?: number;
+  credit?: number;
   running_balance?: number;
   is_beginning_balance?: boolean;
   gl_section?: string;
+}
+
+export interface GlCapitalContributionEntry {
+  id: string;
+  tax_year: number;
+  date: string;
+  transaction_type: string;
+  num: string;
+  /** Display reference combining transaction type and journal/doc number (e.g. "Journal Entry · JE-104") */
+  reference: string;
+  vendor: string;
+  memo: string;
+  account: string;
+  split_account: string;
+  amount: number;
+}
+
+export interface GlCapitalContributionSummary {
+  /** Net capital contributed aggregated by tax year (clamped non-negative per year) */
+  capital_contributions_added: Record<number, number>;
+  /** Matched period equity contribution entries (excluding Beginning/Opening Balance carryforwards) */
+  entries: GlCapitalContributionEntry[];
+  /** Total net capital contributed across all matched tax years */
+  total_added: number;
+  /** Count of ignored Beginning/Opening Balance carryforward rows in capital contribution accounts */
+  ignored_opening_balance_count: number;
+  /** Sum of ignored Beginning/Opening Balance carryforward amounts */
+  ignored_opening_balance_amount: number;
 }
 
 export interface CadenceStreamOverride {
@@ -612,6 +644,8 @@ export interface CadenceForecasterState {
   pnl_line_overrides: Partial<Record<PnlLineId, Partial<PnlLineAmounts>>>;
   /** Balance Sheet inputs (YTD auto-populated from transactions unless edited inline) */
   balance_sheet: BalanceSheetProjectionInputs;
+  /** Per-tax-year net capital contributions parsed from imported GL/ledger equity entries */
+  capital_contributions_added?: Record<number, number>;
   /** Optional expected QBO reconciliation benchmarks */
   qbo_expected?: {
     revenue: number;

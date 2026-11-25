@@ -31,6 +31,7 @@ import type {
   CadenceForecasterState,
   CadenceGroupingMode,
   ComputedTaxYear,
+  GlCapitalContributionSummary,
   GuardrailAcknowledgment,
   PayeeAliasMatchType,
   PayeeAliasRule,
@@ -59,9 +60,12 @@ import {
   clampExpSmoothAlpha,
   computeCadenceForecast,
   createInitialCadenceForecasterState,
+  extractGlCapitalContributions,
   parseQboTransactionArrayBuffer,
   parseQboTransactionText,
   type AuditRowCategory,
+  type ComputedCadenceForecast,
+  type ParsedQboTransactionsResult,
 } from '../engine/cadenceEngine';
 import { evaluateAllPlanningGoals } from '../engine/planningGoals';
 import { getPersonNames } from '../engine/scheduleCatalog';
@@ -89,6 +93,7 @@ interface TransactionCadenceViewProps {
   onUpdateCadenceState: (
     updater: (prev: CadenceForecasterState) => CadenceForecasterState
   ) => void;
+  onSyncGlCapitalContributionsByYear?: (byYear: Record<number, number>) => void;
   onUpdatePlanningGoals: (
     updater: (prev: PlanningGoalGuardrail[]) => PlanningGoalGuardrail[]
   ) => void;
@@ -99,6 +104,15 @@ interface TransactionCadenceViewProps {
   onNavigate: (tab: WorkspaceTab) => void;
   onExportShadowReturn?: () => void;
   exportingShadowReturn?: boolean;
+}
+
+interface PendingLedgerImportPreview {
+  sourceLabel: string;
+  origin: 'file' | 'paste';
+  parsed: ParsedQboTransactionsResult;
+  nextState: CadenceForecasterState;
+  previewForecast: ComputedCadenceForecast;
+  capContrib: GlCapitalContributionSummary;
 }
 
 type PnlEditColumn = 'ytd' | 'remaining' | 'projected';
@@ -209,6 +223,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   year2026Computed,
   computedYears,
   onUpdateCadenceState,
+  onSyncGlCapitalContributionsByYear,
   onUpdatePlanningGoals,
   onPushTo2026Schedule,
   onNavigate,
@@ -220,6 +235,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   const [pasteText, setPasteText] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
+  const [pendingImport, setPendingImport] = useState<PendingLedgerImportPreview | null>(null);
   const [showAuditDrawer, setShowAuditDrawer] = useState(false);
   const [auditCategoryFilter, setAuditCategoryFilter] = useState<'all' | AuditRowCategory>('all');
   const [showCadenceDrawer, setShowCadenceDrawer] = useState(true);
@@ -439,66 +455,14 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     return Array.from(names).sort((a, b) => a.localeCompare(b));
   }, [forecast.granularStreams, payeeAliases]);
 
-  // File upload handler (CSV / TSV / XLSX / XLS)
-  const handleFileUpload = async (file: File) => {
-    setImportError(null);
-    try {
-      const buffer = await file.arrayBuffer();
-      const parsed = parseQboTransactionArrayBuffer(buffer, file.name);
-      if (parsed.transactions.length === 0) {
-        setImportError(
-          `No recognizable QuickBooks transaction rows found in "${file.name}". Verify the file has Date and Amount (or Debit/Credit) columns.`
-        );
-        return;
-      }
-
-      const nextState = buildStateFromImportedTransactions(
-        parsed.transactions,
-        file.name,
-        parsed.detectedAsOfDate,
-        parsed.detectedYear,
-        cadenceState.balance_sheet,
-        parsed.ledgerFormat,
-        cadenceState.qbo_expected,
-        {
-          alpha: cadenceState.exp_smooth_alpha,
-          dayFraction: cadenceState.exp_smooth_day_fraction,
-        },
-        cadenceState.payee_aliases,
-        cadenceState.grouping_mode,
-        setup
-      );
-      onUpdateCadenceState(() => nextState);
-      setShowImportPanel(false);
-      setBannerMessage({
-        type: 'import',
-        text: `Ingested ${parsed.transactions.length} rows from "${file.name}" (${
-          parsed.ledgerFormat === 'general_ledger' ? 'QBO General Ledger' : 'QBO Transaction List'
-        } · As-Of ${nextState.as_of_date}). Section-grouped P&L, Balance Sheet rollups, and calendar cadences updated.`,
-      });
-    } catch (err) {
-      setImportError(
-        err instanceof Error ? err.message : `Unable to read "${file.name}".`
-      );
-    }
-  };
-
-  const handleParsePastedRows = () => {
-    setImportError(null);
-    if (!pasteText.trim()) {
-      setImportError('Paste QuickBooks Online General Ledger or Transaction List rows (CSV or tab-separated) first.');
-      return;
-    }
-    const parsed = parseQboTransactionText(pasteText);
-    if (parsed.transactions.length === 0) {
-      setImportError(
-        'Could not parse any valid transaction rows. Expected QBO General Ledger or Transaction List columns (Date, Transaction Type, Name, Memo/Description, Split, Amount, Balance).'
-      );
-      return;
-    }
+  const stageImportPreview = (
+    parsed: ParsedQboTransactionsResult,
+    sourceLabel: string,
+    origin: 'file' | 'paste'
+  ) => {
     const nextState = buildStateFromImportedTransactions(
       parsed.transactions,
-      `Pasted QBO ${parsed.ledgerFormat === 'general_ledger' ? 'General Ledger' : 'Transactions'} (${parsed.transactions.length} rows)`,
+      sourceLabel,
       parsed.detectedAsOfDate,
       parsed.detectedYear,
       cadenceState.balance_sheet,
@@ -512,15 +476,102 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       cadenceState.grouping_mode,
       setup
     );
+    const previewForecast = computeCadenceForecast(
+      nextState,
+      year2025Computed,
+      year2026Computed,
+      setup
+    );
+    const capContrib = extractGlCapitalContributions(
+      parsed.transactions,
+      parsed.ledgerFormat,
+      setup
+    );
+    setPendingImport({
+      sourceLabel,
+      origin,
+      parsed,
+      nextState,
+      previewForecast,
+      capContrib,
+    });
+  };
+
+  const handleConfirmPendingImport = () => {
+    if (!pendingImport) return;
+    const { parsed, nextState, capContrib, sourceLabel, origin } = pendingImport;
     onUpdateCadenceState(() => nextState);
-    setPasteText('');
+
+    const matchedYears = Object.entries(capContrib.capital_contributions_added)
+      .map(([yr, amt]) => ({ year: Number(yr), amount: amt }))
+      .sort((a, b) => a.year - b.year);
+
+    if (matchedYears.length > 0 && onSyncGlCapitalContributionsByYear) {
+      onSyncGlCapitalContributionsByYear(capContrib.capital_contributions_added);
+    }
+
+    const capSummaryNote =
+      matchedYears.length > 0
+        ? ` Capital Contributions (Basis Added) synced: ${matchedYears
+            .map((m) => `${m.year} ${formatCurrency(m.amount)}`)
+            .join(', ')} — Ending Stock Basis updated automatically.`
+        : '';
+
+    if (origin === 'paste') {
+      setPasteText('');
+    }
+    setPendingImport(null);
     setShowImportPanel(false);
     setBannerMessage({
-      type: 'import',
-      text: `Parsed ${parsed.transactions.length} pasted rows (${
+      type: matchedYears.length > 0 ? 'push' : 'import',
+      text: `Imported ${parsed.transactions.length} rows from "${sourceLabel}" (${
         parsed.ledgerFormat === 'general_ledger' ? 'QBO General Ledger' : 'QBO Transaction List'
-      } · As-Of ${nextState.as_of_date}). Calendar cadences & Balance Sheet rollups refreshed.`,
+      } · As-Of ${nextState.as_of_date}).${capSummaryNote}`,
     });
+  };
+
+  // File upload handler (CSV / TSV / XLSX / XLS)
+  const handleFileUpload = async (file: File) => {
+    setImportError(null);
+    setPendingImport(null);
+    try {
+      const buffer = await file.arrayBuffer();
+      const parsed = parseQboTransactionArrayBuffer(buffer, file.name);
+      if (parsed.transactions.length === 0) {
+        setImportError(
+          `No recognizable QuickBooks transaction rows found in "${file.name}". Verify the file has Date and Amount (or Debit/Credit) columns.`
+        );
+        return;
+      }
+      stageImportPreview(parsed, file.name, 'file');
+    } catch (err) {
+      setImportError(
+        err instanceof Error ? err.message : `Unable to read "${file.name}".`
+      );
+    }
+  };
+
+  const handleParsePastedRows = () => {
+    setImportError(null);
+    setPendingImport(null);
+    if (!pasteText.trim()) {
+      setImportError(
+        'Paste QuickBooks Online General Ledger or Transaction List rows (CSV or tab-separated) first.'
+      );
+      return;
+    }
+    const parsed = parseQboTransactionText(pasteText);
+    if (parsed.transactions.length === 0) {
+      setImportError(
+        'Could not parse any valid transaction rows. Expected QBO General Ledger or Transaction List columns (Date, Transaction Type, Name, Memo/Description, Split, Amount, Balance).'
+      );
+      return;
+    }
+    stageImportPreview(
+      parsed,
+      `Pasted QBO ${parsed.ledgerFormat === 'general_ledger' ? 'General Ledger' : 'Transactions'} (${parsed.transactions.length} rows)`,
+      'paste'
+    );
   };
 
   const handleLoadSampleLedger = () => {
@@ -894,6 +945,30 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   const handlePush = () => {
     if (!canPushForecast) return;
     const impact = onPushTo2026Schedule(pnlState, computed);
+    if (
+      onSyncGlCapitalContributionsByYear &&
+      Object.keys(forecast.capitalContributions.capital_contributions_added).length > 0
+    ) {
+      // Also sync any additional non-projection-year capital contributions matched in the GL
+      const extraYears: Record<number, number> = {};
+      for (const [yrStr, amt] of Object.entries(
+        forecast.capitalContributions.capital_contributions_added
+      )) {
+        const yrNum = Number(yrStr);
+        if (yrNum !== pnlState.projection_year) {
+          extraYears[yrNum] = amt;
+        }
+      }
+      if (Object.keys(extraYears).length > 0) {
+        onSyncGlCapitalContributionsByYear(extraYears);
+      }
+    }
+    const capContribNote =
+      computed.projectedCapitalContributionsTotal > 0
+        ? ` · Capital Contributions (Basis Added): ${formatCurrencyExact(
+            computed.projectedCapitalContributionsTotal
+          )}`
+        : '';
     if (impact) {
       setPushToast(impact);
       setBannerMessage({
@@ -902,7 +977,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           impact.taxYear
         } K-1: ${formatCurrency(impact.newK1)} (${formatSignedDelta(
           impact.k1Delta
-        )}) · Total ${impact.taxYear} All-In Tax: ${formatCurrency(
+        )})${capContribNote} · Total ${impact.taxYear} All-In Tax: ${formatCurrency(
           impact.newAllInTax
         )} (${formatSignedDelta(impact.taxDelta)}).`,
       });
@@ -913,7 +988,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           computed.totalRevenue.projected
         )} · K-1 Profit ${formatCurrencyExact(
           computed.ordinaryBusinessIncome.projected
-        )} · Draws ${formatCurrencyExact(computed.projectedDrawsTotal)}).`,
+        )} · Draws ${formatCurrencyExact(computed.projectedDrawsTotal)}${capContribNote}).`,
       });
     }
   };
@@ -1257,6 +1332,199 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
               <span>{importError}</span>
             </div>
           )}
+
+          {/* Staged General Ledger / Transaction Import Summary & Preview (before confirming) */}
+          {pendingImport && (
+            <div className="border border-teal-200 bg-teal-50/30 rounded-lg p-4 space-y-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-semibold text-slate-900">
+                      Import Summary &amp; Verification Preview
+                    </span>
+                    <span className="text-[11px] font-medium px-2 py-0.5 rounded bg-teal-100 text-teal-900">
+                      {pendingImport.parsed.ledgerFormat === 'general_ledger'
+                        ? 'QBO General Ledger'
+                        : 'QBO Transaction List'}
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-600">
+                      As-Of {pendingImport.nextState.as_of_date}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-600 mt-0.5">
+                    Source: <span className="font-medium text-slate-800">{pendingImport.sourceLabel}</span> ·{' '}
+                    {pendingImport.parsed.transactions.length} parsed rows (
+                    {pendingImport.previewForecast.pnlTransactionCount} P&amp;L ·{' '}
+                    {pendingImport.previewForecast.bsSectionEntryCount} Balance Sheet)
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setPendingImport(null)}
+                    className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConfirmPendingImport}
+                    className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold text-white bg-teal-800 rounded-md hover:bg-teal-900 transition-colors whitespace-nowrap"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Confirm &amp; Apply Import
+                  </button>
+                </div>
+              </div>
+
+              {/* Preview Key Totals */}
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+                <div className="bg-white border border-slate-200 rounded-md px-3 py-2">
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                    YTD Gross Revenue
+                  </div>
+                  <div className="text-sm font-mono font-semibold tabular-nums text-slate-900 mt-0.5">
+                    {formatCurrency(pendingImport.previewForecast.reconciliation.ytdRevenue)}
+                  </div>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-md px-3 py-2">
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                    YTD Book Expenses
+                  </div>
+                  <div className="text-sm font-mono font-semibold tabular-nums text-slate-900 mt-0.5">
+                    {formatCurrency(pendingImport.previewForecast.reconciliation.ytdBookExpenses)}
+                  </div>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-md px-3 py-2">
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                    Member Draws (Dist.)
+                  </div>
+                  <div className="text-sm font-mono font-semibold tabular-nums text-slate-900 mt-0.5">
+                    {formatCurrency(pendingImport.previewForecast.autoBsRollup.member_draws_ytd)}
+                  </div>
+                </div>
+                <div
+                  className={`rounded-md px-3 py-2 border ${
+                    pendingImport.capContrib.total_added > 0
+                      ? 'bg-emerald-50/70 border-emerald-300'
+                      : 'bg-white border-slate-200'
+                  }`}
+                >
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-emerald-800">
+                    Capital Contributions (Basis)
+                  </div>
+                  <div className="text-sm font-mono font-semibold tabular-nums text-emerald-900 mt-0.5">
+                    {formatCurrencyExact(pendingImport.capContrib.total_added)}
+                  </div>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-md px-3 py-2">
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                    Operating Cash
+                  </div>
+                  <div className="text-sm font-mono font-semibold tabular-nums text-slate-900 mt-0.5">
+                    {formatCurrency(pendingImport.previewForecast.autoBsRollup.operating_cash_ytd)}
+                  </div>
+                </div>
+              </div>
+
+              {/* Matched Capital Contributions (Basis Added) Preview Table */}
+              <div className="bg-white border border-slate-200 rounded-md overflow-hidden">
+                <div className="px-3.5 py-2.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 bg-slate-50/70">
+                  <div>
+                    <h3 className="text-xs font-semibold text-slate-900">
+                      Capital Contributions (Basis Added) — Matched Equity Entries
+                    </h3>
+                    <p className="text-[11px] text-slate-500">
+                      Maps Member Equity, Paid-In Capital, Additional Paid-In Capital, Shareholder/Member/Owner Contributions, and Owner&apos;s Investment by tax year. Excludes Opening Balance Equity, Retained Earnings, Beginning Balance, and Total summary rows; draws remain under Member Draws.
+                    </p>
+                  </div>
+                  {Object.keys(pendingImport.capContrib.capital_contributions_added).length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {Object.entries(pendingImport.capContrib.capital_contributions_added)
+                        .sort(([a], [b]) => Number(a) - Number(b))
+                        .map(([yr, amt]) => (
+                          <span
+                            key={yr}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-mono font-semibold bg-emerald-50 text-emerald-900 border border-emerald-200 rounded"
+                          >
+                            {yr}: {formatCurrencyExact(amt)}
+                          </span>
+                        ))}
+                    </div>
+                  )}
+                </div>
+
+                {pendingImport.capContrib.entries.length > 0 ? (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 bg-slate-50/50 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                          <th className="py-2 px-3">Date</th>
+                          <th className="py-2 px-3">Transaction / Journal Ref</th>
+                          <th className="py-2 px-3">Account</th>
+                          <th className="py-2 px-3 text-right">Tax Year</th>
+                          <th className="py-2 px-3 text-right">Amount</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {pendingImport.capContrib.entries.map((entry) => (
+                          <tr key={entry.id} className="hover:bg-slate-50/60">
+                            <td className="py-2 px-3 font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                              {entry.date}
+                            </td>
+                            <td className="py-2 px-3 text-slate-800">
+                              <div className="font-medium text-slate-900">{entry.reference}</div>
+                              {entry.memo && (
+                                <div className="text-[11px] text-slate-500 truncate max-w-xs" title={entry.memo}>
+                                  {entry.memo}
+                                </div>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 text-slate-700">{entry.account}</td>
+                            <td className="py-2 px-3 text-right font-mono tabular-nums text-slate-700">
+                              {entry.tax_year}
+                            </td>
+                            <td
+                              className={`py-2 px-3 text-right font-mono font-semibold tabular-nums whitespace-nowrap ${
+                                entry.amount < 0 ? 'text-amber-700' : 'text-emerald-800'
+                              }`}
+                            >
+                              {formatCurrencyExact(entry.amount)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                      <tfoot>
+                        <tr className="border-t border-slate-200 bg-slate-50/80 font-semibold text-slate-900">
+                          <td colSpan={4} className="py-2 px-3 text-xs">
+                            Net Capital Contributions Added (Syncs to Six-Year Horizon &amp; Stock Basis on Confirm)
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono tabular-nums text-emerald-900 whitespace-nowrap">
+                            {formatCurrencyExact(pendingImport.capContrib.total_added)}
+                          </td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="px-3.5 py-3 text-xs text-slate-500">
+                    No period equity capital contribution entries were detected in this export.
+                  </div>
+                )}
+
+                {pendingImport.capContrib.ignored_opening_balance_count > 0 && (
+                  <div className="px-3.5 py-2 border-t border-slate-100 bg-slate-50/50 text-[11px] text-slate-600 flex items-center gap-1.5">
+                    <Info className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                    <span>
+                      Ignored {pendingImport.capContrib.ignored_opening_balance_count} Beginning/Opening Balance carryforward{' '}
+                      {pendingImport.capContrib.ignored_opening_balance_count === 1 ? 'row' : 'rows'} (
+                      {formatCurrencyExact(pendingImport.capContrib.ignored_opening_balance_amount)}) so only actual period transactions are summed.
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </section>
       )}
 
@@ -1311,12 +1579,29 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           </div>
         </div>
 
-        {/* 6-Column Reconciliation Grid */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 divide-y sm:divide-y-0 sm:divide-x divide-slate-100">
+        {/* Reconciliation Summary Grid (expands to 7 columns when Capital Contributions are present) */}
+        <div
+          className={`grid grid-cols-2 sm:grid-cols-3 ${
+            forecast.reconciliation.items.length >= 7 ? 'lg:grid-cols-7' : 'lg:grid-cols-6'
+          } divide-y sm:divide-y-0 sm:divide-x divide-slate-100`}
+        >
           {forecast.reconciliation.items.map((item) => (
-            <div key={item.id} className="px-4 py-3">
-              <div className="text-[11px] text-slate-500 truncate">{item.label}</div>
-              <div className="text-sm font-semibold font-mono tabular-nums text-slate-900 mt-0.5">
+            <div
+              key={item.id}
+              className={`px-4 py-3 ${
+                item.id === 'capital_contributions' && item.computed > 0 ? 'bg-emerald-50/40' : ''
+              }`}
+            >
+              <div className="text-[11px] text-slate-500 truncate" title={item.label}>
+                {item.label}
+              </div>
+              <div
+                className={`text-sm font-semibold font-mono tabular-nums mt-0.5 ${
+                  item.id === 'capital_contributions' && item.computed > 0
+                    ? 'text-emerald-800'
+                    : 'text-slate-900'
+                }`}
+              >
                 {formatCurrencyExact(item.computed)}
               </div>
               <div className="text-[11px] font-mono tabular-nums mt-0.5">
@@ -1329,7 +1614,20 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
                   </span>
                 )}
                 {item.status === 'info' && (
-                  <span className="text-slate-400">Rolled up from ledger</span>
+                  <span
+                    className={
+                      item.id === 'capital_contributions' && item.computed > 0
+                        ? 'text-emerald-700'
+                        : 'text-slate-400'
+                    }
+                  >
+                    {item.id === 'capital_contributions' &&
+                    forecast.capitalContributions.entries.length > 0
+                      ? `${forecast.capitalContributions.entries.length} equity ${
+                          forecast.capitalContributions.entries.length === 1 ? 'entry' : 'entries'
+                        } matched`
+                      : 'Rolled up from ledger'}
+                  </span>
                 )}
               </div>
             </div>
@@ -1433,10 +1731,21 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
         )}
       </section>
 
-      {/* 4-Column Executive KPI Strip */}
-      <div className="no-print grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      {/* Executive KPI Strip (shows Capital Contributions card beside Member Draws when present) */}
+      <div
+        className={`no-print grid grid-cols-1 sm:grid-cols-2 ${
+          showStockBasis &&
+          (computed.projectedCapitalContributionsTotal > 0 ||
+            bs.capital_contributions_ytd > 0 ||
+            forecast.capitalContributions.total_added > 0)
+            ? 'lg:grid-cols-5'
+            : 'lg:grid-cols-4'
+        } gap-4`}
+      >
         <div className="bg-white border border-slate-200 rounded-lg p-4">
-          <div className="text-xs text-slate-500">Projected 2026 Gross Receipts</div>
+          <div className="text-xs text-slate-500">
+            Projected {cadenceState.projection_year} Gross Receipts
+          </div>
           <div className="text-xl font-bold font-mono tabular-nums text-slate-900 mt-1">
             {formatCurrencyExact(computed.totalRevenue.projected)}
           </div>
@@ -1470,6 +1779,24 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
             {formatCurrencyExact(bs.member_draws_remaining)}
           </div>
         </div>
+
+        {showStockBasis &&
+          (computed.projectedCapitalContributionsTotal > 0 ||
+            bs.capital_contributions_ytd > 0 ||
+            forecast.capitalContributions.total_added > 0) && (
+            <div className="bg-white border border-emerald-200 rounded-lg p-4">
+              <div className="text-xs text-emerald-800 font-medium">
+                Capital Contributions (Basis Added)
+              </div>
+              <div className="text-xl font-bold font-mono tabular-nums text-emerald-800 mt-1">
+                {formatCurrencyExact(computed.projectedCapitalContributionsTotal)}
+              </div>
+              <div className="text-xs text-slate-500 font-mono tabular-nums mt-1">
+                YTD {formatCurrencyExact(bs.capital_contributions_ytd)} · Rem{' '}
+                {formatCurrencyExact(bs.capital_contributions_remaining)}
+              </div>
+            </div>
+          )}
 
         {showStockBasis && (
           <div className="bg-white border border-slate-200 rounded-lg p-4">
