@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { AlertTriangle, Download, Printer, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Download, FileSpreadsheet, Printer, X } from 'lucide-react';
 import type {
+  ComputedTaxYear,
   GuardrailAcknowledgment,
   PnlBalanceSheetState,
   SetupConfig,
@@ -16,6 +17,12 @@ import {
   type CpaPackageMetadata,
   type CpaReportMetadata,
 } from '../engine/pnlBalanceSheet';
+import {
+  buildCpaHorizonSummary,
+  computePnlVsHorizonReconciliation,
+  type CpaHorizonSummaryTable,
+  type PnlHorizonReconciliation,
+} from '../engine/cpaHorizonSummary';
 import { getPersonNames } from '../engine/scheduleCatalog';
 import {
   formatReasonableCompExplanationSummary,
@@ -24,7 +31,7 @@ import {
   syncReasonableCompNoteText,
 } from '../engine/validator';
 import { getSetupStates } from '../utils/setupHelpers';
-import { formatCurrencyExact } from '../utils/format';
+import { formatCurrency, formatCurrencyExact } from '../utils/format';
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -87,6 +94,16 @@ function getCpaEntityLabels(
       : entityType === 'sole_prop'
       ? 'Projected Net Profit (Schedule C Line 31)'
       : 'Projected Net Operating Income';
+  const ordinaryIncomeRef =
+    entityType === 'scorp_llc'
+      ? 'Line 22'
+      : entityType === 'partnership'
+      ? 'Line 23'
+      : entityType === 'ccorp'
+      ? 'Line 30'
+      : entityType === 'sole_prop'
+      ? 'Line 31'
+      : 'Net';
   const filingStatusLabel =
     setup.filing_status === 'married_filing_jointly'
       ? 'MFJ'
@@ -108,28 +125,35 @@ function getCpaEntityLabels(
     entityFormLabel,
     ordinaryIncomeCardLabel,
     ordinaryIncomeRowLabel,
+    ordinaryIncomeRef,
     filingStatusLabel,
     ownershipLabel,
     activeStatesLabel,
   };
 }
 
-interface StandaloneHtmlParams {
+export interface StandaloneHtmlParams {
   setup: SetupConfig;
   pnlState: PnlBalanceSheetState;
   computed: ComputedPnlBalanceSheet;
+  computedYears?: ComputedTaxYear[];
   entityName: string;
   entityEin: string;
   primaryName: string;
   spouseName: string;
   generatedOn: string;
   meta: CpaPackageMetadata;
+  horizonSummary?: CpaHorizonSummaryTable | null;
+  pnlRecon?: PnlHorizonReconciliation | null;
   basisRows: {
     billBeg: number;
     debraBeg: number;
     posInc: number;
     billInc: number;
     debraInc: number;
+    ordLoss: number;
+    billLoss: number;
+    debraLoss: number;
     posInt: number;
     billInt: number;
     debraInt: number;
@@ -151,16 +175,19 @@ interface StandaloneHtmlParams {
   activeGuardrailCount: number;
 }
 
-function buildStandalonePrintHtml({
+export function buildStandalonePrintHtml({
   setup,
   pnlState,
   computed,
+  computedYears,
   entityName,
   entityEin,
   primaryName,
   spouseName,
   generatedOn,
   meta,
+  horizonSummary: providedHorizonSummary,
+  pnlRecon: providedPnlRecon,
   basisRows,
   acknowledgedGuardrails,
   activeGuardrailCount,
@@ -171,8 +198,21 @@ function buildStandalonePrintHtml({
   const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
   const pCode = primaryStateCode || 'State 1';
   const sCode = secondaryStateCode || 'State 2';
+  const isMfj = setup.filing_status === 'married_filing_jointly';
   const priorYearLabel = `${pnlState.projection_year - 1} Filed`;
   const labels = getCpaEntityLabels(setup, primaryName, spouseName, computed);
+  const horizonSummary =
+    providedHorizonSummary !== undefined
+      ? providedHorizonSummary
+      : computedYears && computedYears.length > 0
+      ? buildCpaHorizonSummary(setup, computedYears)
+      : null;
+  const pnlRecon =
+    providedPnlRecon !== undefined
+      ? providedPnlRecon
+      : computedYears && computedYears.length > 0
+      ? computePnlVsHorizonReconciliation(pnlState, computed, computedYears, setup)
+      : null;
   const entityMetaParts = [
     entityEin.trim() ? `<span class="mono">EIN ${e(entityEin.trim())}</span>` : '',
     `Tax Year ${e(pnlState.projection_year)}`,
@@ -180,7 +220,7 @@ function buildStandalonePrintHtml({
     `Ownership: ${e(labels.ownershipLabel)}`,
   ].filter(Boolean);
 
-  const assumptionsHtml = meta.activeAssumptions
+  const assumptionsHtml = (meta.activeAssumptions ?? [])
     .map(
       (item) =>
         `<div class="assumption-item"><span class="assumption-label">${e(item.label)}:</span> ${e(
@@ -198,7 +238,7 @@ function buildStandalonePrintHtml({
           item.id === 'meals_gross'
             ? `
               <tr class="sub-row">
-                <td class="indent">&#8627; 50% Deductible Meals (Included in 1120-S)</td>
+                <td class="indent">&#8627; 50% Deductible Meals (Included in ${e(labels.entityFormLabel)})</td>
                 <td class="mono muted">Line 19</td>
                 <td class="num">${cur(computed.mealsDeductible50.ytd)}</td>
                 <td class="num">${cur(computed.mealsDeductible50.remaining)}</td>
@@ -248,7 +288,7 @@ function buildStandalonePrintHtml({
               <td class="pad-l">
                 Total Operating Expenses (Excl. W-2 &amp; Retirement &middot; Tax Deductible)
                 <div class="muted" style="font-size:9px;font-weight:400;margin-top:2px;">
-                  Excl. Payroll Taxes (1120-S / Horizon OpEx): ${cur(computed.totalOperatingExpensesExclPayroll.projected)}
+                  Excl. Payroll Taxes (${e(labels.entityFormLabel)} / Horizon OpEx): ${cur(computed.totalOperatingExpensesExclPayroll.projected)}
                 </div>
               </td>
               <td class="mono muted">Lines 11&ndash;19</td>
@@ -270,7 +310,8 @@ function buildStandalonePrintHtml({
   }).join('');
 
   const excessGainRowHtml = computed.drawsExceedBasis
-    ? `
+    ? isMfj
+      ? `
       <tr class="danger-row">
         <td>Form 8949 Excess Dist. Gain</td>
         <td class="num">${cur(computed.projectedExcessDistributionGain)}</td>
@@ -278,9 +319,155 @@ function buildStandalonePrintHtml({
         <td class="num">${cur(computed.debraExcessGain)}</td>
       </tr>
     `
+      : `
+      <tr class="danger-row">
+        <td>Form 8949 Excess Dist. Gain</td>
+        <td class="num">${cur(computed.projectedExcessDistributionGain)}</td>
+      </tr>
+    `
     : '';
 
-  const goalsSectionNum = setup.has_stock_basis !== false ? 4 : 3;
+  const ordinaryLossRowHtml =
+    basisRows.ordLoss > 0
+      ? isMfj
+        ? `
+      <tr>
+        <td>&minus; Projected Ordinary Loss</td>
+        <td class="num">${cur(-basisRows.ordLoss)}</td>
+        <td class="num">${cur(-basisRows.billLoss)}</td>
+        <td class="num">${cur(-basisRows.debraLoss)}</td>
+      </tr>
+    `
+        : `
+      <tr>
+        <td>&minus; Projected Ordinary Loss</td>
+        <td class="num">${cur(-basisRows.ordLoss)}</td>
+      </tr>
+    `
+      : '';
+
+  let nextSectionNum = setup.has_stock_basis !== false ? 4 : 3;
+  const horizonSectionNum = horizonSummary ? nextSectionNum++ : 0;
+  const goalsSectionNum = meta.activeGoals.length > 0 ? nextSectionNum++ : 0;
+  const ackSectionNum = acknowledgedGuardrails.length > 0 ? nextSectionNum++ : 0;
+
+  const horizonSectionHtml = horizonSummary
+    ? (() => {
+        const firstYr = horizonSummary.years[0];
+        const lastYr = horizonSummary.years[horizonSummary.years.length - 1];
+        const yrCols = horizonSummary.years
+          .map(
+            (y) =>
+              `<th class="num">${e(y)}${
+                y === setup.anchor_actuals_year ? '<div class="h-th-sub">Actuals</div>' : ''
+              }</th>`
+          )
+          .join('');
+        const colDefs = `<col style="width:28%;" />${horizonSummary.years
+          .map(() => `<col style="width:10%;" />`)
+          .join('')}<col style="width:12%;" />`;
+
+        let lastSec = '';
+        const secHeaders: Record<string, string> = {
+          entity: `${labels.entityFormLabel} Entity Operations & Retirement`,
+          personal: 'Form 1040 Taxable Income, Federal/State Taxes & IRMAA',
+          basis: 'Shareholder Capital Contributions, Draws & Stock Basis',
+        };
+        const rowsHtml = horizonSummary.rows
+          .map((row) => {
+            const secBanner =
+              row.section !== lastSec
+                ? `<tr class="section-row"><td colspan="${
+                    horizonSummary.years.length + 2
+                  }">${e(secHeaders[row.section] || row.section)}</td></tr>`
+                : '';
+            lastSec = row.section;
+            const rowCls =
+              row.highlight === 'primary'
+                ? 'grand-total-row'
+                : row.highlight === 'secondary'
+                ? 'subtotal-row'
+                : '';
+            const cellsHtml = row.cells
+              .map((cell) => {
+                const badgeCls =
+                  cell.tone === 'danger'
+                    ? 'badge-over'
+                    : cell.tone === 'warning'
+                    ? 'badge-watch'
+                    : cell.tone === 'positive'
+                    ? 'badge-within'
+                    : '';
+                const valHtml = cell.badgeText
+                  ? `<span class="h-badge ${badgeCls}">${e(cell.badgeText)}</span>`
+                  : `<span class="${row.bold ? 'strong' : ''}">${e(cell.display)}</span>`;
+                const subHtml = cell.subLabel
+                  ? `<div class="h-sub">${e(cell.subLabel)}</div>`
+                  : '';
+                return `<td class="num">${valHtml}${subHtml}</td>`;
+              })
+              .join('');
+            const totalSub = row.totalSubLabel
+              ? `<div class="h-sub">${e(row.totalSubLabel)}</div>`
+              : '';
+            return `${secBanner}<tr class="${rowCls}">
+              <td><span class="${row.bold ? 'strong' : ''}">${e(row.label)}</span> <span class="h-ref">${e(row.shortRef)}</span></td>
+              ${cellsHtml}
+              <td class="num strong">${e(row.totalDisplay)}${totalSub}</td>
+            </tr>`;
+          })
+          .join('');
+
+        return `
+    <section class="horizon-section">
+      <h2>${horizonSectionNum}. Multi-Year Tax &amp; Cash-Flow Horizon Summary (${e(firstYr)}&ndash;${e(lastYr)})</h2>
+      <table class="horizon-table">
+        <colgroup>${colDefs}</colgroup>
+        <thead>
+          <tr>
+            <th>Horizon Metric</th>
+            ${yrCols}
+            <th class="num">${e(horizonSummary.years.length)}-Yr Total / End</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rowsHtml}
+        </tbody>
+      </table>
+      <div class="h-footnote">
+        All ${e(firstYr)}&ndash;${e(lastYr)} figures tie directly to the 6-Year Horizon Tax Engine ($0 variance). Medicare IRMAA follows the statutory 2-year lookback (e.g., 2026 MAGI sets 2028 Medicare premiums).
+      </div>
+    </section>`;
+      })()
+    : '';
+
+  const reconStripHtml =
+    pnlRecon && setup.has_scorp
+      ? pnlRecon.isReconciled
+        ? `<div class="recon-box recon-ok">
+      <strong>${e(pnlRecon.projectionYear)} Working P&amp;L &harr; ${e(pnlRecon.projectionYear)} Horizon Reconciled ($0 Variance):</strong>
+      Gross Receipts, OpEx, Officer W-2, SEHI, Payroll Taxes, DBP, 401(k), K-1 OBI, Capital Contributions, Draws &amp; Ending Stock Basis tie identically &middot; Reasonable Comp ${e(
+        pnlRecon.rcHorizonPct.toFixed(1)
+      )}%.
+    </div>`
+        : `<div class="recon-box recon-delta">
+      <strong>${e(pnlRecon.projectionYear)} Working P&amp;L vs. ${e(pnlRecon.projectionYear)} Horizon Variance Notice:</strong>
+      Working P&amp;L reflects live bookkeeping/cadence projections not yet pushed to the ${e(
+        pnlRecon.projectionYear
+      )} Horizon schedule (K-1 OBI delta ${e(
+            pnlRecon.obiVariance >= 0 ? '+' : ''
+          )}${e(formatCurrency(pnlRecon.obiVariance))}, Basis delta ${e(
+            pnlRecon.basisVariance >= 0 ? '+' : ''
+          )}${e(formatCurrency(pnlRecon.basisVariance))}, RC ${e(
+            pnlRecon.rcPnlPct.toFixed(1)
+          )}% vs. ${e(pnlRecon.rcHorizonPct.toFixed(1))}%). Section ${horizonSectionNum} below shows the authoritative ${e(
+            horizonSummary?.years[0] ?? 2025
+          )}&ndash;${e(
+            horizonSummary?.years[horizonSummary.years.length - 1] ?? 2030
+          )} Horizon Tax Plan.
+    </div>`
+      : '';
+
   const goalsSectionHtml =
     meta.activeGoals.length > 0
       ? `
@@ -646,6 +833,78 @@ function buildStandalonePrintHtml({
     .goals-section {
       break-inside: avoid;
     }
+    .horizon-section {
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+    .horizon-table {
+      table-layout: fixed;
+      width: 100%;
+      font-size: 9px;
+    }
+    .horizon-table th {
+      font-size: 8.5px;
+      padding: 4px 3px;
+    }
+    .horizon-table td {
+      padding: 3.5px 3px;
+      line-height: 1.25;
+      overflow-wrap: break-word;
+    }
+    .h-th-sub {
+      font-size: 7.5px;
+      font-weight: 500;
+      color: #64748b;
+    }
+    .h-ref {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 7.5px;
+      color: #64748b;
+      margin-left: 2px;
+    }
+    .h-sub {
+      font-size: 7.5px;
+      color: #64748b;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-top: 1px;
+    }
+    .h-badge {
+      display: inline-block;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 8px;
+      font-weight: 700;
+      border: 1px solid #cbd5e1;
+      background: #f1f5f9;
+      color: #334155;
+      white-space: nowrap;
+    }
+    .h-footnote {
+      font-size: 8.5px;
+      color: #64748b;
+      margin-top: 5px;
+    }
+    .recon-box {
+      border-radius: 5px;
+      padding: 7px 11px;
+      margin-bottom: 14px;
+      font-size: 9.5px;
+      line-height: 1.4;
+      break-inside: avoid;
+    }
+    .recon-ok {
+      background: #ecfdf5;
+      border: 1px solid #a7f3d0;
+      color: #065f46;
+    }
+    .recon-delta {
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      color: #92400e;
+    }
     .status-badge {
       display: inline-block;
       padding: 2px 6px;
@@ -812,7 +1071,7 @@ function buildStandalonePrintHtml({
       <div class="summary-card">
         <div class="summary-label">${e(labels.ordinaryIncomeCardLabel)}</div>
         <div class="summary-value">${cur(computed.ordinaryBusinessIncome.projected)}</div>
-        <div class="summary-sub">Prior-Yr Filed: ${cur(computed.ordinaryBusinessIncome.filed2025)}</div>
+        <div class="summary-sub">${e(priorYearLabel)}: ${cur(computed.ordinaryBusinessIncome.filed2025)}</div>
       </div>
       <div class="summary-card">
         <div class="summary-label">Projected Member Draws</div>
@@ -836,6 +1095,8 @@ function buildStandalonePrintHtml({
       }
     </div>
 
+    ${reconStripHtml}
+
     <section>
       <h2>1. Profit &amp; Loss Projection (${e(labels.entityFormLabel)} Structure)</h2>
       <table>
@@ -853,14 +1114,14 @@ function buildStandalonePrintHtml({
           ${pnlRowsHtml}
           <tr class="grand-total-row">
             <td class="pad-l">${e(labels.ordinaryIncomeRowLabel)}</td>
-            <td class="mono">Line 22</td>
+            <td class="mono">${e(labels.ordinaryIncomeRef)}</td>
             <td class="num">${cur(computed.ordinaryBusinessIncome.ytd)}</td>
             <td class="num">${cur(computed.ordinaryBusinessIncome.remaining)}</td>
             <td class="num">${cur(computed.ordinaryBusinessIncome.projected)}</td>
             <td class="num muted">${cur(computed.ordinaryBusinessIncome.filed2025)}</td>
           </tr>
           <tr class="schk-row">
-            <td class="pad-l">${e(SCHEDULE_K_LINE_META.label)} (Excl. from Line 22 &middot; Adds to Basis)</td>
+            <td class="pad-l">${e(SCHEDULE_K_LINE_META.label)} (Excl. from ${e(labels.ordinaryIncomeRef)} &middot; Adds to Basis)</td>
             <td class="mono muted">${e(SCHEDULE_K_LINE_META.form1120sRef)}</td>
             <td class="num">${cur(computed.scheduleKInterest.ytd)}</td>
             <td class="num">${cur(computed.scheduleKInterest.remaining)}</td>
@@ -923,60 +1184,56 @@ function buildStandalonePrintHtml({
       ${
         setup.has_stock_basis !== false
           ? `<section>
-        <h2>3. Form 7203 Shareholder Stock Basis (${e(primaryName)} ${e(
-              computed.billSharePct
-            )}% / ${e(spouseName)} ${e(computed.debraSharePct)}%)</h2>
+        <h2>3. Form 7203 Shareholder Stock Basis (${e(labels.ownershipLabel)})</h2>
         <table>
           <thead>
             <tr>
               <th>Basis Component</th>
-              <th class="num">Combined</th>
+              ${
+                isMfj
+                  ? `<th class="num">Combined</th>
               <th class="num">${e(primaryName)}</th>
-              <th class="num">${e(spouseName)}</th>
+              <th class="num">${e(spouseName)}</th>`
+                  : `<th class="num">${e(primaryName)} (100%)</th>`
+              }
             </tr>
           </thead>
           <tbody>
             <tr>
               <td>Beginning Stock Basis</td>
               <td class="num">${cur(computed.beginningStockBasis)}</td>
-              <td class="num">${cur(basisRows.billBeg)}</td>
-              <td class="num">${cur(basisRows.debraBeg)}</td>
+              ${isMfj ? `<td class="num">${cur(basisRows.billBeg)}</td><td class="num">${cur(basisRows.debraBeg)}</td>` : ''}
             </tr>
             <tr>
               <td>+ Projected K-1 Ordinary Income</td>
               <td class="num">${cur(basisRows.posInc)}</td>
-              <td class="num">${cur(basisRows.billInc)}</td>
-              <td class="num">${cur(basisRows.debraInc)}</td>
+              ${isMfj ? `<td class="num">${cur(basisRows.billInc)}</td><td class="num">${cur(basisRows.debraInc)}</td>` : ''}
             </tr>
             <tr>
               <td>+ Schedule K Interest Income (Line 4)</td>
               <td class="num">${cur(basisRows.posInt)}</td>
-              <td class="num">${cur(basisRows.billInt)}</td>
-              <td class="num">${cur(basisRows.debraInt)}</td>
+              ${isMfj ? `<td class="num">${cur(basisRows.billInt)}</td><td class="num">${cur(basisRows.debraInt)}</td>` : ''}
             </tr>
             <tr>
               <td>+ Capital Contributions</td>
               <td class="num">${cur(computed.projectedCapitalContributionsTotal)}</td>
-              <td class="num">${cur(basisRows.billCap)}</td>
-              <td class="num">${cur(basisRows.debraCap)}</td>
+              ${isMfj ? `<td class="num">${cur(basisRows.billCap)}</td><td class="num">${cur(basisRows.debraCap)}</td>` : ''}
             </tr>
             <tr>
               <td>&minus; Member Draws / Distributions</td>
               <td class="num">${cur(-computed.projectedDrawsTotal)}</td>
-              <td class="num">${cur(-basisRows.billDraws)}</td>
-              <td class="num">${cur(-basisRows.debraDraws)}</td>
+              ${isMfj ? `<td class="num">${cur(-basisRows.billDraws)}</td><td class="num">${cur(-basisRows.debraDraws)}</td>` : ''}
             </tr>
             <tr>
               <td>&minus; Nondeductible (50% Meals)</td>
               <td class="num">${cur(-computed.mealsNondeductible50.projected)}</td>
-              <td class="num">${cur(-basisRows.billNonded)}</td>
-              <td class="num">${cur(-basisRows.debraNonded)}</td>
+              ${isMfj ? `<td class="num">${cur(-basisRows.billNonded)}</td><td class="num">${cur(-basisRows.debraNonded)}</td>` : ''}
             </tr>
+            ${ordinaryLossRowHtml}
             <tr class="subtotal-row">
               <td>Projected Ending Stock Basis</td>
               <td class="num">${cur(computed.projectedEndingStockBasis)}</td>
-              <td class="num">${cur(computed.billProjectedBasisEnding)}</td>
-              <td class="num">${cur(computed.debraProjectedBasisEnding)}</td>
+              ${isMfj ? `<td class="num">${cur(computed.billProjectedBasisEnding)}</td><td class="num">${cur(computed.debraProjectedBasisEnding)}</td>` : ''}
             </tr>
             ${excessGainRowHtml}
           </tbody>
@@ -986,14 +1243,14 @@ function buildStandalonePrintHtml({
       }
     </div>
 
+    ${horizonSectionHtml}
+
     ${goalsSectionHtml}
 
     ${
       acknowledgedGuardrails.length > 0
         ? `<section class="goals-section" style="margin-top:16px;">
-      <h2>${
-        (setup.has_stock_basis !== false ? 4 : 3) + (meta.activeGoals.length > 0 ? 1 : 0)
-      }. Acknowledged Guardrail Findings &amp; Explanations (${acknowledgedGuardrails.length})${
+      <h2>${ackSectionNum}. Acknowledged Guardrail Findings &amp; Explanations (${acknowledgedGuardrails.length})${
             activeGuardrailCount > 0
               ? ` <span class="muted" style="font-weight:400;font-size:10px;">&middot; ${activeGuardrailCount} active ${
                   activeGuardrailCount === 1 ? 'finding' : 'findings'
@@ -1082,6 +1339,7 @@ interface CpaPrintPackageModalProps {
   setup: SetupConfig;
   pnlState: PnlBalanceSheetState;
   computed: ComputedPnlBalanceSheet;
+  computedYears?: ComputedTaxYear[];
   entityName: string;
   entityEin: string;
   reportMeta?: CpaReportMetadata;
@@ -1090,6 +1348,8 @@ interface CpaPrintPackageModalProps {
   issues?: ValidationIssue[];
   guardrailAcknowledgments?: Record<string, GuardrailAcknowledgment>;
   onDownloadCsv: () => void;
+  onExportShadowReturn?: () => void;
+  exportingShadowReturn?: boolean;
   onClose: () => void;
 }
 
@@ -1097,6 +1357,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
   setup,
   pnlState,
   computed,
+  computedYears,
   entityName,
   entityEin,
   reportMeta,
@@ -1105,12 +1366,15 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
   issues = [],
   guardrailAcknowledgments = {},
   onDownloadCsv,
+  onExportShadowReturn,
+  exportingShadowReturn,
   onClose,
 }) => {
   const { primaryName, spouseName } = getPersonNames(setup);
   const { primaryStateCode, secondaryStateCode } = getSetupStates(setup);
   const pCode = primaryStateCode || 'State 1';
   const sCode = secondaryStateCode || 'State 2';
+  const isMfj = setup.filing_status === 'married_filing_jointly';
   const bs = pnlState.balance_sheet;
   const generatedOn = new Date().toLocaleDateString('en-US', {
     year: 'numeric',
@@ -1122,6 +1386,15 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
     moduleName: reportMeta?.moduleName ?? moduleName,
     forecastAssumptions: reportMeta?.forecastAssumptions ?? forecastAssumptions,
   });
+
+  const horizonSummary =
+    computedYears && computedYears.length > 0
+      ? buildCpaHorizonSummary(setup, computedYears)
+      : null;
+  const pnlRecon =
+    computedYears && computedYears.length > 0
+      ? computePnlVsHorizonReconciliation(pnlState, computed, computedYears, setup)
+      : null;
 
   // Resolve acknowledged guardrail findings (matched against live P&L projection or Horizon issues)
   const issueByAckKey = new Map(issues.map((item) => [item.ack_key, item]));
@@ -1177,8 +1450,10 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
   const activeGuardrailCount = issues.filter(
     (item) => !guardrailAcknowledgments[item.ack_key]
   ).length;
-  const ackSectionNum =
-    (setup.has_stock_basis !== false ? 4 : 3) + (meta.activeGoals.length > 0 ? 1 : 0);
+  let nextSecNum = setup.has_stock_basis !== false ? 4 : 3;
+  const horizonSectionNum = horizonSummary ? nextSecNum++ : 0;
+  const goalsSectionNum = meta.activeGoals.length > 0 ? nextSecNum++ : 0;
+  const ackSectionNum = acknowledgedGuardrails.length > 0 ? nextSecNum++ : 0;
 
   const [printStatus, setPrintStatus] = useState<{
     type: 'opened' | 'downloaded';
@@ -1192,6 +1467,12 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
   const posInc = Math.max(0, computed.ordinaryBusinessIncome.projected);
   const billInc = round2(posInc * billPct);
   const debraInc = round2(posInc - billInc);
+  const ordLoss =
+    computed.ordinaryBusinessIncome.projected < 0
+      ? Math.abs(computed.ordinaryBusinessIncome.projected)
+      : 0;
+  const billLoss = round2(ordLoss * billPct);
+  const debraLoss = round2(ordLoss - billLoss);
   const posInt = Math.max(0, computed.scheduleKInterest.projected);
   const billInt = round2(posInt * billPct);
   const debraInt = round2(posInt - billInt);
@@ -1207,12 +1488,15 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
       setup,
       pnlState,
       computed,
+      computedYears,
       entityName,
       entityEin,
       primaryName,
       spouseName,
       generatedOn,
       meta,
+      horizonSummary,
+      pnlRecon,
       acknowledgedGuardrails,
       activeGuardrailCount,
       basisRows: {
@@ -1221,6 +1505,9 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
         posInc,
         billInc,
         debraInc,
+        ordLoss,
+        billLoss,
+        debraLoss,
         posInt,
         billInt,
         debraInt,
@@ -1299,6 +1586,19 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            {onExportShadowReturn && (
+              <button
+                type="button"
+                onClick={onExportShadowReturn}
+                disabled={Boolean(exportingShadowReturn)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-emerald-900 bg-emerald-50 border border-emerald-300 rounded-md hover:bg-emerald-100 disabled:opacity-60 transition-colors whitespace-nowrap"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700" />
+                {exportingShadowReturn
+                  ? 'Generating…'
+                  : 'Export Shadow Tax Return (.xlsx)'}
+              </button>
+            )}
             <button
               type="button"
               onClick={onDownloadCsv}
@@ -1494,7 +1794,8 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                 {formatCurrencyExact(computed.ordinaryBusinessIncome.projected)}
               </div>
               <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
-                Prior-Yr Filed: {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
+                {pnlState.projection_year - 1} Filed:{' '}
+                {formatCurrencyExact(computed.ordinaryBusinessIncome.filed2025)}
               </div>
             </div>
             <div className="border border-slate-200 rounded p-3">
@@ -1524,6 +1825,53 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
               </div>
             )}
           </div>
+
+          {/* 2026 Working P&L <-> Horizon Reconciliation Banner */}
+          {pnlRecon && setup.has_scorp && (
+            <div
+              className={`rounded border px-3.5 py-2 text-[11px] leading-snug flex items-start gap-2 ${
+                pnlRecon.isReconciled
+                  ? 'bg-emerald-50/80 border-emerald-200 text-emerald-900'
+                  : 'bg-amber-50/80 border-amber-200 text-amber-950'
+              }`}
+            >
+              {pnlRecon.isReconciled ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+              ) : (
+                <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              )}
+              <div>
+                {pnlRecon.isReconciled ? (
+                  <>
+                    <strong className="font-semibold">
+                      {pnlRecon.projectionYear} Working P&amp;L ↔ {pnlRecon.projectionYear} Horizon
+                      Reconciled ($0 Variance):
+                    </strong>{' '}
+                    Gross Receipts, OpEx, Officer W-2, SEHI, Payroll Taxes, DBP, 401(k), K-1 OBI,
+                    Capital Contributions, Draws &amp; Ending Stock Basis tie identically ·
+                    Reasonable Comp {pnlRecon.rcHorizonPct.toFixed(1)}%.
+                  </>
+                ) : (
+                  <>
+                    <strong className="font-semibold">
+                      {pnlRecon.projectionYear} Working P&amp;L vs. {pnlRecon.projectionYear}{' '}
+                      Horizon Variance Notice:
+                    </strong>{' '}
+                    Working P&amp;L reflects live bookkeeping/cadence projections not yet pushed to
+                    the {pnlRecon.projectionYear} Horizon schedule (K-1 OBI delta{' '}
+                    {pnlRecon.obiVariance >= 0 ? '+' : ''}
+                    {formatCurrency(pnlRecon.obiVariance)}, Basis delta{' '}
+                    {pnlRecon.basisVariance >= 0 ? '+' : ''}
+                    {formatCurrency(pnlRecon.basisVariance)}, RC {pnlRecon.rcPnlPct.toFixed(1)}% vs.{' '}
+                    {pnlRecon.rcHorizonPct.toFixed(1)}%). Section {horizonSectionNum} below shows
+                    the authoritative {horizonSummary?.years[0] ?? 2025}–
+                    {horizonSummary?.years[horizonSummary.years.length - 1] ?? 2030} Horizon Tax
+                    Plan.
+                  </>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* 1. Profit & Loss Statement */}
           <section>
@@ -1579,7 +1927,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                               <>
                                 <tr className="text-[11px] text-slate-600 bg-slate-50/40">
                                   <td className="py-1 pr-3 pl-6">
-                                    ↳ 50% Deductible Meals (Included in 1120-S)
+                                    ↳ 50% Deductible Meals (Included in {labels.entityFormLabel})
                                   </td>
                                   <td className="py-1 px-2 text-[10px] font-mono text-slate-400">
                                     Line 19
@@ -1645,7 +1993,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                           <td className="py-1.5 pr-3 pl-2">
                             <div>Total Operating Expenses (Excl. W-2 &amp; Retirement · Tax Deductible)</div>
                             <div className="text-[10px] font-normal text-slate-500">
-                              Excl. Payroll Taxes (1120-S / Horizon OpEx):{' '}
+                              Excl. Payroll Taxes ({labels.entityFormLabel} / Horizon OpEx):{' '}
                               <span className="font-mono tabular-nums">
                                 {formatCurrencyExact(computed.totalOperatingExpensesExclPayroll.projected)}
                               </span>
@@ -1675,7 +2023,9 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                   <td className="py-2 pr-3 pl-2">
                     {labels.ordinaryIncomeRowLabel}
                   </td>
-                  <td className="py-2 px-2 text-[10px] font-mono text-slate-600">Line 22</td>
+                  <td className="py-2 px-2 text-[10px] font-mono text-slate-600">
+                    {labels.ordinaryIncomeRef}
+                  </td>
                   <td className="py-2 px-2 text-right font-mono tabular-nums">
                     {formatCurrencyExact(computed.ordinaryBusinessIncome.ytd)}
                   </td>
@@ -1691,7 +2041,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                 </tr>
                 <tr className="bg-slate-50/70 text-slate-800">
                   <td className="py-1.5 pr-3 pl-2 font-medium">
-                    {SCHEDULE_K_LINE_META.label} (Excl. from Line 22 · Adds to Basis)
+                    {SCHEDULE_K_LINE_META.label} (Excl. from {labels.ordinaryIncomeRef} · Adds to Basis)
                   </td>
                   <td className="py-1.5 px-2 text-[10px] font-mono text-slate-500">
                     {SCHEDULE_K_LINE_META.form1120sRef}
@@ -1798,16 +2148,21 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
             {setup.has_stock_basis !== false && (
             <section>
               <h2 className="text-xs font-bold tracking-wide text-slate-900 border-b border-slate-300 pb-1.5 mb-2">
-                3. Form 7203 Shareholder Stock Basis ({primaryName} {computed.billSharePct}% /{' '}
-                {spouseName} {computed.debraSharePct}%)
+                3. Form 7203 Shareholder Stock Basis ({labels.ownershipLabel})
               </h2>
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="border-b border-slate-200 text-[11px] font-semibold text-slate-600">
                     <th className="py-1.5 pr-2">Basis Component</th>
-                    <th className="py-1.5 px-2 text-right">Combined</th>
-                    <th className="py-1.5 px-2 text-right">{primaryName}</th>
-                    <th className="py-1.5 pl-2 text-right">{spouseName}</th>
+                    {isMfj ? (
+                      <>
+                        <th className="py-1.5 px-2 text-right">Combined</th>
+                        <th className="py-1.5 px-2 text-right">{primaryName}</th>
+                        <th className="py-1.5 pl-2 text-right">{spouseName}</th>
+                      </>
+                    ) : (
+                      <th className="py-1.5 pl-2 text-right">{primaryName} (100%)</th>
+                    )}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -1816,84 +2171,130 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(computed.beginningStockBasis)}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(billBeg)}
-                    </td>
-                    <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(debraBeg)}
-                    </td>
+                    {isMfj && (
+                      <>
+                        <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(billBeg)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(debraBeg)}
+                        </td>
+                      </>
+                    )}
                   </tr>
                   <tr>
                     <td className="py-1.5 pr-2">+ Projected K-1 Ordinary Income</td>
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(posInc)}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(billInc)}
-                    </td>
-                    <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(debraInc)}
-                    </td>
+                    {isMfj && (
+                      <>
+                        <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(billInc)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(debraInc)}
+                        </td>
+                      </>
+                    )}
                   </tr>
                   <tr>
                     <td className="py-1.5 pr-2">+ Schedule K Interest Income (Line 4)</td>
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(posInt)}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(billInt)}
-                    </td>
-                    <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(debraInt)}
-                    </td>
+                    {isMfj && (
+                      <>
+                        <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(billInt)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(debraInt)}
+                        </td>
+                      </>
+                    )}
                   </tr>
                   <tr>
                     <td className="py-1.5 pr-2">+ Capital Contributions</td>
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(computed.projectedCapitalContributionsTotal)}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(billCap)}
-                    </td>
-                    <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(debraCap)}
-                    </td>
+                    {isMfj && (
+                      <>
+                        <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(billCap)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(debraCap)}
+                        </td>
+                      </>
+                    )}
                   </tr>
                   <tr>
                     <td className="py-1.5 pr-2">− Member Draws / Distributions</td>
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(-computed.projectedDrawsTotal)}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(-billDraws)}
-                    </td>
-                    <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(-debraDraws)}
-                    </td>
+                    {isMfj && (
+                      <>
+                        <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(-billDraws)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(-debraDraws)}
+                        </td>
+                      </>
+                    )}
                   </tr>
                   <tr>
                     <td className="py-1.5 pr-2">− Nondeductible (50% Meals)</td>
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(-computed.mealsNondeductible50.projected)}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(-billNonded)}
-                    </td>
-                    <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(-debraNonded)}
-                    </td>
+                    {isMfj && (
+                      <>
+                        <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(-billNonded)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(-debraNonded)}
+                        </td>
+                      </>
+                    )}
                   </tr>
+                  {ordLoss > 0 && (
+                    <tr>
+                      <td className="py-1.5 pr-2">− Projected Ordinary Loss</td>
+                      <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                        {formatCurrencyExact(-ordLoss)}
+                      </td>
+                      {isMfj && (
+                        <>
+                          <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                            {formatCurrencyExact(-billLoss)}
+                          </td>
+                          <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                            {formatCurrencyExact(-debraLoss)}
+                          </td>
+                        </>
+                      )}
+                    </tr>
+                  )}
                   <tr className="font-semibold bg-slate-50 border-t border-slate-200">
                     <td className="py-1.5 pr-2">Projected Ending Stock Basis</td>
                     <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                       {formatCurrencyExact(computed.projectedEndingStockBasis)}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(computed.billProjectedBasisEnding)}
-                    </td>
-                    <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                      {formatCurrencyExact(computed.debraProjectedBasisEnding)}
-                    </td>
+                    {isMfj && (
+                      <>
+                        <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(computed.billProjectedBasisEnding)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                          {formatCurrencyExact(computed.debraProjectedBasisEnding)}
+                        </td>
+                      </>
+                    )}
                   </tr>
                   {computed.drawsExceedBasis && (
                     <tr className="font-semibold text-red-700 bg-red-50/60">
@@ -1901,12 +2302,16 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                       <td className="py-1.5 px-2 text-right font-mono tabular-nums">
                         {formatCurrencyExact(computed.projectedExcessDistributionGain)}
                       </td>
-                      <td className="py-1.5 px-2 text-right font-mono tabular-nums">
-                        {formatCurrencyExact(computed.billExcessGain)}
-                      </td>
-                      <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
-                        {formatCurrencyExact(computed.debraExcessGain)}
-                      </td>
+                      {isMfj && (
+                        <>
+                          <td className="py-1.5 px-2 text-right font-mono tabular-nums">
+                            {formatCurrencyExact(computed.billExcessGain)}
+                          </td>
+                          <td className="py-1.5 pl-2 text-right font-mono tabular-nums">
+                            {formatCurrencyExact(computed.debraExcessGain)}
+                          </td>
+                        </>
+                      )}
                     </tr>
                   )}
                 </tbody>
@@ -1915,11 +2320,127 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
             )}
           </div>
 
+          {/* Multi-Year Tax & Cash-Flow Horizon Summary (2025-2030) */}
+          {horizonSummary && (
+            <section>
+              <h2 className="text-xs font-bold tracking-wide text-slate-900 border-b border-slate-300 pb-1.5 mb-2">
+                {horizonSectionNum}. Multi-Year Tax &amp; Cash-Flow Horizon Summary (
+                {horizonSummary.years[0]}–{horizonSummary.years[horizonSummary.years.length - 1]})
+              </h2>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-[11px] min-w-[700px]">
+                  <thead>
+                    <tr className="border-b border-slate-300 text-[10px] font-semibold text-slate-600">
+                      <th className="py-1.5 pr-2 w-[28%]">Horizon Metric</th>
+                      {horizonSummary.years.map((y) => (
+                        <th key={y} className="py-1.5 px-1.5 text-right whitespace-nowrap">
+                          <div>{y}</div>
+                          {y === setup.anchor_actuals_year && (
+                            <div className="text-[9px] font-normal text-slate-400">Actuals</div>
+                          )}
+                        </th>
+                      ))}
+                      <th className="py-1.5 pl-2 text-right whitespace-nowrap">
+                        {horizonSummary.years.length}-Yr Total / End
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {horizonSummary.rows.map((row, idx) => {
+                      const prevSec = idx > 0 ? horizonSummary.rows[idx - 1].section : '';
+                      const secHeaders: Record<string, string> = {
+                        entity: `${labels.entityFormLabel} Entity Operations & Retirement`,
+                        personal: 'Form 1040 Taxable Income, Federal/State Taxes & IRMAA',
+                        basis: 'Shareholder Capital Contributions, Draws & Stock Basis',
+                      };
+                      const rowCls =
+                        row.highlight === 'primary'
+                          ? 'border-t-2 border-slate-900 font-bold bg-slate-100/70'
+                          : row.highlight === 'secondary'
+                          ? 'font-semibold bg-slate-50 border-t border-slate-200'
+                          : '';
+                      return (
+                        <React.Fragment key={row.id}>
+                          {row.section !== prevSec && (
+                            <tr className="bg-slate-50">
+                              <td
+                                colSpan={horizonSummary.years.length + 2}
+                                className="py-1 px-2 text-[10px] font-bold text-slate-700"
+                              >
+                                {secHeaders[row.section] || row.section}
+                              </td>
+                            </tr>
+                          )}
+                          <tr className={rowCls}>
+                            <td className="py-1 pr-2 pl-2 text-slate-800">
+                              <span className={row.bold ? 'font-semibold text-slate-900' : ''}>
+                                {row.label}
+                              </span>{' '}
+                              <span className="text-[9px] font-mono text-slate-400">
+                                {row.shortRef}
+                              </span>
+                            </td>
+                            {row.cells.map((cell) => {
+                              const badgeCls =
+                                cell.tone === 'danger'
+                                  ? 'bg-red-50 text-red-800 border-red-200'
+                                  : cell.tone === 'warning'
+                                  ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                  : cell.tone === 'positive'
+                                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                  : 'bg-slate-100 text-slate-700 border-slate-200';
+                              return (
+                                <td
+                                  key={cell.taxYear}
+                                  className="py-1 px-1.5 text-right font-mono tabular-nums align-top whitespace-nowrap"
+                                >
+                                  {cell.badgeText ? (
+                                    <span
+                                      className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-sans font-semibold border ${badgeCls}`}
+                                    >
+                                      {cell.badgeText}
+                                    </span>
+                                  ) : (
+                                    <span className={row.bold ? 'font-semibold text-slate-900' : ''}>
+                                      {cell.display}
+                                    </span>
+                                  )}
+                                  {cell.subLabel && (
+                                    <div className="text-[9px] font-sans text-slate-400 leading-tight mt-0.5">
+                                      {cell.subLabel}
+                                    </div>
+                                  )}
+                                </td>
+                              );
+                            })}
+                            <td className="py-1 pl-2 text-right font-mono tabular-nums font-semibold text-slate-900 align-top whitespace-nowrap">
+                              <div>{row.totalDisplay}</div>
+                              {row.totalSubLabel && (
+                                <div className="text-[9px] font-sans font-normal text-slate-500 leading-tight mt-0.5">
+                                  {row.totalSubLabel}
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-[10px] text-slate-500 mt-1.5">
+                All {horizonSummary.years[0]}–{horizonSummary.years[horizonSummary.years.length - 1]}{' '}
+                figures tie directly to the 6-Year Horizon Tax Engine ($0 variance). Medicare IRMAA
+                follows the statutory 2-year lookback (e.g., 2026 MAGI sets 2028 Medicare premiums).
+              </p>
+            </section>
+          )}
+
           {/* Planning Goals & Guardrails for CPA Review */}
           {meta.activeGoals.length > 0 && (
             <section>
               <h2 className="text-xs font-bold tracking-wide text-slate-900 border-b border-slate-300 pb-1.5 mb-2">
-                {setup.has_stock_basis !== false ? '4.' : '3.'} Planning Goals &amp; Guardrails for CPA Review ({meta.activeGoals.length} Active)
+                {goalsSectionNum}. Planning Goals &amp; Guardrails for CPA Review ({meta.activeGoals.length} Active)
               </h2>
               <table className="w-full text-left border-collapse text-xs">
                 <thead>

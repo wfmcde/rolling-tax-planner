@@ -85,6 +85,7 @@ interface TransactionCadenceViewProps {
   guardrailAcknowledgments?: Record<string, GuardrailAcknowledgment>;
   year2025Computed?: ComputedTaxYear;
   year2026Computed?: ComputedTaxYear;
+  computedYears?: ComputedTaxYear[];
   onUpdateCadenceState: (
     updater: (prev: CadenceForecasterState) => CadenceForecasterState
   ) => void;
@@ -204,6 +205,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   guardrailAcknowledgments,
   year2025Computed,
   year2026Computed,
+  computedYears,
   onUpdateCadenceState,
   onUpdatePlanningGoals,
   onPushTo2026Schedule,
@@ -861,7 +863,8 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       computed,
       entityName,
       entityEin,
-      cpaReportMeta
+      cpaReportMeta,
+      computedYears
     );
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -3456,6 +3459,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           setup={setup}
           pnlState={pnlState}
           computed={computed}
+          computedYears={computedYears}
           entityName={entityName}
           entityEin={entityEin}
           reportMeta={cpaReportMeta}

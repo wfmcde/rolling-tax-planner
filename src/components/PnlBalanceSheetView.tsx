@@ -48,6 +48,7 @@ interface PnlBalanceSheetViewProps {
   guardrailAcknowledgments?: Record<string, GuardrailAcknowledgment>;
   year2025Computed?: ComputedTaxYear;
   year2026Computed?: ComputedTaxYear;
+  computedYears?: ComputedTaxYear[];
   onUpdatePnlState: (updater: (prev: PnlBalanceSheetState) => PnlBalanceSheetState) => void;
   onUpdatePlanningGoals: (
     updater: (prev: PlanningGoalGuardrail[]) => PlanningGoalGuardrail[]
@@ -58,6 +59,8 @@ interface PnlBalanceSheetViewProps {
   ) => void;
   onResetFrom2026Schedule: () => void;
   onNavigate: (tab: WorkspaceTab) => void;
+  onExportShadowReturn?: () => void;
+  exportingShadowReturn?: boolean;
 }
 
 type PnlEditColumn = 'ytd' | 'remaining' | 'projected';
@@ -94,11 +97,14 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
   guardrailAcknowledgments,
   year2025Computed,
   year2026Computed,
+  computedYears,
   onUpdatePnlState,
   onUpdatePlanningGoals,
   onPushTo2026Schedule,
   onResetFrom2026Schedule,
   onNavigate,
+  onExportShadowReturn,
+  exportingShadowReturn,
 }) => {
   const [activeEdit, setActiveEdit] = useState<ActiveInlineEdit | null>(null);
   const [qboModalTab, setQboModalTab] = useState<'pnl' | 'balance_sheet' | null>(null);
@@ -255,7 +261,8 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
       computed,
       entityName,
       entityEin,
-      cpaReportMeta
+      cpaReportMeta,
+      computedYears
     );
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -414,6 +421,20 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
             <Download className="w-3.5 h-3.5 text-slate-500" />
             Export CPA CSV
           </button>
+
+          {onExportShadowReturn && (
+            <button
+              type="button"
+              onClick={onExportShadowReturn}
+              disabled={Boolean(exportingShadowReturn)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-emerald-900 bg-emerald-50 border border-emerald-300 rounded-md hover:bg-emerald-100 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700" />
+              {exportingShadowReturn
+                ? 'Generating Workbook…'
+                : 'Export Shadow Tax Return (.xlsx)'}
+            </button>
+          )}
 
           <button
             type="button"
@@ -1419,12 +1440,15 @@ export const PnlBalanceSheetView: React.FC<PnlBalanceSheetViewProps> = ({
           setup={setup}
           pnlState={pnlState}
           computed={computed}
+          computedYears={computedYears}
           entityName={entityName}
           entityEin={entityEin}
           reportMeta={cpaReportMeta}
           issues={issues}
           guardrailAcknowledgments={guardrailAcknowledgments}
           onDownloadCsv={handleDownloadCsv}
+          onExportShadowReturn={onExportShadowReturn}
+          exportingShadowReturn={exportingShadowReturn}
           onClose={() => setShowPrintModal(false)}
         />
       )}

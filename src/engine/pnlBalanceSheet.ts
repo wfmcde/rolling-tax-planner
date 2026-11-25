@@ -8,6 +8,7 @@ import type {
   TaxYearRecord,
 } from '../types/tax';
 import type { EvaluatedPlanningGoal } from './planningGoals';
+import { buildCpaHorizonSummary } from './cpaHorizonSummary';
 import { getPersonNames } from './scheduleCatalog';
 import { getSetupBusinessIdentity, getSetupStates, getStateFullName } from '../utils/setupHelpers';
 import {
@@ -664,26 +665,36 @@ export function calculatePnlBalanceSheet(
         }
         return round2(f1040Out.employer_401k_total ?? 0);
       case 'sehi_medicare':
-        // In Form 1120-S filed actuals, 2% shareholder health insurance is folded into
-        // W-2 officer/employee compensation (Lines 7-8) rather than a separate deduction line.
-        return 0;
+        // When detailed 1120-S lines are used (e.g., filed return where >2% SEHI is folded into
+        // W-2 officer/employee compensation Lines 7-8), do not double-deduct SEHI separately.
+        // Otherwise match taxEngine.ts scorpSehiDeduction identically.
+        return sc.use_detailed_1120s_deductions
+          ? 0
+          : round2(f1040Out.sehi_medicare_premiums_effective ?? 0);
       case 'rents':
         return round2(sc.rents ?? 0);
       case 'payroll_taxes':
         return round2(sc.payroll_taxes_input ?? year2025Computed.scorp_out.employer_payroll_taxes ?? 0);
       case 'ca_ftb_tax':
-        return round2(sc.ftb_state_taxes_input ?? 0);
+        return round2(
+          (sc.ftb_state_taxes_input ?? 0) +
+            (sc.use_detailed_1120s_deductions
+              ? 0
+              : (year2025Computed.scorp_out.pte_tax_paid_total ?? 0))
+        );
       case 'meals_gross':
         return round2(nondeductibleMeals * 2);
       case 'other_deductions': {
         if (sc.use_detailed_1120s_deductions) {
           return round2(Math.max(0, (sc.other_deductions ?? 0) - nondeductibleMeals));
         }
+        const effectiveOpEx =
+          year2025Computed.scorp_out.effective_operating_expenses ?? sc.operating_expenses ?? 0;
         const itemized =
           (sc.rents ?? 0) +
           (sc.ftb_state_taxes_input ?? 0) +
           nondeductibleMeals;
-        return round2(Math.max(0, (sc.operating_expenses ?? 0) - itemized));
+        return round2(Math.max(0, effectiveOpEx - itemized));
       }
       case 'schedule_k_interest':
         return round2(sc.schedule_k_interest_income ?? 0);
@@ -903,8 +914,13 @@ export function calculatePnlBalanceSheet(
   const drawsExceedBasis = projectedExcessDistributionGain > 0;
   const basisShortfall = projectedExcessDistributionGain;
 
-  const billSharePct = (year2025Computed?.scorp_in.bill_ownership_pct ?? 50) / 100;
-  const debraSharePct = (year2025Computed?.scorp_in.debra_ownership_pct ?? 50) / 100;
+  const isMfj = setup ? setup.filing_status === 'married_filing_jointly' : true;
+  const billSharePct = isMfj
+    ? (year2025Computed?.scorp_in.bill_ownership_pct ?? 50) / 100
+    : 1;
+  const debraSharePct = isMfj
+    ? (year2025Computed?.scorp_in.debra_ownership_pct ?? 50) / 100
+    : 0;
 
   const billBeg = round2(beginningStockBasis * billSharePct);
   const debraBeg = round2(beginningStockBasis - billBeg);
@@ -1782,9 +1798,11 @@ export function buildCpaPackageMetadata(
           : setupStates.hasPrimaryState
           ? `${state1Code} (Single-State) · `
           : ''
-      }Ownership ${primaryName} ${comp.billSharePct}% / ${spouseName} ${
-        comp.debraSharePct
-      }% · YE Cash ${
+      }Ownership ${
+        setup.filing_status === 'married_filing_jointly'
+          ? `${primaryName} ${comp.billSharePct}% / ${spouseName} ${comp.debraSharePct}%`
+          : `${primaryName} 100%`
+      } · YE Cash ${
         bs.operating_cash_ye_override !== null
           ? 'Manual Override'
           : comp.subsequentYearRetirementAddback > 0
@@ -1858,16 +1876,29 @@ export function buildCpaProjectionCsv(
   comp: ComputedPnlBalanceSheet,
   entityName: string,
   entityEin: string,
-  options?: CpaReportMetadata
+  options?: CpaReportMetadata,
+  computedYears?: ComputedTaxYear[]
 ): string {
   const { primaryName, spouseName } = getPersonNames(setup);
+  const setupStates = getSetupStates(setup);
+  const state1Code = setupStates.primaryStateCode || 'State 1';
+  const state2Code = setupStates.secondaryStateCode || 'State 2';
+  const isMfj = setup.filing_status === 'married_filing_jointly';
+  const entityFormLabel =
+    setup.entity_type === 'partnership'
+      ? 'FORM 1065'
+      : setup.entity_type === 'ccorp'
+      ? 'FORM 1120'
+      : setup.entity_type === 'sole_prop'
+      ? 'SCHEDULE C'
+      : 'FORM 1120-S';
   const meta = buildCpaPackageMetadata(setup, pnlState, comp, entityName, entityEin, options);
 
   const rows: (string | number)[][] = [
     ...meta.csvCommentLines.map((line) => [line]),
     [],
     ['CPA YEAR-END TAX PROJECTION PACKAGE'],
-    ['Prepared By', `${meta.preparedBy} (${meta.website})`],
+    ['Prepared By', meta.website ? `${meta.preparedBy} (${meta.website})` : meta.preparedBy],
     ['Module', meta.moduleName],
     ['Entity', entityName],
     ['EIN', entityEin],
@@ -1880,13 +1911,15 @@ export function buildCpaProjectionCsv(
     ['Accounting Records Source', meta.sourceMode],
     [
       'Ownership Split',
-      `${primaryName} ${comp.billSharePct}% / ${spouseName} ${comp.debraSharePct}%`,
+      isMfj
+        ? `${primaryName} ${comp.billSharePct}% / ${spouseName} ${comp.debraSharePct}%`
+        : `${primaryName} 100%`,
     ],
     ...(setup.multi_state_active
       ? [
           [
             'Projected State Apportionment',
-            `CA ${comp.caPct.projected}% / AZ ${comp.azPct.projected}%`,
+            `${state1Code} ${comp.caPct.projected}% / ${state2Code} ${comp.azPct.projected}%`,
           ],
         ]
       : []),
@@ -1894,12 +1927,12 @@ export function buildCpaProjectionCsv(
     ['CPA Review Disclaimer', `${meta.disclaimerHeadline} — ${meta.disclaimerBody}`],
     [],
     [
-      'PROFIT & LOSS PROJECTION (FORM 1120-S)',
-      '1120-S Ref',
+      `PROFIT & LOSS PROJECTION (${entityFormLabel})`,
+      'Form Ref',
       'YTD Actuals',
       'Remaining Forecast',
       'Projected Full Year',
-      'Prior-Year Filed Actuals',
+      `${pnlState.projection_year - 1} Filed Actuals`,
       'YoY Change ($)',
     ],
   ];
@@ -2020,61 +2053,129 @@ export function buildCpaProjectionCsv(
 
   if (setup.has_stock_basis !== false) {
     rows.push([]);
+    if (isMfj) {
+      rows.push([
+        'FORM 7203 SHAREHOLDER STOCK BASIS PROJECTION',
+        'Combined (100%)',
+        `${primaryName} (${comp.billSharePct}%)`,
+        `${spouseName} (${comp.debraSharePct}%)`,
+      ]);
+      rows.push([
+        `Beginning Stock Basis (1/1/${pnlState.projection_year})`,
+        comp.beginningStockBasis.toFixed(2),
+        billBeg.toFixed(2),
+        debraBeg.toFixed(2),
+      ]);
+      rows.push([
+        '+ Projected Ordinary Business Income (K-1 Box 1)',
+        posInc.toFixed(2),
+        billInc.toFixed(2),
+        debraInc.toFixed(2),
+      ]);
+      rows.push([
+        '+ Schedule K Interest Income (Line 4)',
+        posInt.toFixed(2),
+        billInt.toFixed(2),
+        debraInt.toFixed(2),
+      ]);
+      rows.push([
+        '+ Capital Contributions (YTD + Remaining)',
+        comp.projectedCapitalContributionsTotal.toFixed(2),
+        billCap.toFixed(2),
+        debraCap.toFixed(2),
+      ]);
+      rows.push(['= Basis Available Before Distributions', comp.basisAvailableBeforeDraws.toFixed(2), '', '']);
+      rows.push([
+        '- Member Draws / Distributions (YTD + Planned Remaining)',
+        (-comp.projectedDrawsTotal).toFixed(2),
+        (-billDraws).toFixed(2),
+        (-debraDraws).toFixed(2),
+      ]);
+      rows.push([
+        '- Nondeductible Expenses (50% Meals Sch M-1)',
+        (-comp.mealsNondeductible50.projected).toFixed(2),
+        (-billNonded).toFixed(2),
+        (-debraNonded).toFixed(2),
+      ]);
+      rows.push([
+        `= Projected Ending Stock Basis (12/31/${pnlState.projection_year})`,
+        comp.projectedEndingStockBasis.toFixed(2),
+        comp.billProjectedBasisEnding.toFixed(2),
+        comp.debraProjectedBasisEnding.toFixed(2),
+      ]);
+      rows.push([
+        'Form 8949 Excess Distribution Capital Gain',
+        comp.projectedExcessDistributionGain.toFixed(2),
+        comp.billExcessGain.toFixed(2),
+        comp.debraExcessGain.toFixed(2),
+      ]);
+    } else {
+      rows.push([
+        'FORM 7203 SHAREHOLDER STOCK BASIS PROJECTION',
+        `${primaryName} (100%)`,
+      ]);
+      rows.push([
+        `Beginning Stock Basis (1/1/${pnlState.projection_year})`,
+        comp.beginningStockBasis.toFixed(2),
+      ]);
+      rows.push([
+        '+ Projected Ordinary Business Income (K-1 Box 1)',
+        posInc.toFixed(2),
+      ]);
+      rows.push([
+        '+ Schedule K Interest Income (Line 4)',
+        posInt.toFixed(2),
+      ]);
+      rows.push([
+        '+ Capital Contributions (YTD + Remaining)',
+        comp.projectedCapitalContributionsTotal.toFixed(2),
+      ]);
+      rows.push([
+        '= Basis Available Before Distributions',
+        comp.basisAvailableBeforeDraws.toFixed(2),
+      ]);
+      rows.push([
+        '- Member Draws / Distributions (YTD + Planned Remaining)',
+        (-comp.projectedDrawsTotal).toFixed(2),
+      ]);
+      rows.push([
+        '- Nondeductible Expenses (50% Meals Sch M-1)',
+        (-comp.mealsNondeductible50.projected).toFixed(2),
+      ]);
+      rows.push([
+        `= Projected Ending Stock Basis (12/31/${pnlState.projection_year})`,
+        comp.projectedEndingStockBasis.toFixed(2),
+      ]);
+      rows.push([
+        'Form 8949 Excess Distribution Capital Gain',
+        comp.projectedExcessDistributionGain.toFixed(2),
+      ]);
+    }
+  }
+
+  if (computedYears && computedYears.length > 0) {
+    const horizonSummary = buildCpaHorizonSummary(setup, computedYears);
+    const firstYr = horizonSummary.years[0];
+    const lastYr = horizonSummary.years[horizonSummary.years.length - 1];
+    rows.push([]);
     rows.push([
-      'FORM 7203 SHAREHOLDER STOCK BASIS PROJECTION',
-      'Combined (100%)',
-      `${primaryName} (${comp.billSharePct}%)`,
-      `${spouseName} (${comp.debraSharePct}%)`,
+      `MULTI-YEAR TAX & CASH-FLOW HORIZON SUMMARY (${firstYr}-${lastYr})`,
+      'Ref',
+      ...horizonSummary.years.map((y) => String(y)),
+      `${horizonSummary.years.length}-Yr Total / End`,
     ]);
-    rows.push([
-      `Beginning Stock Basis (1/1/${pnlState.projection_year})`,
-      comp.beginningStockBasis.toFixed(2),
-      billBeg.toFixed(2),
-      debraBeg.toFixed(2),
-    ]);
-    rows.push([
-      '+ Projected Ordinary Business Income (K-1 Box 1)',
-      posInc.toFixed(2),
-      billInc.toFixed(2),
-      debraInc.toFixed(2),
-    ]);
-    rows.push([
-      '+ Schedule K Interest Income (Line 4)',
-      posInt.toFixed(2),
-      billInt.toFixed(2),
-      debraInt.toFixed(2),
-    ]);
-    rows.push([
-      '+ Capital Contributions (YTD + Remaining)',
-      comp.projectedCapitalContributionsTotal.toFixed(2),
-      billCap.toFixed(2),
-      debraCap.toFixed(2),
-    ]);
-    rows.push(['= Basis Available Before Distributions', comp.basisAvailableBeforeDraws.toFixed(2), '', '']);
-    rows.push([
-      '- Member Draws / Distributions (YTD + Planned Remaining)',
-      (-comp.projectedDrawsTotal).toFixed(2),
-      (-billDraws).toFixed(2),
-      (-debraDraws).toFixed(2),
-    ]);
-    rows.push([
-      '- Nondeductible Expenses (50% Meals Sch M-1)',
-      (-comp.mealsNondeductible50.projected).toFixed(2),
-      (-billNonded).toFixed(2),
-      (-debraNonded).toFixed(2),
-    ]);
-    rows.push([
-      `= Projected Ending Stock Basis (12/31/${pnlState.projection_year})`,
-      comp.projectedEndingStockBasis.toFixed(2),
-      comp.billProjectedBasisEnding.toFixed(2),
-      comp.debraProjectedBasisEnding.toFixed(2),
-    ]);
-    rows.push([
-      'Form 8949 Excess Distribution Capital Gain',
-      comp.projectedExcessDistributionGain.toFixed(2),
-      comp.billExcessGain.toFixed(2),
-      comp.debraExcessGain.toFixed(2),
-    ]);
+    for (const row of horizonSummary.rows) {
+      rows.push([
+        row.label,
+        row.shortRef,
+        ...row.cells.map((cell) =>
+          row.id === 'irmaa_lookback' && cell.badgeText
+            ? `${cell.display} (${cell.badgeText})`
+            : cell.display
+        ),
+        row.totalDisplay,
+      ]);
+    }
   }
 
   if (meta.activeGoals.length > 0) {

@@ -17,9 +17,11 @@ import {
   ChevronRight,
   Eye,
   FileCheck2,
+  FileSpreadsheet,
   Info,
   Lock,
   Pencil,
+  Printer,
   RotateCcw,
   ShieldAlert,
 } from 'lucide-react';
@@ -83,6 +85,9 @@ interface HorizonViewProps {
   onReopenGuardrailAck: (ackKey: string) => void;
   onSelectYear: (year: number, navigateTo?: WorkspaceTab) => void;
   onNavigate: (tab: WorkspaceTab) => void;
+  onOpenCpaPackage?: () => void;
+  onExportShadowReturn?: () => void;
+  exportingShadowReturn?: boolean;
 }
 
 const SUB_TONE_CLASS: Record<CellTone, string> = {
@@ -181,6 +186,9 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
   onReopenGuardrailAck,
   onSelectYear,
   onNavigate,
+  onOpenCpaPackage,
+  onExportShadowReturn,
+  exportingShadowReturn,
 }) => {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [editingCell, setEditingCell] = useState<{
@@ -1341,28 +1349,55 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
             </p>
           </div>
 
-          <div className="relative shrink-0 self-start sm:self-center">
-            <button
-              type="button"
-              onClick={() => setPickerOpen((o) => !o)}
-              aria-expanded={pickerOpen}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:border-teal-700 hover:text-teal-900 transition-colors whitespace-nowrap"
-            >
-              <Eye className="w-3.5 h-3.5 text-teal-700" />
-              <span>Show / Hide Rows</span>
-              <span className="font-mono text-[11px] text-slate-500">
-                ({visibleRowCount}/{ALL_SCHEDULE_ITEM_IDS.length})
-              </span>
-            </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0 self-start sm:self-center">
+            {onExportShadowReturn && (
+              <button
+                type="button"
+                onClick={onExportShadowReturn}
+                disabled={Boolean(exportingShadowReturn)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-900 bg-emerald-50 border border-emerald-300 rounded-md hover:bg-emerald-100 disabled:opacity-60 transition-colors whitespace-nowrap"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700" />
+                <span>
+                  {exportingShadowReturn
+                    ? 'Generating Workbook…'
+                    : 'Export Shadow Tax Return (.xlsx)'}
+                </span>
+              </button>
+            )}
+            {onOpenCpaPackage && (
+              <button
+                type="button"
+                onClick={onOpenCpaPackage}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900 transition-colors whitespace-nowrap"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>CPA Print Package</span>
+              </button>
+            )}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setPickerOpen((o) => !o)}
+                aria-expanded={pickerOpen}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:border-teal-700 hover:text-teal-900 transition-colors whitespace-nowrap"
+              >
+                <Eye className="w-3.5 h-3.5 text-teal-700" />
+                <span>Show / Hide Rows</span>
+                <span className="font-mono text-[11px] text-slate-500">
+                  ({visibleRowCount}/{ALL_SCHEDULE_ITEM_IDS.length})
+                </span>
+              </button>
 
-            <ScheduleRowPickerDrawer
-              open={pickerOpen}
-              setup={setup}
-              scheduleView={scheduleView}
-              hiddenRowIds={hiddenRowIds}
-              onChange={onUpdateScheduleView}
-              onClose={() => setPickerOpen(false)}
-            />
+              <ScheduleRowPickerDrawer
+                open={pickerOpen}
+                setup={setup}
+                scheduleView={scheduleView}
+                hiddenRowIds={hiddenRowIds}
+                onChange={onUpdateScheduleView}
+                onClose={() => setPickerOpen(false)}
+              />
+            </div>
           </div>
         </div>
 

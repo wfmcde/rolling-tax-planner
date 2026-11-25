@@ -282,6 +282,97 @@ export const DEFAULT_PROFILE_SEED = {
       member_draws: 121939.75,
     },
   },
+  /** Default-profile-only Shadow Tax Return (.xlsx) branding, 2025 filed baseline & 2026 overrides */
+  shadow_return_seed: {
+    branding: {
+      creator: 'Operating Support Services, LLC (OSS Advisory Group)',
+      title: 'OSS Shadow Tax Return & CPA Verification Suite',
+      filename_prefix: 'OSS',
+      eyebrow:
+        'OPERATING SUPPORT SERVICES, LLC  \u2022  OSS ADVISORY GROUP  |  EXECUTIVE TAX & FINANCIAL PLANNING  |  ossadvisorygroup.com',
+      header_left: 'Operating Support Services, LLC \u2014 OSS Advisory Group',
+      header_right: 'Executive Tax & Financial Planning | ossadvisorygroup.com',
+      disclaimer_entity: 'Operating Support Services, LLC',
+      disclaimer_taxpayers: 'William & Debra McDermott',
+    },
+    filed_2025: {
+      primary_ownership_pct: 0.51,
+      spouse_ownership_pct: 0.49,
+      ca_revenue: 136770,
+      az_revenue: 242815,
+      other_revenue: 0,
+      scorp_interest: 619,
+      officer_w2: 42000,
+      staff_w2: 33550,
+      rents: 35447,
+      payroll_taxes: 6130,
+      ca_entity_state_tax: 2891,
+      dbp_contribution: 140000,
+      er_401k_match: 4540,
+      sehi_medicare: 0,
+      advertising: 0,
+      other_opex: 23529,
+      nondeductible_meals: 1910,
+      ca_depr_adj: 0,
+      ca_conformity_adj: 969,
+      beg_cash: 48500,
+      end_cash: 48500,
+      other_assets_eoy: 0,
+      ap_cc_eoy: 4200,
+      pension_payable_eoy: 144540,
+      paid_in_capital: 1000,
+      beg_aaa: -39908,
+      capital_contributions: 0,
+      distributions: 135315,
+      primary_beg_stock_basis: 5615,
+      spouse_beg_stock_basis: 5401,
+      ca_beg_stock_basis: 11016,
+      ca_100s_est_paid: 800,
+      primary_ee_401k: 31000,
+      spouse_ee_401k: 30500,
+      other_w2_wages: 0,
+      personal_interest: 163,
+      tax_exempt_interest: 0,
+      ordinary_dividends: 505,
+      qualified_dividends: 67,
+      ira_taxable: 12935,
+      pensions_taxable: 250,
+      ss_gross: 0,
+      ss_taxable: 0,
+      brokerage_cap_gain: -60,
+      other_sch1_adj: 1631,
+      itemized_deductions: 0,
+      seniors_65_plus_count: 2,
+      fed_withholding: 0,
+      fed_estimates: 0,
+      ca_residency_factor: 1.0,
+      ca_withholding_est: 0,
+      az_withholding_est: 0,
+      cpa_filed_tieout: {
+        gross_receipts: 379585,
+        total_deductions: 288087,
+        obi_1120s: 91498,
+        ending_stock_basis: 0,
+        excess_dist_cap_gain: 32182,
+        w2_box1: 14050,
+        total_income_1040: 152142,
+        agi_1040: 150511,
+        std_or_itemized_ded: 34700,
+        senior_deduction: 11938,
+        qbi_deduction: 14337,
+        taxable_income_1040: 89536,
+        total_tax_1040: 6402,
+        ca_540_tax: 5362,
+        az_140nr_tax: 0,
+        ca_100s_franchise_tax: 800,
+      },
+    },
+    projected_2026_overrides: {
+      ca_depr_disposal_adj: -1278,
+      beg_aaa: -85016,
+      ca_100s_est_paid: 800,
+    },
+  },
 } as const;
 
 /**
@@ -506,13 +597,13 @@ export function buildTestPersonaPnl(projectionYear: number): PnlBalanceSheetStat
   pnl.bill_officer_w2 = { ytd: 94400, remaining: 18900 };
   pnl.debra_salaries_wages = { ytd: 72950, remaining: 14600 };
   pnl.dbp_contribution = { ytd: 0, remaining: 0 };
-  pnl.employer_401k = { ytd: 18500, remaining: 5500 };
+  pnl.employer_401k = { ytd: 18500, remaining: 5602 };
   pnl.sehi_medicare = { ytd: 12600, remaining: 2520 };
-  pnl.rents = { ytd: 24600, remaining: 4920 };
-  pnl.payroll_taxes = { ytd: 12480, remaining: 2496 };
+  pnl.rents = { ytd: 30000, remaining: 6000 };
+  pnl.payroll_taxes = { ytd: 13500, remaining: 2705 };
   pnl.ca_ftb_tax = { ytd: 0, remaining: 0 };
-  pnl.professional_fees = { ytd: 9450, remaining: 1890 };
-  pnl.subscriptions_software = { ytd: 7820, remaining: 1564 };
+  pnl.professional_fees = { ytd: 13500, remaining: 2700 };
+  pnl.subscriptions_software = { ytd: 10500, remaining: 2100 };
   pnl.telephone_internet = { ytd: 2640, remaining: 528 };
   pnl.travel = { ytd: 6340, remaining: 1268 };
   pnl.meals_gross = { ytd: 3600, remaining: 600 };
@@ -520,7 +611,7 @@ export function buildTestPersonaPnl(projectionYear: number): PnlBalanceSheetStat
   pnl.insurance = { ytd: 5100, remaining: 1020 };
   pnl.utilities = { ytd: 1800, remaining: 360 };
   pnl.bank_payroll_fees = { ytd: 1450, remaining: 290 };
-  pnl.other_deductions = { ytd: 4100, remaining: 820 };
+  pnl.other_deductions = { ytd: 6100, remaining: 1216 };
   pnl.schedule_k_interest = { ytd: 1820, remaining: 360 };
 
   return {
@@ -537,7 +628,7 @@ export function buildTestPersonaPnl(projectionYear: number): PnlBalanceSheetStat
       cc_ap_beg: 2800,
       cc_ap_ytd: 3420,
       cc_ap_ye: 3100,
-      member_draws_ytd: 95000,
+      member_draws_ytd: 95175,
       member_draws_remaining: 25000,
       capital_contributions_ytd: 0,
       capital_contributions_remaining: 0,

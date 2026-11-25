@@ -43,11 +43,13 @@ import { calculateSixYearPlan } from './engine/taxEngine';
 import { runGuardrailValidation } from './engine/validator';
 import { buildFilingFormsMap } from './engine/formsMap';
 import {
+  buildCpaProjectionCsv,
+  calculatePnlBalanceSheet,
   createInitialPnlBalanceSheetState,
   type ComputedPnlBalanceSheet,
 } from './engine/pnlBalanceSheet';
 import { createInitialCadenceForecasterState } from './engine/cadenceEngine';
-import { resolvePlanningGoals } from './engine/planningGoals';
+import { evaluateAllPlanningGoals, resolvePlanningGoals } from './engine/planningGoals';
 import {
   addProfileToStore,
   buildFreshBlankUserRecord,
@@ -91,8 +93,10 @@ import { MultiStateView } from './components/MultiStateView';
 import { FormsMapView } from './components/FormsMapView';
 import { ScenariosAiView } from './components/ScenariosAiView';
 import { RollForwardModal } from './components/RollForwardModal';
+import { CpaPrintPackageModal } from './components/CpaPrintPackageModal';
 import { ProfileSwitcher } from './components/ProfileSwitcher';
 import { ProfilesManagerModal } from './components/ProfilesManagerModal';
+import { exportShadowTaxReturnXlsx } from './utils/shadowReturnExport';
 
 const TAB_LABELS: Record<WorkspaceTab, string> = {
   horizon: 'Six-Year Horizon',
@@ -161,6 +165,7 @@ export function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('horizon');
   const [selectedYear, setSelectedYear] = useState<number>(state.setup.anchor_actuals_year);
   const [showRollModal, setShowRollModal] = useState(false);
+  const [showHorizonCpaModal, setShowHorizonCpaModal] = useState(false);
   const [profilesModalMode, setProfilesModalMode] = useState<'list' | 'create' | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [importNotice, setImportNotice] = useState<{ type: 'ok' | 'error'; text: string } | null>(
@@ -694,21 +699,6 @@ export function App() {
     pnlComp: ComputedPnlBalanceSheet
   ): TaxYearRecord[] => {
     const targetYear = pnlSnapshot.projection_year || 2026;
-    const caRev = Math.round(Math.max(0, pnlComp.lines.ca_revenue.projected));
-    const azRev = Math.round(Math.max(0, pnlComp.lines.az_revenue.projected));
-    const totalRev = caRev + azRev;
-    const caApp = totalRev > 0 ? caRev / totalRev : 0;
-    const azApp = totalRev > 0 ? azRev / totalRev : 0;
-    const billW2 = Math.round(Math.max(0, pnlComp.lines.bill_officer_w2.projected));
-    const debraW2 = Math.round(Math.max(0, pnlComp.lines.debra_salaries_wages.projected));
-    const totalW2 = billW2 + debraW2;
-    const dbpContrib = Math.round(Math.max(0, pnlComp.lines.dbp_contribution.projected));
-    const sehiProjected = Math.round(Math.max(0, pnlComp.lines.sehi_medicare.projected));
-    const drawsTotal = Math.round(Math.max(0, pnlComp.projectedDrawsTotal));
-    const capContrib = Math.round(Math.max(0, pnlComp.projectedCapitalContributionsTotal));
-    const nondedMeals = Math.round(Math.max(0, pnlComp.mealsNondeductible50.projected));
-    const schedKInterest = Math.round(Math.max(0, pnlComp.scheduleKInterest.projected));
-
     const { primaryStateCode, secondaryStateCode, hasSecondaryState } = getSetupStates(prev.setup);
     const resolvedTarget = resolveStateApportionmentForYear(prev.setup, targetYear);
     const activeCodes =
@@ -722,6 +712,31 @@ export function App() {
     const hasSecond = Boolean(
       prev.setup.multi_state_active || hasSecondaryState || activeCodes.length >= 2
     );
+
+    const targetTotalRev = Math.round(Math.max(0, pnlComp.totalRevenue.projected));
+    const caRev = hasSecond
+      ? Math.min(targetTotalRev, Math.round(Math.max(0, pnlComp.lines.ca_revenue.projected)))
+      : targetTotalRev;
+    const azRev = hasSecond ? Math.max(0, targetTotalRev - caRev) : 0;
+    const totalRev = caRev + azRev;
+    const caApp = totalRev > 0 ? caRev / totalRev : 0;
+    const azApp = totalRev > 0 ? azRev / totalRev : 0;
+
+    const targetTotalW2 = Math.round(Math.max(0, pnlComp.totalCompensation.projected));
+    const billW2 = Math.min(
+      targetTotalW2,
+      Math.round(Math.max(0, pnlComp.lines.bill_officer_w2.projected))
+    );
+    const debraW2 = Math.max(0, targetTotalW2 - billW2);
+    const totalW2 = billW2 + debraW2;
+    const dbpContrib = Math.round(Math.max(0, pnlComp.lines.dbp_contribution.projected));
+    const emp401kProjected = Math.round(Math.max(0, pnlComp.lines.employer_401k.projected));
+    const sehiProjected = Math.round(Math.max(0, pnlComp.lines.sehi_medicare.projected));
+    const drawsTotal = Math.round(Math.max(0, pnlComp.projectedDrawsTotal));
+    const capContrib = Math.round(Math.max(0, pnlComp.projectedCapitalContributionsTotal));
+    const nondedMeals = Math.round(Math.max(0, pnlComp.mealsNondeductible50.projected));
+    const schedKInterest = Math.round(Math.max(0, pnlComp.scheduleKInterest.projected));
+
     const pCode = activeCodes[0] || primaryStateCode || prev.years[0]?.state_filings[0]?.state_code || 'HOME';
     const sCode = activeCodes[1] || secondaryStateCode || prev.years[0]?.state_filings[1]?.state_code || 'OTHER';
     const nextBreakdown = hasSecond
@@ -738,12 +753,27 @@ export function App() {
       ? [{ state_code: primaryStateCode, apportionment_percent: 100 }]
       : [];
 
-    const opExExclPayroll = Math.round(
+    const rawOpExExclPayroll = Math.round(
       Math.max(0, pnlComp.totalOperatingExpensesExclPayroll.projected)
     );
     const payrollTaxesProjected = Math.round(
       Math.max(0, pnlComp.lines.payroll_taxes.projected)
     );
+    // Absorb at most +/-$1 of cent-rounding sum drift into OpEx so rounded K-1 OBI ties to $0
+    const targetObi = Math.round(pnlComp.ordinaryBusinessIncome.projected);
+    const impliedObi =
+      totalRev -
+      totalW2 -
+      sehiProjected -
+      payrollTaxesProjected -
+      dbpContrib -
+      emp401kProjected -
+      rawOpExExclPayroll;
+    const obiCentDrift = impliedObi - targetObi;
+    const opExExclPayroll =
+      Math.abs(obiCentDrift) <= 2 && rawOpExExclPayroll + obiCentDrift >= 0
+        ? rawOpExExclPayroll + obiCentDrift
+        : rawOpExExclPayroll;
 
     return prev.years.map((yr) => {
       if (yr.tax_year !== targetYear) return yr;
@@ -753,7 +783,7 @@ export function App() {
           ...yr.form_1040,
           w2_wages_total: totalW2,
           health_insurance_premiums: sehiProjected,
-          sehi_medicare_override: sehiProjected > 0 ? sehiProjected : null,
+          sehi_medicare_override: sehiProjected,
         },
         scorp_1120s: {
           ...yr.scorp_1120s,
@@ -761,7 +791,10 @@ export function App() {
           az_revenue: azRev,
           gross_receipts_revenue: totalRev,
           operating_expenses: opExExclPayroll,
-          operating_expenses_override: null,
+          operating_expenses_override:
+            prev.setup.assumptions.opex_scaling_mode === 'revenue_proportional'
+              ? opExExclPayroll
+              : null,
           payroll_taxes_input: payrollTaxesProjected,
           use_detailed_1120s_deductions: false,
           bill_w2_wages: billW2,
@@ -979,8 +1012,40 @@ export function App() {
     );
   };
 
+  const [exportingShadowReturn, setExportingShadowReturn] = useState(false);
+
   const handleExportJson = () => {
     handleExportSingleProfile(activeProfile);
+  };
+
+  const handleExportShadowReturn = async () => {
+    if (exportingShadowReturn) return;
+    setExportingShadowReturn(true);
+    try {
+      const targetYear =
+        selectedYear === 2025 ? state.setup.current_tax_year : selectedYear;
+      const filename = await exportShadowTaxReturnXlsx({
+        setup: state.setup,
+        years: state.years,
+        computed,
+        selectedYear: targetYear,
+        pnlState: activePnlState,
+      });
+      setImportNotice({
+        type: 'ok',
+        text: `Downloaded ${filename} (8 formula-driven tabs).`,
+      });
+    } catch (err) {
+      setImportNotice({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? `Excel export failed: ${err.message}`
+            : 'Excel export failed.',
+      });
+    } finally {
+      setExportingShadowReturn(false);
+    }
   };
 
   const handleSwitchWorkspaceMode = (mode: WorkspaceProfileMode) => {
@@ -1153,6 +1218,17 @@ export function App() {
           </span>
           <span className="font-mono text-[11px] text-teal-800">
             {profileStore.profiles.length}
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={handleExportShadowReturn}
+          disabled={exportingShadowReturn}
+          className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-emerald-900 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-md transition-colors whitespace-nowrap disabled:opacity-60"
+        >
+          <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+          <span className="truncate">
+            {exportingShadowReturn ? 'Generating Excel…' : 'Shadow Tax Return (.xlsx)'}
           </span>
         </button>
         <button
@@ -1338,6 +1414,9 @@ export function App() {
                 if (nav) setActiveTab(nav);
               }}
               onNavigate={setActiveTab}
+              onOpenCpaPackage={() => setShowHorizonCpaModal(true)}
+              onExportShadowReturn={handleExportShadowReturn}
+              exportingShadowReturn={exportingShadowReturn}
             />
           )}
 
@@ -1363,11 +1442,14 @@ export function App() {
               year2026Computed={
                 computed.find((c) => c.tax_year === state.setup.current_tax_year) ?? computed[1]
               }
+              computedYears={computed}
               onUpdatePnlState={handleUpdatePnlState}
               onUpdatePlanningGoals={handleUpdatePlanningGoals}
               onPushTo2026Schedule={handlePushPnlTo2026Schedule}
               onResetFrom2026Schedule={handleResetPnlFrom2026Schedule}
               onNavigate={setActiveTab}
+              onExportShadowReturn={handleExportShadowReturn}
+              exportingShadowReturn={exportingShadowReturn}
             />
           )}
 
@@ -1382,6 +1464,7 @@ export function App() {
               year2026Computed={
                 computed.find((c) => c.tax_year === state.setup.current_tax_year) ?? computed[1]
               }
+              computedYears={computed}
               onUpdateCadenceState={handleUpdateCadenceState}
               onUpdatePlanningGoals={handleUpdatePlanningGoals}
               onPushTo2026Schedule={handlePushCadenceTo2026Schedule}
@@ -1467,6 +1550,71 @@ export function App() {
           onConfirmRoll={handleConfirmRoll}
         />
       )}
+
+      {/* Horizon Direct CPA Print Package Modal */}
+      {showHorizonCpaModal && (() => {
+        const y25 = computed.find((c) => c.tax_year === 2025) ?? computed[0];
+        const y26 = computed.find((c) => c.tax_year === state.setup.current_tax_year) ?? computed[1];
+        const horizonPnlComp = calculatePnlBalanceSheet(activePnlState, y25, y26, state.setup);
+        const entityName =
+          state.setup.business_name?.trim() ||
+          y26?.scorp_in.entity_name ||
+          y25?.scorp_in.entity_name ||
+          'Business Entity';
+        const entityEin =
+          state.setup.business_ein?.trim() ||
+          y26?.scorp_in.entity_ein ||
+          y25?.scorp_in.entity_ein ||
+          '';
+        const evaluatedGoals = evaluateAllPlanningGoals(
+          activePlanningGoals,
+          horizonPnlComp,
+          activePnlState,
+          state.setup
+        );
+        const horizonReportMeta = {
+          moduleName: 'Six-Year Tax Horizon & CPA Package',
+          sourceMode: 'Working P&L Projection + Six-Year Tax Engine',
+          activeGoals: evaluatedGoals,
+        };
+        const handleDownloadHorizonCsv = () => {
+          const csv = buildCpaProjectionCsv(
+            state.setup,
+            activePnlState,
+            horizonPnlComp,
+            entityName,
+            entityEin,
+            horizonReportMeta,
+            computed
+          );
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          const safeEntity =
+            entityName.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '') || 'CPA_Report';
+          a.download = `${safeEntity}_${activePnlState.projection_year}_CPA_Horizon_Package.csv`;
+          a.click();
+          URL.revokeObjectURL(url);
+        };
+        return (
+          <CpaPrintPackageModal
+            setup={state.setup}
+            pnlState={activePnlState}
+            computed={horizonPnlComp}
+            computedYears={computed}
+            entityName={entityName}
+            entityEin={entityEin}
+            reportMeta={horizonReportMeta}
+            issues={issues}
+            guardrailAcknowledgments={state.guardrail_acknowledgments ?? {}}
+            onDownloadCsv={handleDownloadHorizonCsv}
+            onExportShadowReturn={handleExportShadowReturn}
+            exportingShadowReturn={exportingShadowReturn}
+            onClose={() => setShowHorizonCpaModal(false)}
+          />
+        );
+      })()}
 
       {/* Multi-Profile Manager & New Profile Modal */}
       {profilesModalMode !== null && (
