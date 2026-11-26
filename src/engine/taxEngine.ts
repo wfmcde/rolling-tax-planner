@@ -798,6 +798,7 @@ export function calculateSixYearPlan(
 ): ComputedTaxYear[] {
   const results: ComputedTaxYear[] = [];
   let runningStockBasis: number | null = null;
+  let runningStateStockBasis: number | null = null;
   let runningAaa: number | null = null;
   const billSsTrack: SsTrackState = { suspendedMonths: 0, wasSuspendedPriorYear: false };
   const debraSsTrack: SsTrackState = { suspendedMonths: 0, wasSuspendedPriorYear: false };
@@ -988,6 +989,10 @@ export function calculateSixYearPlan(
       i === 0 || runningStockBasis === null
         ? scorpIn.stock_basis_beginning
         : runningStockBasis;
+    const stateStockBasisBeginning: number =
+      i === 0 || runningStateStockBasis === null
+        ? scorpIn.stock_basis_beginning
+        : runningStateStockBasis;
     const aaaBeginning: number =
       i === 0 || runningAaa === null ? scorpIn.aaa_balance_beginning : runningAaa;
     let stockBasisAdditions = 0;
@@ -995,6 +1000,7 @@ export function calculateSixYearPlan(
     let stockBasisEnding: number = stockBasisBeginning;
     let aaaEnding: number = aaaBeginning;
     let excessDistributionCapGain = 0;
+    let stateExcessDistributionCapGain = 0;
     let reasonableCompRatio = 0;
 
     const hasSplitRev =
@@ -1204,6 +1210,27 @@ export function calculateSixYearPlan(
         Math.max(0, basisAfterDist - nondeductibleExp - lossReduction)
       );
 
+      // State-conformity Form 7203 basis ordering (Treas. Reg. §1.1367-1(f)):
+      // Because state entity PTE tax is nondeductible for state income tax purposes, state K-1 income
+      // adds back PTE in Step 1 (before distributions in Step 2), while the nondeductible PTE expense
+      // reduces basis in Step 3 (after distributions, floored at $0). This prevents double-counting
+      // PTE in both excess distribution capital gain and the state AGI PTE add-back.
+      const stateBasisAdditions = Math.max(0, prePteOrdinaryIncome) + schedKInterest + capContrib;
+      const stateBasisBeforeDist = stateStockBasisBeginning + stateBasisAdditions;
+      if (scorpIn.scorp_distributions_total > Math.max(0, stateBasisBeforeDist)) {
+        stateExcessDistributionCapGain = round0(
+          scorpIn.scorp_distributions_total - Math.max(0, stateBasisBeforeDist)
+        );
+      }
+      const stateBasisAfterDist = Math.max(
+        0,
+        stateBasisBeforeDist - scorpIn.scorp_distributions_total
+      );
+      const stateLossReduction = prePteOrdinaryIncome < 0 ? Math.abs(prePteOrdinaryIncome) : 0;
+      const stateStockBasisEnding = round0(
+        Math.max(0, stateBasisAfterDist - nondeductibleExp - pteTaxPaidTotal - stateLossReduction)
+      );
+
       // IRS Form 1120-S Schedule M-2 (Accumulated Adjustments Account):
       // Ending AAA = Beginning AAA + Ordinary Business Income (Line 22)
       //   + Schedule K Interest Income (Box 4) - 50% Nondeductible Meals (Sch M-1 / Box 16c)
@@ -1219,6 +1246,7 @@ export function calculateSixYearPlan(
       reasonableCompRatio = computeReasonableCompRatio(combinedOfficerW2, ordinaryIncome1120s);
 
       runningStockBasis = stockBasisEnding;
+      runningStateStockBasis = stateStockBasisEnding;
       runningAaa = aaaEnding;
     }
 
@@ -1373,8 +1401,32 @@ export function calculateSixYearPlan(
       );
     }
 
+    // Schedule SE Self-Employment Tax & 1/2 SE Tax Deduction (Sole Prop / Single-Member LLC only):
+    // Applies statutory 92.35% net earnings factor, 12.4% Social Security up to remaining wage base,
+    // 2.9% Medicare, and 0.9% Additional Medicare above threshold, with 50% of base SE tax deductible on Sch 1.
+    const solePropNetProfit =
+      setup.entity_type === 'sole_prop' && !setup.has_scorp
+        ? Math.max(0, f1040In.schedule_1_other_income)
+        : 0;
+    const seEarnings = round0(solePropNetProfit * 0.9235);
+    const remSsBaseForSe = Math.max(0, ssWageBase - billW2);
+    const seTaxBase =
+      seEarnings >= 400
+        ? round0(Math.min(seEarnings, remSsBaseForSe) * 0.124 + seEarnings * 0.029)
+        : 0;
+    const seAddlMedicare =
+      seEarnings >= 400 && combinedW2ForFica + seEarnings > addlMedThreshold
+        ? round0(
+            (Math.max(0, combinedW2ForFica + seEarnings - addlMedThreshold) -
+              Math.max(0, combinedW2ForFica - addlMedThreshold)) *
+              0.009
+          )
+        : 0;
+    const selfEmploymentTax = round0(seTaxBase + seAddlMedicare);
+    const halfSeTaxDeduction = round0(seTaxBase * 0.5);
+
     const adjustmentsToIncome = round0(
-      sehiMedicareDeduction + (f1040In.schedule_1_adjustments_input ?? 0)
+      sehiMedicareDeduction + halfSeTaxDeduction + (f1040In.schedule_1_adjustments_input ?? 0)
     );
 
     // IRS Social Security Benefits Worksheet:
@@ -1434,15 +1486,22 @@ export function calculateSixYearPlan(
     // Section 199A W-2 wage limit uses W-2 Box 1 + elective deferrals (Cash W-2 + SEHI add-back per Rev. Proc. 2019-11).
     const taxableBeforeQbi = Math.max(0, agi - deductionAmount - enhancedSeniorAllowed);
     let qbiDeduction = 0;
-    if (setup.has_scorp && effectiveK1Ordinary > 0) {
-      const qbiBase = round0(effectiveK1Ordinary * 0.2);
+    const qualifiedBusinessProfit = setup.has_scorp
+      ? effectiveK1Ordinary
+      : setup.entity_type === 'sole_prop'
+      ? Math.max(0, solePropNetProfit - halfSeTaxDeduction)
+      : 0;
+    if (qualifiedBusinessProfit > 0) {
+      const qbiBase = round0(qualifiedBusinessProfit * 0.2);
       const netCapGainForQbi = Math.max(0, netCapitalGainLoss);
       const qbiCapTaxable = round0(
         Math.max(0, taxableBeforeQbi - netCapGainForQbi - f1040In.qualified_dividends) * 0.2
       );
       const qbiThreshold = BASE_QBI_THRESHOLD_2025[setup.filing_status];
       const scaledStart = qbiThreshold.start * scale;
-      const w2Limit = round0((combinedOfficerW2 + scorpSehiDeduction) * 0.5);
+      const w2Limit = setup.has_scorp
+        ? round0((combinedOfficerW2 + scorpSehiDeduction) * 0.5)
+        : 0;
 
       if (taxableBeforeQbi <= scaledStart) {
         qbiDeduction = Math.min(qbiBase, qbiCapTaxable);
@@ -1508,7 +1567,7 @@ export function calculateSixYearPlan(
         ? round0(Math.min(netInvIncome, agi - niitThreshold) * 0.038)
         : 0;
 
-    const federalIncomeTax = round0(ordinaryResult.tax + prefTax + niitTax);
+    const federalIncomeTax = round0(ordinaryResult.tax + prefTax + niitTax + selfEmploymentTax);
 
     const isZeroFederalTax = taxableIncome <= 0 && federalIncomeTax <= 0;
     const effectiveTaxRate = agi > 0 ? round2((federalIncomeTax / agi) * 100) : 0;
@@ -1623,8 +1682,21 @@ export function calculateSixYearPlan(
 
       const conformityAdj = sf.state_conformity_adjustment ?? 0;
       // Add back entity-level state PTE taxes deducted on federal Form 1120-S when computing
-      // state taxable income (state income taxes are not deductible against state tax).
-      const stateAgiBaseForTax = agi + pteTaxPaidTotal;
+      // state taxable income (state income taxes are not deductible against state tax),
+      // adjusted for any Treas. Reg. §1.1367-1(f) difference between federal and state excess
+      // distribution capital gain so PTE is never double-counted when stock basis is exhausted.
+      const stateEffectiveLtcg = f1040In.schedule_d_includes_excess_gain
+        ? f1040In.long_term_capital_gain_loss
+        : f1040In.long_term_capital_gain_loss + stateExcessDistributionCapGain;
+      const stateNetCapitalGainLoss = Math.max(
+        -3000,
+        f1040In.short_term_capital_gain_loss + stateEffectiveLtcg
+      );
+      const pteStateAgiAddBack =
+        pteTaxPaidTotal > 0
+          ? Math.max(0, pteTaxPaidTotal + (stateNetCapitalGainLoss - netCapitalGainLoss))
+          : 0;
+      const stateAgiBaseForTax = agi + pteStateAgiAddBack;
       const stateK1ForTax = effectiveK1Ordinary + pteTaxPaidTotal;
       const stateBaseAgi = Math.max(
         0,
