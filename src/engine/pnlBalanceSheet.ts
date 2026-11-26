@@ -8,7 +8,7 @@ import type {
   TaxYearRecord,
 } from '../types/tax';
 import type { EvaluatedPlanningGoal } from './planningGoals';
-import { buildCpaHorizonSummary } from './cpaHorizonSummary';
+import { buildCpaHorizonSummary, reconcileCpaGoalsWithHorizon } from './cpaHorizonSummary';
 import { getPersonNames } from './scheduleCatalog';
 import { getSetupBusinessIdentity, getSetupStates, getStateFullName } from '../utils/setupHelpers';
 import {
@@ -1919,7 +1919,26 @@ export function buildCpaProjectionCsv(
       : setup.entity_type === 'sole_prop'
       ? 'SCHEDULE C'
       : 'FORM 1120-S';
-  const meta = buildCpaPackageMetadata(setup, pnlState, comp, entityName, entityEin, options);
+  const reconciledCsvOptions: CpaReportMetadata | undefined =
+    options && options.activeGoals && computedYears && computedYears.length > 0
+      ? {
+          ...options,
+          activeGoals: reconcileCpaGoalsWithHorizon(
+            options.activeGoals,
+            computedYears,
+            pnlState.projection_year,
+            setup
+          ),
+        }
+      : options;
+  const meta = buildCpaPackageMetadata(
+    setup,
+    pnlState,
+    comp,
+    entityName,
+    entityEin,
+    reconciledCsvOptions
+  );
 
   const rows: (string | number)[][] = [
     ...meta.csvCommentLines.map((line) => [line]),

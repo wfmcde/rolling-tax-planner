@@ -20,6 +20,7 @@ import {
 import {
   buildCpaHorizonSummary,
   computePnlVsHorizonReconciliation,
+  reconcileCpaGoalsWithHorizon,
   type CpaHorizonSummaryTable,
   type PnlHorizonReconciliation,
 } from '../engine/cpaHorizonSummary';
@@ -346,9 +347,15 @@ export function buildStandalonePrintHtml({
     `
       : '';
 
+  const reconciledActiveGoals = reconcileCpaGoalsWithHorizon(
+    meta.activeGoals,
+    computedYears,
+    pnlState.projection_year,
+    setup
+  );
   let nextSectionNum = setup.has_stock_basis !== false ? 4 : 3;
   const horizonSectionNum = horizonSummary ? nextSectionNum++ : 0;
-  const goalsSectionNum = meta.activeGoals.length > 0 ? nextSectionNum++ : 0;
+  const goalsSectionNum = reconciledActiveGoals.length > 0 ? nextSectionNum++ : 0;
   const ackSectionNum = acknowledgedGuardrails.length > 0 ? nextSectionNum++ : 0;
 
   const horizonSectionHtml = horizonSummary
@@ -483,10 +490,10 @@ export function buildStandalonePrintHtml({
       : '';
 
   const goalsSectionHtml =
-    meta.activeGoals.length > 0
+    reconciledActiveGoals.length > 0
       ? `
     <section class="goals-section">
-      <h2>${goalsSectionNum}. Planning Goals &amp; Guardrails for CPA Review (${meta.activeGoals.length} Active)</h2>
+      <h2>${goalsSectionNum}. Planning Goals &amp; Guardrails for CPA Review (${reconciledActiveGoals.length} Active)</h2>
       <table>
         <thead>
           <tr>
@@ -498,7 +505,7 @@ export function buildStandalonePrintHtml({
           </tr>
         </thead>
         <tbody>
-          ${meta.activeGoals
+          ${reconciledActiveGoals
             .map((item) => {
               const badgeCls =
                 item.status === 'over'
@@ -1397,8 +1404,17 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
     month: 'short',
     day: 'numeric',
   });
+  const reconciledReportGoals = reportMeta?.activeGoals
+    ? reconcileCpaGoalsWithHorizon(
+        reportMeta.activeGoals,
+        computedYears,
+        pnlState.projection_year,
+        setup
+      )
+    : undefined;
   const meta = buildCpaPackageMetadata(setup, pnlState, computed, entityName, entityEin, {
     ...reportMeta,
+    activeGoals: reconciledReportGoals,
     moduleName: reportMeta?.moduleName ?? moduleName,
     forecastAssumptions: reportMeta?.forecastAssumptions ?? forecastAssumptions,
   });

@@ -136,6 +136,7 @@ export interface ProjectedJointMagiBreakdown {
   projectedMagi: number;
   projectedAgi: number;
   k1OrdinaryIncome: number;
+  pteEntityTaxDeduction: number;
   w2Box1Taxable: number;
   grossW2: number;
   employee401kTotal: number;
@@ -265,16 +266,47 @@ export function computeProjectedJointMagi(
   const sehiDeduction =
     hasScorp && sehiAddback > 0 ? round2(Math.min(sehiAddback, grossW2)) : 0;
 
-  const k1OrdinaryIncome = hasScorp
+  const prePtePnlObi = hasScorp
     ? round2(computed.ordinaryBusinessIncome.projected)
     : round2(f1040In?.schedule_k1_ordinary_income ?? 0);
+
+  // Entity-level state PTE tax is deductible on Form 1120-S (reducing K-1 Box 1 ordinary income
+  // and Form 1040 AGI/MAGI). Mirror taxEngine.ts so Working P&L MAGI does not overstate MAGI
+  // by the excluded PTE tax deduction.
+  const horizonPteTotal =
+    hasScorp && yearProjectedComputed
+      ? Math.max(0, yearProjectedComputed.scorp_out.pte_tax_paid_total ?? 0)
+      : 0;
+  const horizonK1Obi =
+    hasScorp && yearProjectedComputed
+      ? yearProjectedComputed.scorp_out.ordinary_business_income_1120s
+      : 0;
+  const horizonPrePteObi = horizonK1Obi + horizonPteTotal;
+  const pteEntityTaxDeduction =
+    hasScorp && horizonPteTotal > 0 && prePtePnlObi > 0
+      ? Math.abs(prePtePnlObi - horizonPrePteObi) <= 2
+        ? horizonPteTotal
+        : horizonPrePteObi > 0
+        ? Math.round(prePtePnlObi * (horizonPteTotal / horizonPrePteObi))
+        : horizonPteTotal
+      : 0;
+
+  const k1OrdinaryIncome = hasScorp
+    ? round2(prePtePnlObi - pteEntityTaxDeduction)
+    : prePtePnlObi;
 
   const taxableInterest = f1040In?.taxable_interest ?? 0;
   const ordinaryDividends = f1040In?.ordinary_dividends ?? 0;
   const taxExemptInterest = round2(f1040In?.tax_exempt_interest ?? 0);
   const personalInterestAndDividends = round2(taxableInterest + ordinaryDividends);
 
-  const excessDistGain = hasScorp ? Math.max(0, computed.projectedExcessDistributionGain) : 0;
+  const postPteBasisBeforeDraws = Math.max(
+    0,
+    round2(computed.basisAvailableBeforeDraws - pteEntityTaxDeduction)
+  );
+  const excessDistGain = hasScorp
+    ? round2(Math.max(0, computed.projectedDrawsTotal - postPteBasisBeforeDraws))
+    : 0;
   const effectiveLtcg = f1040In
     ? f1040In.schedule_d_includes_excess_gain
       ? f1040In.long_term_capital_gain_loss
@@ -317,19 +349,49 @@ export function computeProjectedJointMagi(
     )
   );
 
-  const projectedAgi = round2(Math.max(0, incomeBeforeSS + taxableSocialSecurity - adjustmentsToIncome));
-  const projectedMagi = round2(projectedAgi + taxExemptInterest);
+  // When the Working P&L has been pushed/reconciled with the active Horizon year (K-1 OBI after
+  // PTE, W-2 wages, and SEHI all match to whole dollars), anchor directly to the Horizon tax
+  // engine's authoritative Form 1040 AGI/MAGI so live guardrails and Section 4 match with $0 drift.
+  const horizonGrossW2 = yearProjectedComputed
+    ? hasScorp
+      ? yearProjectedComputed.scorp_in.bill_w2_wages +
+        (isMfj ? yearProjectedComputed.scorp_in.debra_w2_wages : 0)
+      : yearProjectedComputed.form_1040_in.w2_wages_total
+    : 0;
+  const horizonSynced =
+    Boolean(yearProjectedComputed) &&
+    (!hasScorp || Math.abs(Math.round(k1OrdinaryIncome) - horizonK1Obi) <= 1) &&
+    Math.abs(Math.round(grossW2) - Math.round(horizonGrossW2)) <= 1 &&
+    (!hasScorp ||
+      Math.abs(
+        Math.round(sehiAddback) -
+          Math.round(yearProjectedComputed!.form_1040_out.sehi_medicare_premiums_effective)
+      ) <= 1);
+
+  const projectedAgi = horizonSynced
+    ? yearProjectedComputed!.form_1040_out.adjusted_gross_income
+    : round2(Math.max(0, incomeBeforeSS + taxableSocialSecurity - adjustmentsToIncome));
+  const projectedMagi = horizonSynced
+    ? Math.round(projectedAgi + taxExemptInterest)
+    : round2(projectedAgi + taxExemptInterest);
 
   return {
     projectedMagi,
     projectedAgi,
-    k1OrdinaryIncome,
+    k1OrdinaryIncome: horizonSynced && hasScorp ? horizonK1Obi : k1OrdinaryIncome,
+    pteEntityTaxDeduction,
     w2Box1Taxable,
     grossW2,
-    employee401kTotal,
+    employee401kTotal: horizonSynced
+      ? yearProjectedComputed!.form_1040_out.employee_401k_total
+      : employee401kTotal,
     sehiAddback,
-    sehiDeduction,
-    taxableSocialSecurity,
+    sehiDeduction: horizonSynced
+      ? yearProjectedComputed!.form_1040_out.sehi_medicare_deduction
+      : sehiDeduction,
+    taxableSocialSecurity: horizonSynced
+      ? yearProjectedComputed!.form_1040_out.social_security_taxable
+      : taxableSocialSecurity,
     grossSocialSecurity,
     personalInterestAndDividends,
     otherForm1040Income,
@@ -633,6 +695,101 @@ function resolveCustomMetricNumeric(
   }
 }
 
+/**
+ * Evaluates an `income_ceiling` planning guardrail from a known Form 1040 Joint MAGI figure.
+ * Shared by both live Planning Goals evaluation and CPA Section 4 <-> Section 5 reconciliation
+ * so status (`Within Guardrail` / `Shielded` vs. `Over Target`) and variance copy stay 100% consistent.
+ */
+export function evaluateIncomeCeilingGoalWithMagi(
+  goal: PlanningGoalGuardrail,
+  actualMagi: number,
+  projectionYear: number,
+  setup?: SetupConfig
+): EvaluatedPlanningGoal {
+  const linked = getLinkedIrmaaCeilingForProjectionYear(projectionYear, setup);
+  const isGoalTargetOverridden =
+    goal.target_overridden === true &&
+    typeof goal.target_value === 'number' &&
+    Number.isFinite(goal.target_value) &&
+    Math.abs(goal.target_value - linked.threshold) > 0.005;
+
+  const target = isGoalTargetOverridden ? (goal.target_value as number) : linked.threshold;
+  const actual = round2(actualMagi);
+  const diff = round2(actual - target);
+  const absDiff = Math.abs(diff);
+
+  // IRMAA Tier 1 is a binary statutory cliff: at or below the threshold is Shielded / Within Guardrail;
+  // above the threshold is Over Target (matches Section 4's IRMAA Shielded vs. Cliff evaluation).
+  let status: PlanningGuardrailStatus;
+  if (goal.comparator === 'info') {
+    status = 'within';
+  } else if (goal.comparator === 'min') {
+    status = actual < target - 0.005 ? 'over' : 'within';
+  } else {
+    status = actual > target + 0.005 ? 'over' : 'within';
+  }
+
+  const isShieldedFromIrmaa = actual <= linked.threshold + 0.005;
+
+  const effectiveWhy = goal.why_it_matters_custom
+    ? goal.why_it_matters
+    : buildIncomeCeilingWhyItMatters(
+        linked.projectionYear,
+        linked.coverageYear,
+        target,
+        linked.threshold,
+        isGoalTargetOverridden,
+        linked.filingStatusLabel
+      );
+
+  const effectiveGoal: PlanningGoalGuardrail = {
+    ...goal,
+    target_value: target,
+    target_overridden: isGoalTargetOverridden,
+    why_it_matters: effectiveWhy,
+  };
+
+  const targetFormatted = formatCurrencyExact(target);
+  const actualFormatted = formatCurrencyExact(actual);
+  const magiLabel =
+    linked.filingStatus === 'married_filing_jointly'
+      ? 'Form 1040 Joint MAGI'
+      : 'Form 1040 MAGI';
+  const irmaaShieldTag = isShieldedFromIrmaa ? ' · Shielded' : '';
+  const benchmarkNote = isGoalTargetOverridden
+    ? `Projected ${linked.projectionYear} ${magiLabel}: ${actualFormatted}; ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort}) is ${formatCurrencyExact(
+        linked.threshold
+      )}${irmaaShieldTag}`
+    : `Projected ${linked.projectionYear} ${magiLabel}: ${actualFormatted} vs. ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort} · 2-yr lookback)${irmaaShieldTag}`;
+
+  const varianceSummary =
+    diff > 0.005
+      ? `+${formatCurrencyExact(absDiff)} above ${targetFormatted} (${benchmarkNote})`
+      : diff < -0.005
+      ? `-${formatCurrencyExact(absDiff)} below ${targetFormatted} (${benchmarkNote})`
+      : `$0.00 variance vs. ${targetFormatted} (${benchmarkNote})`;
+
+  return {
+    goal: effectiveGoal,
+    status,
+    statusLabel: getStatusLabel(status),
+    targetDisplay: fmtTarget(effectiveGoal),
+    currentDisplay: actualFormatted,
+    currentNumeric: actual,
+    varianceSummary,
+    linkedIrmaa: {
+      projectionYear: linked.projectionYear,
+      coverageYear: linked.coverageYear,
+      threshold: linked.threshold,
+      filingStatus: linked.filingStatus,
+      filingStatusShort: linked.filingStatusShort,
+      filingStatusLabel: linked.filingStatusLabel,
+      isGoalTargetOverridden,
+      isCoverageYearOverridden: linked.isCoverageYearOverridden,
+    },
+  };
+}
+
 export function evaluatePlanningGoal(
   goal: PlanningGoalGuardrail,
   computed: ComputedPnlBalanceSheet,
@@ -644,81 +801,18 @@ export function evaluatePlanningGoal(
 
   if (goal.kind === 'income_ceiling') {
     const projectionYear = pnlState.projection_year || setup?.current_tax_year || 2026;
-    const linked = getLinkedIrmaaCeilingForProjectionYear(projectionYear, setup);
-    const isGoalTargetOverridden =
-      goal.target_overridden === true &&
-      typeof goal.target_value === 'number' &&
-      Number.isFinite(goal.target_value) &&
-      Math.abs(goal.target_value - linked.threshold) > 0.005;
-
-    const target = isGoalTargetOverridden ? (goal.target_value as number) : linked.threshold;
     const magiBreakdown = computeProjectedJointMagi(
       computed,
       pnlState,
       setup,
       yearProjectedComputed
     );
-    const actual = magiBreakdown.projectedMagi;
-    const diff = round2(actual - target);
-    const absDiff = Math.abs(diff);
-    const res = evaluateNumericAgainstTarget(actual, target, goal.comparator, 'currency');
-
-    const effectiveWhy = goal.why_it_matters_custom
-      ? goal.why_it_matters
-      : buildIncomeCeilingWhyItMatters(
-          linked.projectionYear,
-          linked.coverageYear,
-          target,
-          linked.threshold,
-          isGoalTargetOverridden,
-          linked.filingStatusLabel
-        );
-
-    const effectiveGoal: PlanningGoalGuardrail = {
-      ...goal,
-      target_value: target,
-      target_overridden: isGoalTargetOverridden,
-      why_it_matters: effectiveWhy,
-    };
-
-    const targetFormatted = formatCurrencyExact(target);
-    const actualFormatted = formatCurrencyExact(actual);
-    const magiLabel =
-      linked.filingStatus === 'married_filing_jointly'
-        ? 'Form 1040 Joint MAGI'
-        : 'Form 1040 MAGI';
-    const benchmarkNote = isGoalTargetOverridden
-      ? `Projected ${linked.projectionYear} ${magiLabel}: ${actualFormatted}; ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort}) is ${formatCurrencyExact(
-          linked.threshold
-        )}`
-      : `Projected ${linked.projectionYear} ${magiLabel}: ${actualFormatted} vs. ${linked.coverageYear} IRMAA Tier 1 (${linked.filingStatusShort} · 2-yr lookback)`;
-
-    const varianceSummary =
-      diff > 0.005
-        ? `+${formatCurrencyExact(absDiff)} above ${targetFormatted} (${benchmarkNote})`
-        : diff < -0.005
-        ? `-${formatCurrencyExact(absDiff)} below ${targetFormatted} (${benchmarkNote})`
-        : `$0.00 variance vs. ${targetFormatted} (${benchmarkNote})`;
-
-    return {
-      goal: effectiveGoal,
-      status: res.status,
-      statusLabel: getStatusLabel(res.status),
-      targetDisplay: fmtTarget(effectiveGoal),
-      currentDisplay: actualFormatted,
-      currentNumeric: actual,
-      varianceSummary,
-      linkedIrmaa: {
-        projectionYear: linked.projectionYear,
-        coverageYear: linked.coverageYear,
-        threshold: linked.threshold,
-        filingStatus: linked.filingStatus,
-        filingStatusShort: linked.filingStatusShort,
-        filingStatusLabel: linked.filingStatusLabel,
-        isGoalTargetOverridden,
-        isCoverageYearOverridden: linked.isCoverageYearOverridden,
-      },
-    };
+    return evaluateIncomeCeilingGoalWithMagi(
+      goal,
+      magiBreakdown.projectedMagi,
+      projectionYear,
+      setup
+    );
   }
 
   if (goal.kind === 'stock_basis_floor') {

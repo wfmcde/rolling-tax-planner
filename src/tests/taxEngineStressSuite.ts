@@ -14,12 +14,19 @@ import { ALL_SCHEDULE_ITEM_IDS, MASTER_SCHEDULE_CATALOG } from '../engine/schedu
 import {
   buildCpaHorizonSummary,
   computePnlVsHorizonReconciliation,
+  getHorizonYearMagi,
+  reconcileCpaGoalsWithHorizon,
   reconcilePnlStateToHorizonRevenue,
 } from '../engine/cpaHorizonSummary';
 import {
+  buildCpaProjectionCsv,
   calculatePnlBalanceSheet,
   createInitialPnlBalanceSheetState,
 } from '../engine/pnlBalanceSheet';
+import {
+  createDefaultPlanningGoals,
+  evaluateAllPlanningGoals,
+} from '../engine/planningGoals';
 import { computeDbpActuarialWaterfall } from '../engine/dbpActuarial';
 import { computeIrmaaBracketThresholds } from '../engine/irmaa';
 import {
@@ -2332,6 +2339,152 @@ function runPhase1BoundaryMatrix(failures: StressTestFailure[]): number {
         'Boundary B20',
         2026,
         `normalizePlannerState silently re-split 37.4% CA/AZ revenue: got ${comp04[1].scorp_in.ca_revenue}/${comp04[1].scorp_in.az_revenue} expected 129414/216614`
+      );
+    }
+
+    // Verify CPA Section 4 (Form 1040 Joint AGI/MAGI & IRMAA) <-> Section 5 (Income Ceiling Guardrail)
+    // exact reconciliation with pushed $346,028 revenue & CA+AZ PTE ON (Shielded / Within Guardrail)
+    // and Over Target (> $231,000 IRMAA Tier 1 MFJ cliff).
+    const sec4MagiPushed = getHorizonYearMagi(p3Y26);
+    const sec4AgiCell = p3CpaSec4.rows
+      .find((r) => r.id === 'agi_magi')!
+      .cells.find((c) => c.taxYear === 2026)!;
+    const sec4IrmaaCell = p3CpaSec4.rows
+      .find((r) => r.id === 'irmaa_lookback')!
+      .cells.find((c) => c.taxYear === 2026)!;
+    const defaultGoals26 = createDefaultPlanningGoals(pushed3StateNorm.setup, 2026);
+    const rawEvalGoals26 = evaluateAllPlanningGoals(
+      defaultGoals26,
+      p3CpaSec1,
+      p3SyncedPnl,
+      pushed3StateNorm.setup,
+      p3Y26
+    );
+    const reconciledGoals26 = reconcileCpaGoalsWithHorizon(
+      rawEvalGoals26,
+      pushed3Comp,
+      2026,
+      pushed3StateNorm.setup
+    );
+    const sec5IncomeCeiling = reconciledGoals26.find((g) => g.goal.kind === 'income_ceiling')!;
+    const expectedShieldedStatus = sec4MagiPushed <= 231000 ? 'within' : 'over';
+    const expectedShieldedLabel =
+      expectedShieldedStatus === 'within' ? 'Within Guardrail' : 'Over Target';
+    if (
+      sec4AgiCell.numericValue + (p3Y26.form_1040_in.tax_exempt_interest || 0) !== sec4MagiPushed ||
+      sec5IncomeCeiling.currentNumeric !== sec4MagiPushed ||
+      sec5IncomeCeiling.status !== expectedShieldedStatus ||
+      sec5IncomeCeiling.statusLabel !== expectedShieldedLabel ||
+      (expectedShieldedStatus === 'within' && sec4IrmaaCell.badgeText !== 'Shielded') ||
+      (expectedShieldedStatus === 'within' && !sec5IncomeCeiling.varianceSummary.includes('below $231,000.00')) ||
+      (expectedShieldedStatus === 'over' && !sec5IncomeCeiling.varianceSummary.includes('above $231,000.00'))
+    ) {
+      push(
+        'Boundary B20',
+        2026,
+        `CPA Section 4 vs Section 5 MAGI/IRMAA mismatch (PTE ON): sec4Magi=${sec4MagiPushed}, sec4Irmaa=${sec4IrmaaCell.badgeText}, sec5Current=${sec5IncomeCeiling.currentNumeric}, sec5Status=${sec5IncomeCeiling.statusLabel}, var="${sec5IncomeCeiling.varianceSummary}"`
+      );
+    }
+
+    // Explicitly verify Shielded case (2026 Joint MAGI <= $231,000 -> Within Guardrail + Shielded)
+    // AND Over Target case (2026 Joint MAGI > $231,000 -> Over Target + 2028 Cliff) plus CSV parity.
+    const shieldedYears = pushed3StateNorm.years.map((yr) =>
+      yr.tax_year !== 2026
+        ? yr
+        : {
+            ...yr,
+            scorp_1120s: {
+              ...yr.scorp_1120s,
+              operating_expenses: 56000,
+              operating_expenses_override: 56000,
+              pte_election_active: true,
+            },
+            state_filings: yr.state_filings.map((sf) =>
+              sf.state_code === 'CA' || sf.state_code === 'AZ'
+                ? { ...sf, state_pte_elected: true }
+                : sf
+            ),
+          }
+    );
+    const shieldedComp = calculateSixYearPlan(pushed3StateNorm.setup, shieldedYears);
+    const shieldedY26 = shieldedComp[1];
+    const shieldedSec4Magi = getHorizonYearMagi(shieldedY26);
+    const shieldedSec4Table = buildCpaHorizonSummary(pushed3StateNorm.setup, shieldedComp);
+    const shieldedSec4Irmaa = shieldedSec4Table.rows
+      .find((r) => r.id === 'irmaa_lookback')!
+      .cells.find((c) => c.taxYear === 2026)!;
+    // Deliberately pass stale rawEvalGoals26 (from higher OBI) into reconcileCpaGoalsWithHorizon & CSV
+    const shieldedSec5Goals = reconcileCpaGoalsWithHorizon(
+      rawEvalGoals26,
+      shieldedComp,
+      2026,
+      pushed3StateNorm.setup
+    );
+    const shieldedCeiling = shieldedSec5Goals.find((g) => g.goal.kind === 'income_ceiling')!;
+    const shieldedCsv = buildCpaProjectionCsv(
+      pushed3StateNorm.setup,
+      p3SyncedPnl,
+      p3CpaSec1,
+      pushed3StateNorm.setup.business_name || 'Business Entity',
+      pushed3StateNorm.setup.business_ein || '',
+      { activeGoals: rawEvalGoals26 },
+      shieldedComp
+    );
+    if (
+      shieldedSec4Magi > 231000 ||
+      shieldedSec4Irmaa.badgeText !== 'Shielded' ||
+      shieldedCeiling.currentNumeric !== shieldedSec4Magi ||
+      shieldedCeiling.status !== 'within' ||
+      shieldedCeiling.statusLabel !== 'Within Guardrail' ||
+      !shieldedCeiling.varianceSummary.includes('below $231,000.00') ||
+      !shieldedCsv.includes(shieldedCeiling.currentDisplay)
+    ) {
+      push(
+        'Boundary B20',
+        2026,
+        `Shielded Section 4 vs Section 5 parity failed: sec4Magi=${shieldedSec4Magi}, sec4Irmaa=${shieldedSec4Irmaa.badgeText}, sec5=${shieldedCeiling.currentDisplay} (${shieldedCeiling.statusLabel})`
+      );
+    }
+
+    const overTargetYears = pushed3StateNorm.years.map((yr) =>
+      yr.tax_year !== 2026
+        ? yr
+        : {
+            ...yr,
+            scorp_1120s: {
+              ...yr.scorp_1120s,
+              ca_revenue: 160000,
+              az_revenue: 240000,
+              gross_receipts_revenue: 400000,
+              operating_expenses: 20000,
+              operating_expenses_override: 20000,
+            },
+          }
+    );
+    const overTargetComp = calculateSixYearPlan(pushed3StateNorm.setup, overTargetYears);
+    const overTargetSec4Magi = getHorizonYearMagi(overTargetComp[1]);
+    const overTargetSec4Table = buildCpaHorizonSummary(pushed3StateNorm.setup, overTargetComp);
+    const overTargetSec4Irmaa = overTargetSec4Table.rows
+      .find((r) => r.id === 'irmaa_lookback')!
+      .cells.find((c) => c.taxYear === 2026)!;
+    const overTargetCeiling = reconcileCpaGoalsWithHorizon(
+      rawEvalGoals26,
+      overTargetComp,
+      2026,
+      pushed3StateNorm.setup
+    ).find((g) => g.goal.kind === 'income_ceiling')!;
+    if (
+      overTargetSec4Magi <= 231000 ||
+      overTargetSec4Irmaa.badgeText !== '2028 Cliff' ||
+      overTargetCeiling.currentNumeric !== overTargetSec4Magi ||
+      overTargetCeiling.status !== 'over' ||
+      overTargetCeiling.statusLabel !== 'Over Target' ||
+      !overTargetCeiling.varianceSummary.includes('above $231,000.00')
+    ) {
+      push(
+        'Boundary B20',
+        2026,
+        `Over-Target Section 4 vs Section 5 parity failed: sec4Magi=${overTargetSec4Magi}, sec4Irmaa=${overTargetSec4Irmaa.badgeText}, sec5=${overTargetCeiling.currentDisplay} (${overTargetCeiling.statusLabel})`
       );
     }
   });

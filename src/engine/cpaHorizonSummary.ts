@@ -4,6 +4,10 @@ import type {
   SetupConfig,
 } from '../types/tax';
 import type { ComputedPnlBalanceSheet } from './pnlBalanceSheet';
+import {
+  evaluateIncomeCeilingGoalWithMagi,
+  type EvaluatedPlanningGoal,
+} from './planningGoals';
 import { computeReasonableCompRatio } from './validator';
 import { formatCompactCurrency, formatCurrency, formatPercent } from '../utils/format';
 import { getSetupStates } from '../utils/setupHelpers';
@@ -418,7 +422,7 @@ export function buildCpaHorizonSummary(
   const agiCells: HorizonSummaryCell[] = computedYears.map((c) => {
     const agi = c.form_1040_out.adjusted_gross_income;
     const taxExemptInt = c.form_1040_in.tax_exempt_interest || 0;
-    const magi = agi + taxExemptInt;
+    const magi = getHorizonYearMagi(c);
     return {
       taxYear: c.tax_year,
       numericValue: agi,
@@ -876,4 +880,44 @@ export function computePnlVsHorizonReconciliation(
     rcVariancePct: Number((rcPnlPct - rcHorizonPct).toFixed(1)),
     mismatchedLines,
   };
+}
+
+/**
+ * Returns the exact Form 1040 Joint AGI / MAGI figure reported in Section 4 (Multi-Year Horizon
+ * Summary) for a computed tax year (`adjusted_gross_income + tax_exempt_interest`).
+ */
+export function getHorizonYearMagi(horizonYear: ComputedTaxYear): number {
+  const agi = horizonYear.form_1040_out.adjusted_gross_income;
+  const taxExemptInt = horizonYear.form_1040_in.tax_exempt_interest || 0;
+  return Math.round(agi + taxExemptInt);
+}
+
+/**
+ * Reconciles Section 5 Planning Goals & Guardrails (specifically the `income_ceiling` IRMAA
+ * 2-year lookback guardrail) against Section 4's authoritative projection-year Form 1040 Joint
+ * MAGI so Section 4 and Section 5 always report the identical figure, Shielded / Within Guardrail
+ * vs. Over Target status, and variance copy across Preview, Print/PDF, and CSV exports.
+ */
+export function reconcileCpaGoalsWithHorizon(
+  activeGoals: EvaluatedPlanningGoal[],
+  computedYears: ComputedTaxYear[] | undefined,
+  projectionYear: number,
+  setup: SetupConfig
+): EvaluatedPlanningGoal[] {
+  if (!computedYears || computedYears.length === 0 || activeGoals.length === 0) {
+    return activeGoals;
+  }
+  const horizonYear = computedYears.find((c) => c.tax_year === projectionYear);
+  if (!horizonYear) return activeGoals;
+
+  const section4Magi = getHorizonYearMagi(horizonYear);
+  return activeGoals.map((item) => {
+    if (item.goal.kind !== 'income_ceiling') return item;
+    return evaluateIncomeCeilingGoalWithMagi(
+      item.goal,
+      section4Magi,
+      projectionYear,
+      setup
+    );
+  });
 }
