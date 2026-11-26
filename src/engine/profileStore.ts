@@ -12,7 +12,11 @@ import type {
   TaxYearRecord,
   WorkspaceProfileMode,
 } from '../types/tax';
-import { createInitialBaselineState, normalizePlannerState } from './baseline';
+import {
+  createInitialBaselineState,
+  normalizePlannerState,
+  reconcileDerivedPlannerState,
+} from './baseline';
 import {
   DEFAULT_EXP_SMOOTH_ALPHA,
   createInitialCadenceForecasterState,
@@ -682,13 +686,18 @@ function migrateTaxYearForV3(yr: TaxYearRecord, setup: SetupConfig): TaxYearReco
         : undefined,
   }));
 
+  const syncedScorp: TaxYearRecord['scorp_1120s'] = {
+    ...safeScorp,
+    pte_election_active: safeStates.some((sf) => Boolean(sf.state_pte_elected)),
+  };
+
   return {
     ...yr,
     tax_year: taxYear,
     record_mode: yr.record_mode === 'actuals' ? 'actuals' : 'forecast',
     is_locked_actuals: Boolean(yr.is_locked_actuals),
     form_1040: safeForm1040,
-    scorp_1120s: safeScorp,
+    scorp_1120s: syncedScorp,
     dbp_and_retirement: safeDbp,
     state_filings: safeStates,
   };
@@ -1093,11 +1102,16 @@ export function serializeSingleProfileBackup(
   profile: TaxProfileRecord,
   exportedAt: string = new Date().toISOString()
 ): string {
+  const cloned = deepClone(profile);
+  const reconciledProfile: TaxProfileRecord = {
+    ...cloned,
+    state: reconcileDerivedPlannerState(cloned.state),
+  };
   const envelope: ProfileSnapshotEnvelope = {
     schemaVersion: PROFILE_SNAPSHOT_SCHEMA_VERSION,
     exportedAt,
     app: PROFILE_SNAPSHOT_APP_ID,
-    profile: deepClone(profile),
+    profile: reconciledProfile,
   };
   return JSON.stringify(envelope, null, 2);
 }
@@ -1105,6 +1119,13 @@ export function serializeSingleProfileBackup(
 export const serializeProfileSnapshot = serializeSingleProfileBackup;
 
 export function serializeAllProfilesBackup(store: MultiProfileStore): string {
+  const reconciledProfiles = store.profiles.map((p) => {
+    const cloned = deepClone(p);
+    return {
+      ...cloned,
+      state: reconcileDerivedPlannerState(cloned.state),
+    };
+  });
   return JSON.stringify(
     {
       schemaVersion: PROFILE_SNAPSHOT_SCHEMA_VERSION,
@@ -1113,7 +1134,7 @@ export function serializeAllProfilesBackup(store: MultiProfileStore): string {
       exportedAt: new Date().toISOString(),
       exported_at: new Date().toISOString(),
       active_profile_id: store.active_profile_id,
-      profiles: store.profiles,
+      profiles: reconciledProfiles,
     },
     null,
     2

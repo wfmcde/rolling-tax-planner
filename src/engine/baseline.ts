@@ -18,6 +18,7 @@ import {
 } from './pnlBalanceSheet';
 import { DEFAULT_IRMAA_GROWTH_RATE, sanitizeIrmaaThresholdOverrides } from './irmaa';
 import { DEFAULT_PROFILE_SEED, isDefaultSeedSetup } from '../data/profiles';
+import { calculateSixYearPlan } from './taxEngine';
 import {
   applySetupApportionmentToYear,
   getActiveBusinessStates,
@@ -367,7 +368,7 @@ export function projectNextYear(
               apportionment_percent: resolvedSplit.split[code] ?? 0,
             }))
           : prior.scorp_1120s.state_sourcing_breakdown,
-      pte_election_active: setup.has_pte,
+      pte_election_active: nextStates.some((sf) => Boolean(sf.state_pte_elected)),
       auto_sync_k1: true,
     },
     dbp_and_retirement: {
@@ -693,7 +694,7 @@ export function createInitialBaselineState(): PlannerState {
 
   const year2026 = years.find((y) => y.tax_year === 2026) ?? years[1];
 
-  return {
+  return reconcileDerivedPlannerState({
     setup,
     years,
     archived_years: [],
@@ -703,6 +704,171 @@ export function createInitialBaselineState(): PlannerState {
       hidden_line_item_ids: [],
     },
     pnl_balance_sheet: createInitialPnlBalanceSheetState(year2026, 0, setup),
+  });
+}
+
+/**
+ * Synchronizes derived per-year fields and working P&L retirement lines against the active
+ * deterministic tax engine calculation so live state, Six-Year Horizon, CPA Package, and
+ * exported v3.0 JSON snapshots always reconcile with $0 drift:
+ *  - scorp_1120s.pte_election_active === state_filings.some(sf => sf.state_pte_elected)
+ *  - scorp_1120s.gross_receipts_revenue === ca_revenue + az_revenue (when S-Corp split is active)
+ *  - form_1040.schedule_k1_ordinary_income === computed K-1 OBI on auto-synced non-locked years
+ *  - scorp_1120s.stock_basis_beginning & aaa_balance_beginning === prior year's calculated ending balances
+ *  - pnl_balance_sheet.pnl.dbp_contribution & employer_401k stay synced to the projection year's active plan
+ */
+export function reconcileDerivedPlannerState(state: PlannerState): PlannerState {
+  if (!state?.setup || !Array.isArray(state.years) || state.years.length === 0) {
+    return state;
+  }
+
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+
+  // Step 1: Enforce PTE flag & gross receipts parity before running the engine
+  const preSyncedYears: TaxYearRecord[] = state.years.map((yr) => {
+    const anyStatePteElected = yr.state_filings.some((sf) => Boolean(sf.state_pte_elected));
+    const hasSplitRev =
+      state.setup.has_scorp &&
+      typeof yr.scorp_1120s.ca_revenue === 'number' &&
+      Number.isFinite(yr.scorp_1120s.ca_revenue) &&
+      typeof yr.scorp_1120s.az_revenue === 'number' &&
+      Number.isFinite(yr.scorp_1120s.az_revenue);
+    const reconciledGross = hasSplitRev
+      ? Math.max(0, round0(yr.scorp_1120s.ca_revenue)) +
+        Math.max(0, round0(yr.scorp_1120s.az_revenue))
+      : yr.scorp_1120s.gross_receipts_revenue;
+
+    if (
+      yr.scorp_1120s.pte_election_active === anyStatePteElected &&
+      yr.scorp_1120s.gross_receipts_revenue === reconciledGross
+    ) {
+      return yr;
+    }
+
+    return {
+      ...yr,
+      scorp_1120s: {
+        ...yr.scorp_1120s,
+        gross_receipts_revenue: reconciledGross,
+        pte_election_active: anyStatePteElected,
+      },
+    };
+  });
+
+  // Step 2: Run the authoritative 6-year tax engine to resolve K-1 OBI, basis rollforward, and retirement
+  const computedYears = calculateSixYearPlan(state.setup, preSyncedYears);
+
+  // Step 3: Write authoritative derived fields back onto non-locked forecast years (never mutating locked actuals)
+  const syncedYears: TaxYearRecord[] = preSyncedYears.map((yr, idx) => {
+    if (yr.is_locked_actuals) return yr;
+    const compYr = computedYears[idx];
+    if (!compYr) return yr;
+
+    const nextK1 =
+      state.setup.has_scorp && yr.scorp_1120s.auto_sync_k1
+        ? compYr.scorp_out.ordinary_business_income_1120s
+        : yr.form_1040.schedule_k1_ordinary_income;
+    const nextBegBasis =
+      idx > 0
+        ? computedYears[idx - 1].scorp_out.stock_basis_ending
+        : yr.scorp_1120s.stock_basis_beginning;
+    const nextBegAaa =
+      idx > 0
+        ? computedYears[idx - 1].scorp_out.aaa_balance_ending
+        : yr.scorp_1120s.aaa_balance_beginning;
+
+    const nextDbpActual =
+      !state.setup.has_dbp || yr.dbp_and_retirement.dbp_status === 'terminated'
+        ? 0
+        : yr.dbp_and_retirement.dbp_actual_contribution;
+
+    if (
+      yr.form_1040.schedule_k1_ordinary_income === nextK1 &&
+      yr.scorp_1120s.stock_basis_beginning === nextBegBasis &&
+      yr.scorp_1120s.aaa_balance_beginning === nextBegAaa &&
+      yr.dbp_and_retirement.dbp_actual_contribution === nextDbpActual
+    ) {
+      return yr;
+    }
+
+    return {
+      ...yr,
+      form_1040: {
+        ...yr.form_1040,
+        schedule_k1_ordinary_income: nextK1,
+      },
+      scorp_1120s: {
+        ...yr.scorp_1120s,
+        stock_basis_beginning: nextBegBasis,
+        aaa_balance_beginning: nextBegAaa,
+      },
+      dbp_and_retirement: {
+        ...yr.dbp_and_retirement,
+        dbp_actual_contribution: nextDbpActual,
+      },
+    };
+  });
+
+  // Step 4: Reconcile working P&L retirement targets & beginning stock basis with the active projection year
+  let nextPnl = state.pnl_balance_sheet;
+  if (nextPnl) {
+    const projIdx = syncedYears.findIndex((y) => y.tax_year === nextPnl!.projection_year);
+    const projYr = projIdx >= 0 ? syncedYears[projIdx] : undefined;
+    const projComp = projIdx >= 0 ? computedYears[projIdx] : undefined;
+    if (projYr && projComp && !projYr.is_locked_actuals) {
+      const targetDbp =
+        state.setup.has_dbp && projComp.dbp_in.dbp_status !== 'terminated'
+          ? Math.max(0, Math.round(projComp.dbp_in.dbp_actual_contribution))
+          : 0;
+      const target401k = Math.max(0, Math.round(projComp.form_1040_out.employer_401k_total));
+      const manualRet = nextPnl.retirement_line17_manual_overrides;
+
+      const dbpLine = nextPnl.pnl.dbp_contribution ?? { ytd: 0, remaining: 0 };
+      const k401Line = nextPnl.pnl.employer_401k ?? { ytd: 0, remaining: 0 };
+
+      const nextDbpRem = manualRet?.dbp_contribution
+        ? dbpLine.remaining
+        : r2(targetDbp - dbpLine.ytd);
+      const next401kRem = manualRet?.employer_401k
+        ? k401Line.remaining
+        : r2(target401k - k401Line.ytd);
+
+      const priorEndingBasis =
+        projIdx > 0 ? computedYears[projIdx - 1].scorp_out.stock_basis_ending : null;
+      const prevBegOverride = nextPnl.balance_sheet.beginning_stock_basis_override;
+      const year0BegBasis = syncedYears[0]?.scorp_1120s.stock_basis_beginning ?? 0;
+      const nextBegOverride =
+        priorEndingBasis !== null &&
+        (prevBegOverride === null ||
+          (prevBegOverride === year0BegBasis && priorEndingBasis !== year0BegBasis))
+          ? priorEndingBasis
+          : prevBegOverride;
+
+      if (
+        nextDbpRem !== dbpLine.remaining ||
+        next401kRem !== k401Line.remaining ||
+        nextBegOverride !== prevBegOverride
+      ) {
+        nextPnl = {
+          ...nextPnl,
+          pnl: {
+            ...nextPnl.pnl,
+            dbp_contribution: { ytd: dbpLine.ytd, remaining: nextDbpRem },
+            employer_401k: { ytd: k401Line.ytd, remaining: next401kRem },
+          },
+          balance_sheet: {
+            ...nextPnl.balance_sheet,
+            beginning_stock_basis_override: nextBegOverride,
+          },
+        };
+      }
+    }
+  }
+
+  return {
+    ...state,
+    years: syncedYears,
+    ...(nextPnl ? { pnl_balance_sheet: nextPnl } : {}),
   };
 }
 
@@ -781,14 +947,14 @@ export function rollWindowForward(
     forecast_years: nextYears.map((y) => y.tax_year),
   };
 
-  return {
+  return reconcileDerivedPlannerState({
     setup: nextSetup,
     years: nextYears,
     archived_years: [archived, ...state.archived_years],
     schedule_view: state.schedule_view,
     planning_goals: state.planning_goals,
     guardrail_acknowledgments: state.guardrail_acknowledgments,
-  };
+  });
 }
 
 /**
@@ -1268,7 +1434,7 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
         const pPct = Math.round((yr.scorp_1120s.ca_revenue / tot) * 1000) / 10;
         const sPct = Math.round((100 - pPct) * 10) / 10;
         const defaultPrimary = seedDefault[pCode] ?? 50;
-        if (Math.abs(pPct - defaultPrimary) > 0.5) {
+        if (Math.abs(pPct - defaultPrimary) > 0.05) {
           yearOverrides[yr.tax_year] = { [pCode]: pPct, [sCode]: sPct };
         }
       }
@@ -1307,7 +1473,7 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
         const tot = yr.scorp_1120s.ca_revenue + yr.scorp_1120s.az_revenue;
         if (tot <= 0) continue;
         const pPct = Math.round((yr.scorp_1120s.ca_revenue / tot) * 1000) / 10;
-        if (Math.abs(pPct - inferredPrimaryPct) > 0.5) {
+        if (Math.abs(pPct - inferredPrimaryPct) > 0.05) {
           yearOverrides[yr.tax_year] = {
             [pCode]: pPct,
             [sCode]: Math.round((100 - pPct) * 10) / 10,
@@ -1366,7 +1532,7 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
     }
   }
 
-  return {
+  return reconcileDerivedPlannerState({
     ...raw,
     setup: finalSetup,
     years: finalYears,
@@ -1377,5 +1543,5 @@ export function normalizePlannerState(raw: PlannerState): PlannerState {
     },
     pnl_balance_sheet: pnlBalanceSheet,
     ...(normalizedCadence ? { cadence_forecaster: normalizedCadence } : {}),
-  };
+  });
 }

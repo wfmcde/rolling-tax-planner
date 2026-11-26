@@ -71,7 +71,11 @@ export interface PnlHorizonReconLine {
 export interface PnlHorizonReconciliation {
   projectionYear: number;
   isReconciled: boolean;
+  pnlObi: number;
+  horizonObi: number;
+  pteEntityTaxDeduction: number;
   obiVariance: number;
+  obiAfterPteVariance: number;
   basisVariance: number;
   rcPnlPct: number;
   rcHorizonPct: number;
@@ -641,6 +645,92 @@ export function buildCpaHorizonSummary(
 }
 
 /**
+ * Reconciles a working P&L snapshot's revenue lines (primary / secondary / total) against the
+ * active Six-Year Horizon year when opening the CPA Package from Six-Year Horizon.
+ *
+ * - If the snapshot already matches Horizon to whole dollars (e.g., immediately after pushing
+ *   from Transaction Cadence Forecast), exact cent-level YTD and Remaining figures are preserved.
+ * - If the snapshot is stale relative to Horizon (e.g., Horizon was edited directly or an older
+ *   saved snapshot drifted by >= $1), Remaining is back-solved from Horizon so Section 1 P&L,
+ *   Horizon Group 1, and Section 4 Gross Receipts always tie out with $0 variance.
+ */
+export function reconcilePnlStateToHorizonRevenue(
+  pnlState: PnlBalanceSheetState,
+  horizonYear: ComputedTaxYear | undefined,
+  setup?: SetupConfig | null
+): PnlBalanceSheetState {
+  if (!horizonYear) return pnlState;
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+  const horizonCa = Math.round(Math.max(0, horizonYear.scorp_in.ca_revenue));
+  const horizonAz = Math.round(Math.max(0, horizonYear.scorp_in.az_revenue));
+  const horizonTotal = Math.round(Math.max(0, horizonYear.scorp_in.gross_receipts_revenue));
+
+  const caLine = pnlState.pnl.ca_revenue ?? { ytd: 0, remaining: 0 };
+  const azLine = pnlState.pnl.az_revenue ?? { ytd: 0, remaining: 0 };
+  const pnlCa = r2(caLine.ytd + caLine.remaining);
+  const pnlAz = r2(azLine.ytd + azLine.remaining);
+  const pnlTotal = r2(pnlCa + pnlAz);
+
+  const totalMatches = Math.round(pnlTotal) === horizonTotal;
+  const caMatches = Math.abs(pnlCa - horizonCa) < 1;
+  const azMatches = Math.abs(pnlAz - horizonAz) < 1;
+
+  const targetDbp =
+    (setup && setup.has_dbp === false) || horizonYear.dbp_in.dbp_status === 'terminated'
+      ? 0
+      : Math.max(0, Math.round(horizonYear.dbp_in.dbp_actual_contribution));
+  const target401k = Math.max(0, Math.round(horizonYear.form_1040_out.employer_401k_total));
+  const dbpLine = pnlState.pnl.dbp_contribution ?? { ytd: 0, remaining: 0 };
+  const k401Line = pnlState.pnl.employer_401k ?? { ytd: 0, remaining: 0 };
+  const manualRet = pnlState.retirement_line17_manual_overrides;
+  const dbpMatches =
+    Boolean(manualRet?.dbp_contribution) ||
+    Math.abs(r2(dbpLine.ytd + dbpLine.remaining) - targetDbp) < 1;
+  const k401Matches =
+    Boolean(manualRet?.employer_401k) ||
+    Math.abs(r2(k401Line.ytd + k401Line.remaining) - target401k) < 1;
+
+  if (totalMatches && caMatches && azMatches && dbpMatches && k401Matches) {
+    return pnlState;
+  }
+
+  return {
+    ...pnlState,
+    pnl: {
+      ...pnlState.pnl,
+      ...(!(totalMatches && caMatches && azMatches)
+        ? {
+            ca_revenue: {
+              ytd: caLine.ytd,
+              remaining: r2(horizonCa - caLine.ytd),
+            },
+            az_revenue: {
+              ytd: azLine.ytd,
+              remaining: r2(horizonAz - azLine.ytd),
+            },
+          }
+        : {}),
+      ...(!dbpMatches
+        ? {
+            dbp_contribution: {
+              ytd: dbpLine.ytd,
+              remaining: r2(targetDbp - dbpLine.ytd),
+            },
+          }
+        : {}),
+      ...(!k401Matches
+        ? {
+            employer_401k: {
+              ytd: k401Line.ytd,
+              remaining: r2(target401k - k401Line.ytd),
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+/**
  * Reconciles the working projection-year P&L / Form 7203 against the corresponding
  * tax year in the 6-year Horizon model so the CPA report clearly displays $0 parity
  * or highlights any un-pushed working P&L deltas transparently.
@@ -656,10 +746,19 @@ export function computePnlVsHorizonReconciliation(
   if (!horizonYear) return null;
 
   const r0 = (n: number) => Math.round(n);
+  const { primaryStateName, secondaryStateCode, secondaryStateName, hasPrimaryState } =
+    getSetupStates(setup);
   const pnlW2 = r0(pnlComputed.totalCompensation.projected);
   const pnlObi = r0(pnlComputed.ordinaryBusinessIncome.projected);
   const horizonW2 = r0(getYearW2(horizonYear, setup));
   const horizonObi = r0(horizonYear.scorp_out.ordinary_business_income_1120s);
+
+  const pteEntityTaxDeduction = r0(Math.max(0, horizonYear.scorp_out.pte_tax_paid_total));
+  const pnlObiAfterPte = pnlObi - pteEntityTaxDeduction;
+  const pnlEndingBasisAfterPte =
+    pteEntityTaxDeduction > 0
+      ? Math.max(0, r0(pnlComputed.projectedEndingStockBasis) - pteEntityTaxDeduction)
+      : r0(pnlComputed.projectedEndingStockBasis);
 
   const checks: PnlHorizonReconLine[] = [
     {
@@ -668,6 +767,22 @@ export function computePnlVsHorizonReconciliation(
       horizonValue: r0(horizonYear.scorp_in.gross_receipts_revenue),
       variance: 0,
     },
+    ...(setup.multi_state_active && secondaryStateCode
+      ? [
+          {
+            label: `${hasPrimaryState ? primaryStateName : 'Primary State'} S-Corp Revenue`,
+            pnlValue: r0(pnlComputed.lines.ca_revenue.projected),
+            horizonValue: r0(horizonYear.scorp_in.ca_revenue),
+            variance: 0,
+          },
+          {
+            label: `${secondaryStateName} S-Corp Revenue`,
+            pnlValue: r0(pnlComputed.lines.az_revenue.projected),
+            horizonValue: r0(horizonYear.scorp_in.az_revenue),
+            variance: 0,
+          },
+        ]
+      : []),
     {
       label: 'OpEx (Excl. Payroll)',
       pnlValue: r0(pnlComputed.totalOperatingExpensesExclPayroll.projected),
@@ -705,8 +820,11 @@ export function computePnlVsHorizonReconciliation(
       variance: 0,
     },
     {
-      label: 'K-1 Ordinary Business Income',
-      pnlValue: pnlObi,
+      label:
+        pteEntityTaxDeduction > 0
+          ? 'K-1 Ordinary Business Income (Post-PTE)'
+          : 'K-1 Ordinary Business Income',
+      pnlValue: pnlObiAfterPte,
       horizonValue: horizonObi,
       variance: 0,
     },
@@ -724,18 +842,20 @@ export function computePnlVsHorizonReconciliation(
     },
     {
       label: 'Ending Stock Basis',
-      pnlValue: r0(pnlComputed.projectedEndingStockBasis),
+      pnlValue: pnlEndingBasisAfterPte,
       horizonValue: r0(horizonYear.scorp_out.stock_basis_ending),
       variance: 0,
     },
   ].map((row) => ({ ...row, variance: row.pnlValue - row.horizonValue }));
 
   const obiVariance = pnlObi - horizonObi;
+  const obiAfterPteVariance = pnlObiAfterPte - horizonObi;
   const basisVariance =
-    r0(pnlComputed.projectedEndingStockBasis) - r0(horizonYear.scorp_out.stock_basis_ending);
-  const exactBottomLineTieOut = obiVariance === 0 && basisVariance === 0;
-  // IRS Form 1120-S rounds cent-level QBO books to whole dollars; when K-1 OBI and Ending Stock
-  // Basis tie to exact $0, a +/-$1 whole-dollar rounding absorption on a single sub-line is reconciled.
+    pnlEndingBasisAfterPte - r0(horizonYear.scorp_out.stock_basis_ending);
+  const exactBottomLineTieOut = obiAfterPteVariance === 0 && basisVariance === 0;
+  // IRS Form 1120-S rounds cent-level QBO books to whole dollars; when K-1 OBI (after Entity PTE
+  // deduction, if elected) and Ending Stock Basis tie to exact $0, a +/-$1 whole-dollar rounding
+  // absorption on a single sub-line is reconciled.
   const mismatchedLines = checks.filter((c) =>
     exactBottomLineTieOut ? Math.abs(c.variance) > 1 : c.variance !== 0
   );
@@ -745,7 +865,11 @@ export function computePnlVsHorizonReconciliation(
   return {
     projectionYear: projYear,
     isReconciled: exactBottomLineTieOut && mismatchedLines.length === 0,
+    pnlObi,
+    horizonObi,
+    pteEntityTaxDeduction,
     obiVariance,
+    obiAfterPteVariance,
     basisVariance,
     rcPnlPct,
     rcHorizonPct,

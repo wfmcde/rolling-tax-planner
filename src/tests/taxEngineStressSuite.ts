@@ -11,9 +11,25 @@ import type {
 import { createInitialBaselineState, normalizePlannerState } from '../engine/baseline';
 import { calculateSixYearPlan, STATE_TAX_RULES } from '../engine/taxEngine';
 import { ALL_SCHEDULE_ITEM_IDS, MASTER_SCHEDULE_CATALOG } from '../engine/scheduleCatalog';
-import { buildCpaHorizonSummary } from '../engine/cpaHorizonSummary';
+import {
+  buildCpaHorizonSummary,
+  computePnlVsHorizonReconciliation,
+  reconcilePnlStateToHorizonRevenue,
+} from '../engine/cpaHorizonSummary';
+import {
+  calculatePnlBalanceSheet,
+  createInitialPnlBalanceSheetState,
+} from '../engine/pnlBalanceSheet';
 import { computeDbpActuarialWaterfall } from '../engine/dbpActuarial';
 import { computeIrmaaBracketThresholds } from '../engine/irmaa';
+import {
+  aggregateCadenceStateRevenue,
+  computeCadenceForecast,
+} from '../engine/cadenceEngine';
+import {
+  setYearStateApportionmentOverride,
+  updateYearStateApportionmentSplit,
+} from '../utils/setupHelpers';
 import { DEFAULT_PROFILE_SEED, isDefaultSeedSetup } from '../data/profiles';
 import {
   PROFILE_SNAPSHOT_APP_ID,
@@ -662,6 +678,201 @@ function checkUniversalInvariants(
         c.tax_year,
         `total_all_in_tax (${c.total_all_in_tax}) !== Fed+State+ERPayroll (${recomposedAllIn})`
       );
+    }
+  }
+
+  // --- INVARIANT 6: Cross-View & Snapshot Parity + v3.0 JSON Round-Trip ($0 variance) ---
+  const dbpHorizonEntry = horizonRowsComputed.find((x) => x.row.id === 'dbp_contribution');
+  for (let i = 0; i < state.years.length; i++) {
+    const yr = state.years[i];
+    const c = computed[i];
+    if (!c) continue;
+
+    // 6.1 Total S-Corp gross receipts (ca_revenue + az_revenue) equals gross_receipts_revenue within $1
+    if (state.setup.has_scorp) {
+      const rawSplitSum = yr.scorp_1120s.ca_revenue + yr.scorp_1120s.az_revenue;
+      if (Math.abs(rawSplitSum - yr.scorp_1120s.gross_receipts_revenue) > 1) {
+        pushFail(
+          'Invariant 6 (Snapshot Parity)',
+          yr.tax_year,
+          `Input S-Corp ca+az (${rawSplitSum}) !== gross_receipts_revenue (${yr.scorp_1120s.gross_receipts_revenue})`
+        );
+      }
+      const compSplitSum = c.scorp_in.ca_revenue + c.scorp_in.az_revenue;
+      if (Math.abs(compSplitSum - c.scorp_in.gross_receipts_revenue) > 1) {
+        pushFail(
+          'Invariant 6 (Snapshot Parity)',
+          yr.tax_year,
+          `Computed S-Corp ca+az (${compSplitSum}) !== gross_receipts_revenue (${c.scorp_in.gross_receipts_revenue})`
+        );
+      }
+    }
+
+    // 6.2 scorp_1120s.pte_election_active strictly matches whether any state_filing has state_pte_elected === true
+    const anyStatePteElected = yr.state_filings.some((sf) => Boolean(sf.state_pte_elected));
+    if (yr.scorp_1120s.pte_election_active !== anyStatePteElected) {
+      pushFail(
+        'Invariant 6 (Snapshot Parity)',
+        yr.tax_year,
+        `pte_election_active (${yr.scorp_1120s.pte_election_active}) !== state_filings.some(state_pte_elected) (${anyStatePteElected})`
+      );
+    }
+
+    // 6.3 dbp_actual_contribution matches Horizon Group 3 DBP row and P&L DBP total within $1
+    const horizonDbpVal = dbpHorizonEntry?.cells[i]?.numericValue ?? 0;
+    const expectedDbp =
+      state.setup.has_dbp && yr.dbp_and_retirement.dbp_status !== 'terminated'
+        ? yr.dbp_and_retirement.dbp_actual_contribution
+        : 0;
+    if (Math.abs(expectedDbp - horizonDbpVal) > 1) {
+      pushFail(
+        'Invariant 6 (Snapshot Parity)',
+        yr.tax_year,
+        `DBP contribution (${expectedDbp}) !== Horizon Group 3 row (${horizonDbpVal})`
+      );
+    }
+    if (
+      !yr.is_locked_actuals &&
+      Math.abs(yr.dbp_and_retirement.dbp_actual_contribution - horizonDbpVal) > 1
+    ) {
+      pushFail(
+        'Invariant 6 (Snapshot Parity)',
+        yr.tax_year,
+        `Raw forecast dbp_actual_contribution (${yr.dbp_and_retirement.dbp_actual_contribution}) !== Horizon Group 3 row (${horizonDbpVal})`
+      );
+    }
+    if (
+      state.pnl_balance_sheet &&
+      state.pnl_balance_sheet.projection_year === yr.tax_year &&
+      !yr.is_locked_actuals &&
+      !state.pnl_balance_sheet.retirement_line17_manual_overrides?.dbp_contribution
+    ) {
+      const pnlDbpLine = state.pnl_balance_sheet.pnl.dbp_contribution ?? { ytd: 0, remaining: 0 };
+      const pnlDbpTotal = pnlDbpLine.ytd + pnlDbpLine.remaining;
+      if (Math.abs(pnlDbpTotal - horizonDbpVal) > 1) {
+        pushFail(
+          'Invariant 6 (Snapshot Parity)',
+          yr.tax_year,
+          `P&L dbp_contribution (${pnlDbpTotal}) !== Horizon Group 3 DBP (${horizonDbpVal})`
+        );
+      }
+    }
+
+    // 6.4 Forecast beginning stock basis matches prior-year ending stock basis & auto-synced K-1 matches computed OBI
+    if (i >= 1 && !yr.is_locked_actuals) {
+      const priorEndBasis = computed[i - 1].scorp_out.stock_basis_ending;
+      if (Math.abs(yr.scorp_1120s.stock_basis_beginning - priorEndBasis) > 1) {
+        pushFail(
+          'Invariant 6 (Snapshot Parity)',
+          yr.tax_year,
+          `stock_basis_beginning (${yr.scorp_1120s.stock_basis_beginning}) !== prior-year ending basis (${priorEndBasis})`
+        );
+      }
+      if (state.setup.has_scorp && yr.scorp_1120s.auto_sync_k1) {
+        if (
+          Math.abs(
+            yr.form_1040.schedule_k1_ordinary_income - c.scorp_out.ordinary_business_income_1120s
+          ) > 1
+        ) {
+          pushFail(
+            'Invariant 6 (Snapshot Parity)',
+            yr.tax_year,
+            `schedule_k1_ordinary_income (${yr.form_1040.schedule_k1_ordinary_income}) !== computed K-1 OBI (${c.scorp_out.ordinary_business_income_1120s})`
+          );
+        }
+      }
+    }
+  }
+
+  // 6.5 Exported v3.0 JSON round-trip re-import preserves all reconciled fields with $0 variance
+  const snapshotProfile = {
+    id: `stress-${caseId.toLowerCase()}`,
+    name: state.setup.business_name || `Stress ${caseId}`,
+    entity_name: state.setup.business_name || `Stress ${caseId}`,
+    entity_ein: state.setup.business_ein || '',
+    notes: 'Stress Snapshot Verification',
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+    state,
+  };
+  const exportedJson = serializeSingleProfileBackup(snapshotProfile);
+  let rtState: PlannerState | null = null;
+  try {
+    const parsedSnapshot = parseAndValidateProfileSnapshot(exportedJson);
+    rtState = parsedSnapshot.profiles[0]?.state ?? null;
+    if (!rtState) {
+      pushFail('Invariant 6 (Snapshot Parity)', 'ALL', 'v3.0 JSON snapshot round-trip returned empty profiles[]');
+    }
+  } catch (err) {
+    pushFail(
+      'Invariant 6 (Snapshot Parity)',
+      'ALL',
+      `v3.0 JSON snapshot round-trip parse failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (rtState) {
+    const rtComputed = calculateSixYearPlan(rtState.setup, rtState.years);
+    for (let i = 0; i < state.years.length; i++) {
+      const origYr = state.years[i];
+      const rtYr = rtState.years[i];
+      const origC = computed[i];
+      const rtC = rtComputed[i];
+      if (!rtYr || !rtC) {
+        pushFail('Invariant 6 (Snapshot Parity)', origYr.tax_year, 'Round-trip missing tax year');
+        continue;
+      }
+      const rtChecks: [string, number | boolean, number | boolean][] = [
+        ['gross_receipts_revenue', rtYr.scorp_1120s.gross_receipts_revenue, origYr.scorp_1120s.gross_receipts_revenue],
+        ['ca_revenue', rtYr.scorp_1120s.ca_revenue, origYr.scorp_1120s.ca_revenue],
+        ['az_revenue', rtYr.scorp_1120s.az_revenue, origYr.scorp_1120s.az_revenue],
+        ['pte_election_active', rtYr.scorp_1120s.pte_election_active, origYr.scorp_1120s.pte_election_active],
+        ['dbp_actual_contribution', rtYr.dbp_and_retirement.dbp_actual_contribution, origYr.dbp_and_retirement.dbp_actual_contribution],
+        ['stock_basis_beginning', rtYr.scorp_1120s.stock_basis_beginning, origYr.scorp_1120s.stock_basis_beginning],
+        ['schedule_k1_ordinary_income', rtYr.form_1040.schedule_k1_ordinary_income, origYr.form_1040.schedule_k1_ordinary_income],
+        ['computed_k1_obi', rtC.scorp_out.ordinary_business_income_1120s, origC.scorp_out.ordinary_business_income_1120s],
+        ['computed_ending_basis', rtC.scorp_out.stock_basis_ending, origC.scorp_out.stock_basis_ending],
+        ['computed_all_in_tax', rtC.total_all_in_tax, origC.total_all_in_tax],
+      ];
+      for (const [field, got, expected] of rtChecks) {
+        if (got !== expected) {
+          pushFail(
+            'Invariant 6 (Snapshot Parity)',
+            origYr.tax_year,
+            `v3.0 JSON round-trip drift on ${field}: got=${String(got)} expected=${String(expected)}`
+          );
+        }
+      }
+      if (origYr.state_filings.length !== rtYr.state_filings.length) {
+        pushFail(
+          'Invariant 6 (Snapshot Parity)',
+          origYr.tax_year,
+          `v3.0 JSON round-trip state_filings count drift: ${rtYr.state_filings.length} !== ${origYr.state_filings.length}`
+        );
+      } else {
+        for (let sIdx = 0; sIdx < origYr.state_filings.length; sIdx++) {
+          if (
+            Boolean(rtYr.state_filings[sIdx].state_pte_elected) !==
+            Boolean(origYr.state_filings[sIdx].state_pte_elected)
+          ) {
+            pushFail(
+              'Invariant 6 (Snapshot Parity)',
+              origYr.tax_year,
+              `v3.0 JSON round-trip state_pte_elected drift on ${origYr.state_filings[sIdx].state_code}`
+            );
+          }
+        }
+      }
+    }
+    if (state.pnl_balance_sheet && rtState.pnl_balance_sheet) {
+      const origDbp = state.pnl_balance_sheet.pnl.dbp_contribution;
+      const rtDbp = rtState.pnl_balance_sheet.pnl.dbp_contribution;
+      if (origDbp.ytd !== rtDbp.ytd || origDbp.remaining !== rtDbp.remaining) {
+        pushFail(
+          'Invariant 6 (Snapshot Parity)',
+          state.pnl_balance_sheet.projection_year,
+          `v3.0 JSON round-trip P&L dbp_contribution drift: (${rtDbp.ytd},${rtDbp.remaining}) !== (${origDbp.ytd},${origDbp.remaining})`
+        );
+      }
     }
   }
 }
@@ -1624,6 +1835,505 @@ function runPhase1BoundaryMatrix(failures: StressTestFailure[]): number {
     if (corruptPartial.length > 0) {
       push('Boundary B20', 'ALL', `Partial V3 migration produced corrupt numbers: ${corruptPartial[0]}`);
     }
+
+    // 6. End-to-End 2026 S-Corp Revenue & CA/AZ Split Reconciliation (Cadence Push -> Horizon Group 1 -> CPA Sec 1 & Sec 4)
+    const revScenarios = [
+      { label: '344k-exact', caYtd: 100000.0, caRem: 26922.85, azYtd: 170000.0, azRem: 47484.83, centCarry: false }, // $126,922.85 CA + $217,484.83 AZ = $344,407.68
+      { label: '346k-exact', caYtd: 101000.0, caRem: 26521.2, azYtd: 171000.0, azRem: 47506.51, centCarry: false }, // $127,521.20 CA + $218,506.51 AZ = $346,027.71
+      { label: '346k-carry', caYtd: 101000.0, caRem: 26521.4, azYtd: 171000.0, azRem: 47506.31, centCarry: true }, // $127,521.40 CA + $218,506.31 AZ = $346,027.71 (.40+.31=.71 cent carry)
+    ];
+    const rowTotalRev = MASTER_SCHEDULE_CATALOG.find((r) => r.id === 'scorp_gross_revenue')!;
+    const rowCaRev = MASTER_SCHEDULE_CATALOG.find((r) => r.id === 'ca_scorp_revenue')!;
+    const rowAzRev = MASTER_SCHEDULE_CATALOG.find((r) => r.id === 'az_scorp_revenue')!;
+
+    for (const sc of revScenarios) {
+      const basePushState = createInitialBaselineState();
+      const baseComp = calculateSixYearPlan(basePushState.setup, basePushState.years);
+      const y25Base = baseComp[0];
+      const y26Base = baseComp[1];
+      const seedPnl = createInitialPnlBalanceSheetState(
+        basePushState.years[1],
+        y25Base.scorp_out.stock_basis_ending,
+        basePushState.setup
+      );
+      const cadencePnlState = {
+        ...seedPnl,
+        last_pushed_at: '2026-11-26T09:00:00.000Z',
+        pnl: {
+          ...seedPnl.pnl,
+          ca_revenue: { ytd: sc.caYtd, remaining: sc.caRem },
+          az_revenue: { ytd: sc.azYtd, remaining: sc.azRem },
+        },
+      };
+      const cadencePnlComp = calculatePnlBalanceSheet(
+        cadencePnlState,
+        y25Base,
+        y26Base,
+        basePushState.setup,
+        { respectStateRetirementRemaining: true }
+      );
+      const targetTotal = Math.round(cadencePnlComp.totalRevenue.projected);
+      const targetCa = Math.min(targetTotal, Math.round(cadencePnlComp.lines.ca_revenue.projected));
+      const targetAz = Math.max(0, targetTotal - targetCa);
+      const pushedPct = Math.round((targetCa / targetTotal) * 1000) / 10;
+      const pushedSetup = setYearStateApportionmentOverride(basePushState.setup, 2026, pushedPct);
+      const pushedYears = basePushState.years.map((yr) =>
+        yr.tax_year !== 2026
+          ? yr
+          : {
+              ...yr,
+              scorp_1120s: {
+                ...yr.scorp_1120s,
+                ca_revenue: targetCa,
+                az_revenue: targetAz,
+                gross_receipts_revenue: targetTotal,
+              },
+              state_filings: yr.state_filings.map((sf) =>
+                sf.state_code === 'CA'
+                  ? { ...sf, state_apportionment_factor: targetCa / targetTotal }
+                  : sf.state_code === 'AZ'
+                  ? { ...sf, state_apportionment_factor: targetAz / targetTotal }
+                  : sf
+              ),
+            }
+      );
+      const pushedComp = calculateSixYearPlan(pushedSetup, pushedYears);
+      const y26Pushed = pushedComp.find((c) => c.tax_year === 2026)!;
+      const hTotal = rowTotalRev.computeCell(y26Pushed, 1, pushedComp, pushedSetup).numericValue;
+      const hCa = rowCaRev.computeCell(y26Pushed, 1, pushedComp, pushedSetup).numericValue;
+      const hAz = rowAzRev.computeCell(y26Pushed, 1, pushedComp, pushedSetup).numericValue;
+
+      const syncedHorizonPnl = reconcilePnlStateToHorizonRevenue(cadencePnlState, y26Pushed);
+      const cpaSec1 = calculatePnlBalanceSheet(
+        syncedHorizonPnl,
+        pushedComp[0],
+        y26Pushed,
+        pushedSetup,
+        { respectStateRetirementRemaining: true }
+      );
+      const cpaSec4 = buildCpaHorizonSummary(pushedSetup, pushedComp);
+      const sec4Rev26 = cpaSec4.rows
+        .find((r) => r.id === 'gross_receipts')!
+        .cells.find((c) => c.taxYear === 2026)!.numericValue;
+      const recon = computePnlVsHorizonReconciliation(
+        syncedHorizonPnl,
+        cpaSec1,
+        pushedComp,
+        pushedSetup
+      )!;
+      const grossMismatch = recon.mismatchedLines.find((m) => m.label === 'Gross Receipts');
+      const subLineTol = sc.centCarry ? 1 : 0;
+
+      if (
+        hTotal !== targetTotal ||
+        hCa !== targetCa ||
+        hAz !== targetAz ||
+        hCa + hAz !== hTotal ||
+        Math.round(cpaSec1.totalRevenue.projected) !== targetTotal ||
+        Math.abs(Math.round(cpaSec1.lines.ca_revenue.projected) - targetCa) > subLineTol ||
+        Math.abs(Math.round(cpaSec1.lines.az_revenue.projected) - targetAz) > subLineTol ||
+        sec4Rev26 !== targetTotal ||
+        grossMismatch
+      ) {
+        push(
+          'Boundary B20',
+          2026,
+          `2026 revenue reconciliation drift (${sc.label}): target=${targetCa}+${targetAz}=${targetTotal}, horizon=${hCa}+${hAz}=${hTotal}, sec1=${cpaSec1.lines.ca_revenue.projected}+${cpaSec1.lines.az_revenue.projected}=${cpaSec1.totalRevenue.projected}, sec4=${sec4Rev26}`
+        );
+      }
+
+      // Stale pnl_balance_sheet ($344,407.68) opened from Horizon ($346,028) must auto-sync to $0 variance
+      const stalePnl = {
+        ...cadencePnlState,
+        pnl: {
+          ...cadencePnlState.pnl,
+          ca_revenue: { ytd: 100000, remaining: 26922.85 },
+          az_revenue: { ytd: 170000, remaining: 47484.83 },
+        },
+      };
+      const autoSynced = reconcilePnlStateToHorizonRevenue(stalePnl, y26Pushed);
+      const autoSec1 = calculatePnlBalanceSheet(autoSynced, pushedComp[0], y26Pushed, pushedSetup, {
+        respectStateRetirementRemaining: true,
+      });
+      if (
+        Math.round(autoSec1.totalRevenue.projected) !== hTotal ||
+        Math.round(autoSec1.lines.ca_revenue.projected) !== hCa ||
+        Math.round(autoSec1.lines.az_revenue.projected) !== hAz
+      ) {
+        push(
+          'Boundary B20',
+          2026,
+          `Stale Horizon CPA P&L failed to reconcile (${sc.label}): sec1=${autoSec1.lines.ca_revenue.projected}+${autoSec1.lines.az_revenue.projected} vs horizon=${hCa}+${hAz}`
+        );
+      }
+    }
+
+    // 2026 Snapshot / Horizon / CPA Reconciliation Check (DBP $61k -> $73k, PTE ON, K-1 OBI, Stock Basis = $0)
+    const dirty2026State = createInitialBaselineState();
+    const polluted2026: PlannerState = {
+      ...dirty2026State,
+      years: dirty2026State.years.map((yr) =>
+        yr.tax_year !== 2026
+          ? yr
+          : {
+              ...yr,
+              form_1040: {
+                ...yr.form_1040,
+                schedule_k1_ordinary_income: 91498, // intentionally stale 2025 figure
+              },
+              scorp_1120s: {
+                ...yr.scorp_1120s,
+                pte_election_active: false, // intentionally mismatched with state_pte_elected: true
+                stock_basis_beginning: 11016, // intentionally stale 2025 beginning basis
+              },
+              dbp_and_retirement: {
+                ...yr.dbp_and_retirement,
+                dbp_actual_contribution: 73000,
+              },
+              state_filings: yr.state_filings.map((sf) => ({
+                ...sf,
+                state_pte_elected: sf.state_code === 'CA' || sf.state_code === 'AZ',
+              })),
+            }
+      ),
+      pnl_balance_sheet: dirty2026State.pnl_balance_sheet
+        ? {
+            ...dirty2026State.pnl_balance_sheet,
+            pnl: {
+              ...dirty2026State.pnl_balance_sheet.pnl,
+              dbp_contribution: { ytd: 0, remaining: 61000 }, // intentionally stale $61k
+            },
+            balance_sheet: {
+              ...dirty2026State.pnl_balance_sheet.balance_sheet,
+              beginning_stock_basis_override: 11016, // intentionally stale 2025 beginning basis
+            },
+          }
+        : undefined,
+    };
+
+    const reconciled2026 = normalizePlannerState(polluted2026);
+    const reconciledComp = calculateSixYearPlan(reconciled2026.setup, reconciled2026.years);
+    const recY25 = reconciledComp[0];
+    const recY26 = reconciledComp[1];
+    const rawY26 = reconciled2026.years[1];
+
+    if (
+      rawY26.form_1040.schedule_k1_ordinary_income !== recY26.scorp_out.ordinary_business_income_1120s ||
+      rawY26.form_1040.schedule_k1_ordinary_income === 91498
+    ) {
+      push(
+        'Boundary B20',
+        2026,
+        `2026 schedule_k1_ordinary_income stale or mismatched: raw=${rawY26.form_1040.schedule_k1_ordinary_income}, computed=${recY26.scorp_out.ordinary_business_income_1120s}`
+      );
+    }
+    if (rawY26.scorp_1120s.pte_election_active !== true) {
+      push(
+        'Boundary B20',
+        2026,
+        `2026 pte_election_active must sync to true when CA/AZ state_pte_elected is true`
+      );
+    }
+    const pnlDbp26 = reconciled2026.pnl_balance_sheet!.pnl.dbp_contribution;
+    if (Math.round(pnlDbp26.ytd + pnlDbp26.remaining) !== 73000) {
+      push(
+        'Boundary B20',
+        2026,
+        `2026 P&L dbp_contribution must reconcile to $73,000, got ${pnlDbp26.ytd + pnlDbp26.remaining}`
+      );
+    }
+    if (rawY26.scorp_1120s.stock_basis_beginning !== recY25.scorp_out.stock_basis_ending || recY25.scorp_out.stock_basis_ending !== 0) {
+      push(
+        'Boundary B20',
+        2026,
+        `2026 stock_basis_beginning must equal 2025 ending basis ($0), got raw=${rawY26.scorp_1120s.stock_basis_beginning}, y25End=${recY25.scorp_out.stock_basis_ending}`
+      );
+    }
+    if (reconciled2026.pnl_balance_sheet!.balance_sheet.beginning_stock_basis_override !== 0) {
+      push(
+        'Boundary B20',
+        2026,
+        `2026 P&L Balance Sheet beginning_stock_basis_override must reconcile to $0, got ${reconciled2026.pnl_balance_sheet!.balance_sheet.beginning_stock_basis_override}`
+      );
+    }
+    // Verify Working P&L pre-PTE OBI - Entity PTE Tax Deduction = Horizon K-1 OBI bridge
+    // Align P&L SEHI & Payroll Taxes to Horizon (matching a pushed Cadence/P&L -> Horizon state)
+    const cpaPnlBase26 = reconcilePnlStateToHorizonRevenue(
+      reconciled2026.pnl_balance_sheet!,
+      recY26,
+      reconciled2026.setup
+    );
+    const cpaPnl26 = {
+      ...cpaPnlBase26,
+      pnl: {
+        ...cpaPnlBase26.pnl,
+        sehi_medicare: {
+          ytd: cpaPnlBase26.pnl.sehi_medicare.ytd,
+          remaining: Math.round((recY26.form_1040_out.sehi_medicare_premiums_effective - cpaPnlBase26.pnl.sehi_medicare.ytd) * 100) / 100,
+        },
+        payroll_taxes: {
+          ytd: cpaPnlBase26.pnl.payroll_taxes.ytd,
+          remaining: Math.round((recY26.scorp_out.employer_payroll_taxes - cpaPnlBase26.pnl.payroll_taxes.ytd) * 100) / 100,
+        },
+      },
+    };
+    const cpaPnlComp26 = calculatePnlBalanceSheet(
+      cpaPnl26,
+      recY25,
+      recY26,
+      reconciled2026.setup,
+      { respectStateRetirementRemaining: true }
+    );
+    const cpaRecon26 = computePnlVsHorizonReconciliation(
+      cpaPnl26,
+      cpaPnlComp26,
+      reconciledComp,
+      reconciled2026.setup
+    )!;
+    if (
+      cpaRecon26.pteEntityTaxDeduction <= 0 ||
+      Math.abs((cpaRecon26.pnlObi - cpaRecon26.pteEntityTaxDeduction) - cpaRecon26.horizonObi) > 1
+    ) {
+      push(
+        'Boundary B20',
+        2026,
+        `Working P&L vs Horizon K-1 OBI PTE bridge mismatch: pnlObi=${cpaRecon26.pnlObi}, pte=${cpaRecon26.pteEntityTaxDeduction}, horizonObi=${cpaRecon26.horizonObi}, var=${cpaRecon26.obiAfterPteVariance}`
+      );
+    }
+    // Verify v3.0 JSON snapshot export & re-import preserves all reconciled 2026 fields with $0 variance
+    const exported26 = serializeSingleProfileBackup({
+      id: 'b20-recon-2026',
+      name: '2026 Reconciled Snapshot',
+      entity_name: polluted2026.setup.business_name || '',
+      entity_ein: polluted2026.setup.business_ein || '',
+      notes: 'B20 Verification',
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+      state: polluted2026, // even passing un-reconciled state to export must auto-reconcile before serialization!
+    });
+    try {
+      const parsed26 = parseAndValidateProfileSnapshot(exported26);
+      const imp26State = parsed26.profiles[0].state;
+      const impY26 = imp26State.years[1];
+      const impDbp = imp26State.pnl_balance_sheet!.pnl.dbp_contribution;
+      if (
+        impY26.form_1040.schedule_k1_ordinary_income !== recY26.scorp_out.ordinary_business_income_1120s ||
+        impY26.scorp_1120s.pte_election_active !== true ||
+        impY26.scorp_1120s.stock_basis_beginning !== 0 ||
+        Math.round(impDbp.ytd + impDbp.remaining) !== 73000
+      ) {
+        push(
+          'Boundary B20',
+          2026,
+          `v3.0 JSON export/import failed to preserve reconciled 2026 fields: k1=${impY26.form_1040.schedule_k1_ordinary_income}, pte=${impY26.scorp_1120s.pte_election_active}, basis=${impY26.scorp_1120s.stock_basis_beginning}, pnlDbp=${impDbp.ytd + impDbp.remaining}`
+        );
+      }
+    } catch (err) {
+      push(
+        'Boundary B20',
+        2026,
+        `2026 snapshot export/import failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
+    // 2026 Category/State Revenue Aggregation Parity:
+    // Consulting - Debra (CA) $130,320.00 + Consulting - Bill (AZ) $213,902.50 + Services - Bill (AZ) $1,805.21 = $346,027.71
+    // Starting from stale Horizon ($126,923 CA / $217,485 AZ = $344,408) + 3-state CA/AZ/WA setup
+    const revBase = createInitialBaselineState();
+    const staleHorizonSetup: SetupConfig = {
+      ...revBase.setup,
+      state_revenue_apportionment: {
+        states: ['CA', 'AZ', 'WA'],
+        default_split: { CA: 37, AZ: 60, WA: 3 },
+        year_overrides: { 2026: { CA: 36.9, AZ: 63.1, WA: 0 } },
+      },
+    };
+    const staleHorizonYears = revBase.years.map((yr) =>
+      yr.tax_year !== 2026
+        ? yr
+        : {
+            ...yr,
+            scorp_1120s: {
+              ...yr.scorp_1120s,
+              ca_revenue: 126923,
+              az_revenue: 217485,
+              gross_receipts_revenue: 344408,
+            },
+          }
+    );
+    const staleComp = calculateSixYearPlan(staleHorizonSetup, staleHorizonYears);
+    const exactCadence = {
+      projection_year: 2026,
+      source_label: '2026 QBO General Ledger',
+      ledger_format: 'general_ledger' as const,
+      as_of_date: '2026-11-26',
+      grouping_mode: 'category' as const,
+      exp_smooth_alpha: 0.5,
+      exp_smooth_day_fraction: false,
+      payee_aliases: [],
+      transactions: [
+        {
+          id: 'rev-ca-1',
+          date: '2026-06-15',
+          transaction_type: 'Deposit',
+          num: '',
+          vendor: 'CA Client',
+          memo: '',
+          account: 'Consulting - Debra (CA)',
+          split_account: 'Checking',
+          amount: 130320.0,
+        },
+        {
+          id: 'rev-az-1',
+          date: '2026-06-15',
+          transaction_type: 'Deposit',
+          num: '',
+          vendor: 'AZ Client',
+          memo: '',
+          account: 'Consulting - Bill (AZ)',
+          split_account: 'Checking',
+          amount: 213902.5,
+        },
+        {
+          id: 'rev-az-2',
+          date: '2026-06-15',
+          transaction_type: 'Deposit',
+          num: '',
+          vendor: 'AZ Services Client',
+          memo: '',
+          account: 'Services - Bill (AZ)',
+          split_account: 'Checking',
+          amount: 1805.21,
+        },
+      ],
+      stream_overrides: {},
+      pnl_line_overrides: {},
+      balance_sheet: revBase.pnl_balance_sheet!.balance_sheet,
+    };
+    const exactFc = computeCadenceForecast(exactCadence, staleComp[0], staleComp[1], staleHorizonSetup);
+    const revAgg = aggregateCadenceStateRevenue(exactFc, true);
+    if (
+      revAgg.caProjected !== 130320 ||
+      revAgg.azProjected !== 215707.71 ||
+      revAgg.totalProjected !== 346027.71 ||
+      revAgg.horizonCa !== 130320 ||
+      revAgg.horizonAz !== 215708 ||
+      revAgg.horizonTotal !== 346028
+    ) {
+      push(
+        'Boundary B20',
+        2026,
+        `Cadence category/state revenue aggregation drift: ca=${revAgg.caProjected}, az=${revAgg.azProjected}, total=${revAgg.totalProjected}, horizon=${revAgg.horizonCa}+${revAgg.horizonAz}=${revAgg.horizonTotal}`
+      );
+    }
+
+    // Push into 3-state setup & reload via normalizePlannerState (zero drift allowed!)
+    const primaryPctPush = Math.round((revAgg.horizonCa / revAgg.horizonTotal) * 1000) / 10;
+    const secondaryPctPush = Math.round((100 - primaryPctPush) * 10) / 10;
+    const pushed3StateSetup = updateYearStateApportionmentSplit(staleHorizonSetup, 2026, {
+      CA: primaryPctPush,
+      AZ: secondaryPctPush,
+      WA: 0,
+    });
+    const pushed3StateYears = staleHorizonYears.map((yr) =>
+      yr.tax_year !== 2026
+        ? yr
+        : {
+            ...yr,
+            scorp_1120s: {
+              ...yr.scorp_1120s,
+              ca_revenue: revAgg.horizonCa,
+              az_revenue: revAgg.horizonAz,
+              gross_receipts_revenue: revAgg.horizonTotal,
+            },
+            state_filings: yr.state_filings.map((sf) =>
+              sf.state_code === 'CA'
+                ? { ...sf, state_apportionment_factor: revAgg.horizonCa / revAgg.horizonTotal }
+                : sf.state_code === 'AZ'
+                ? { ...sf, state_apportionment_factor: revAgg.horizonAz / revAgg.horizonTotal }
+                : sf
+            ),
+          }
+    );
+    const pushed3StateNorm = normalizePlannerState({
+      ...revBase,
+      setup: pushed3StateSetup,
+      years: pushed3StateYears,
+      pnl_balance_sheet: exactFc.synthesizedPnlState,
+      cadence_forecaster: exactCadence,
+    });
+    const pushed3Comp = calculateSixYearPlan(pushed3StateNorm.setup, pushed3StateNorm.years);
+    const p3Y26 = pushed3Comp[1];
+    const p3SyncedPnl = reconcilePnlStateToHorizonRevenue(
+      pushed3StateNorm.pnl_balance_sheet!,
+      p3Y26,
+      pushed3StateNorm.setup
+    );
+    const p3CpaSec1 = calculatePnlBalanceSheet(
+      p3SyncedPnl,
+      pushed3Comp[0],
+      p3Y26,
+      pushed3StateNorm.setup,
+      { respectStateRetirementRemaining: true }
+    );
+    const p3CpaSec4 = buildCpaHorizonSummary(pushed3StateNorm.setup, pushed3Comp);
+    const p3Sec4Gross = p3CpaSec4.rows
+      .find((r) => r.id === 'gross_receipts')!
+      .cells.find((c) => c.taxYear === 2026)!.numericValue;
+    const p3Recon = computePnlVsHorizonReconciliation(
+      p3SyncedPnl,
+      p3CpaSec1,
+      pushed3Comp,
+      pushed3StateNorm.setup
+    )!;
+    const p3RevMismatches = p3Recon.mismatchedLines.filter(
+      (m) => m.label === 'Gross Receipts' || m.label.includes('S-Corp Revenue')
+    );
+
+    if (
+      p3Y26.scorp_in.gross_receipts_revenue !== 346028 ||
+      p3Y26.scorp_in.ca_revenue !== 130320 ||
+      p3Y26.scorp_in.az_revenue !== 215708 ||
+      p3CpaSec1.lines.ca_revenue.projected !== 130320 ||
+      p3CpaSec1.lines.az_revenue.projected !== 215707.71 ||
+      p3CpaSec1.totalRevenue.projected !== 346027.71 ||
+      p3Sec4Gross !== 346028 ||
+      p3RevMismatches.length > 0
+    ) {
+      push(
+        'Boundary B20',
+        2026,
+        `3-view $346,027.71 push mismatch: horizon=${p3Y26.scorp_in.ca_revenue}+${p3Y26.scorp_in.az_revenue}=${p3Y26.scorp_in.gross_receipts_revenue}, sec1=${p3CpaSec1.lines.ca_revenue.projected}+${p3CpaSec1.lines.az_revenue.projected}=${p3CpaSec1.totalRevenue.projected}, sec4=${p3Sec4Gross}, mismatches=${p3RevMismatches.map((m) => m.label).join(',')}`
+      );
+    }
+
+    // Verify 0.4% split drift (37.4% vs 37.0% default) is preserved by normalizePlannerState without re-splitting
+    const legacyNoSplitState: PlannerState = {
+      ...revBase,
+      setup: { ...revBase.setup, state_revenue_apportionment: undefined },
+      years: revBase.years.map((yr) =>
+        yr.tax_year !== 2026
+          ? yr
+          : {
+              ...yr,
+              scorp_1120s: {
+                ...yr.scorp_1120s,
+                ca_revenue: 129414, // 37.4% of $346,028
+                az_revenue: 216614,
+                gross_receipts_revenue: 346028,
+              },
+            }
+      ),
+    };
+    const norm04 = normalizePlannerState(legacyNoSplitState);
+    const comp04 = calculateSixYearPlan(norm04.setup, norm04.years);
+    if (comp04[1].scorp_in.ca_revenue !== 129414 || comp04[1].scorp_in.az_revenue !== 216614) {
+      push(
+        'Boundary B20',
+        2026,
+        `normalizePlannerState silently re-split 37.4% CA/AZ revenue: got ${comp04[1].scorp_in.ca_revenue}/${comp04[1].scorp_in.az_revenue} expected 129414/216614`
+      );
+    }
   });
 
   return count;
@@ -1796,7 +2506,7 @@ if (isDirectCliRun) {
     );
     process.exit(1);
   } else {
-    console.log('ALL 195/195 CASES PASSED ALL 5 UNIVERSAL INVARIANTS WITH ZERO FAILURES.');
+    console.log('ALL 195/195 CASES PASSED ALL 6 UNIVERSAL INVARIANTS WITH ZERO FAILURES.');
     process.exit(0);
   }
 }

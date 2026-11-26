@@ -50,18 +50,14 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
         state_code: sf.state_code,
         apportionment_percent: Math.round(sf.state_apportionment_factor * 100),
       }));
-      const anyStatePteElected = nextFilings.some(
-        (sf) => sf.state_pte_elected && Boolean(STATE_TAX_RULES[sf.state_code]?.pteAvailable)
-      );
+      const anyStatePteElected = nextFilings.some((sf) => Boolean(sf.state_pte_elected));
       return {
         ...prev,
         state_filings: nextFilings,
         scorp_1120s: {
           ...prev.scorp_1120s,
           state_sourcing_breakdown: nextSourcing,
-          ...(patch.state_pte_elected !== undefined
-            ? { pte_election_active: anyStatePteElected }
-            : {}),
+          pte_election_active: anyStatePteElected,
         },
       };
     });

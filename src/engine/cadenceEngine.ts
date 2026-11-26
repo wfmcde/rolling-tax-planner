@@ -3046,6 +3046,93 @@ export function computeCadenceForecast(
   };
 }
 
+export interface CadenceStateRevenueAggregation {
+  projectionYear: number;
+  caYtd: number;
+  caRemaining: number;
+  caProjected: number;
+  azYtd: number;
+  azRemaining: number;
+  azProjected: number;
+  totalYtd: number;
+  totalRemaining: number;
+  totalProjected: number;
+  /** Whole-dollar 2026 Horizon push targets guaranteed to satisfy horizonCa + horizonAz === horizonTotal */
+  horizonCa: number;
+  horizonAz: number;
+  horizonTotal: number;
+  /** Direct sum of active Section 1 cadence streams mapped to primary/secondary state revenue */
+  streamSumCa: number;
+  streamSumAz: number;
+  streamSumTotal: number;
+  /** True if Section 2 P&L revenue overrides diverge from Section 1 stream sums */
+  hasRevenueLineOverride: boolean;
+}
+
+/**
+ * Single authoritative category/state revenue aggregator shared by Transaction Cadence Forecast,
+ * Push Forecast to 6-Year Horizon, Horizon drift detection, and the CPA Year-End Projection Package.
+ * Sums every active primary-state stream (e.g. Consulting - Debra (CA)) into ca_revenue and every
+ * secondary-state stream (e.g. Consulting - Bill (AZ) + Services - Bill (AZ)) into az_revenue.
+ */
+export function aggregateCadenceStateRevenue(
+  forecast: ComputedCadenceForecast,
+  hasSecondaryState = true
+): CadenceStateRevenueAggregation {
+  let streamSumCa = 0;
+  let streamSumAz = 0;
+  for (const s of forecast.streams) {
+    const projected = round2(s.ytdAmount + s.effectiveRemainingAmount);
+    if (s.targetLineId === 'ca_revenue') {
+      streamSumCa = round2(streamSumCa + projected);
+    } else if (s.targetLineId === 'az_revenue') {
+      streamSumAz = round2(streamSumAz + projected);
+    }
+  }
+  const streamSumTotal = round2(streamSumCa + streamSumAz);
+
+  const caLine = forecast.pnlComputed.lines.ca_revenue;
+  const azLine = forecast.pnlComputed.lines.az_revenue;
+  const caYtd = round2(caLine.ytd);
+  const caRemaining = round2(caLine.remaining);
+  const caProjected = round2(caLine.projected);
+  const azYtd = round2(azLine.ytd);
+  const azRemaining = round2(azLine.remaining);
+  const azProjected = round2(azLine.projected);
+  const totalYtd = round2(caYtd + azYtd);
+  const totalRemaining = round2(caRemaining + azRemaining);
+  const totalProjected = round2(forecast.pnlComputed.totalRevenue.projected);
+
+  const horizonTotal = Math.round(Math.max(0, totalProjected));
+  const horizonCa = hasSecondaryState
+    ? Math.min(horizonTotal, Math.round(Math.max(0, caProjected)))
+    : horizonTotal;
+  const horizonAz = hasSecondaryState ? Math.max(0, horizonTotal - horizonCa) : 0;
+
+  const hasRevenueLineOverride =
+    Math.abs(caProjected - streamSumCa) >= 0.01 || Math.abs(azProjected - streamSumAz) >= 0.01;
+
+  return {
+    projectionYear: forecast.projectionYear,
+    caYtd,
+    caRemaining,
+    caProjected,
+    azYtd,
+    azRemaining,
+    azProjected,
+    totalYtd,
+    totalRemaining,
+    totalProjected,
+    horizonCa,
+    horizonAz,
+    horizonTotal,
+    streamSumCa,
+    streamSumAz,
+    streamSumTotal,
+    hasRevenueLineOverride,
+  };
+}
+
 // ============================================================================
 // Initial Cadence State Builders (Isolated per Active Workspace Profile)
 // ============================================================================

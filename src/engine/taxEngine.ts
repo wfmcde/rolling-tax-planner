@@ -985,16 +985,21 @@ export function calculateSixYearPlan(
     let ordinaryIncome1120s = 0;
     const pteTaxPaidByState: Record<string, number> = {};
     let pteTaxPaidTotal = 0;
-    const stockBasisBeginning: number =
-      i === 0 || runningStockBasis === null
-        ? scorpIn.stock_basis_beginning
-        : runningStockBasis;
-    const stateStockBasisBeginning: number =
-      i === 0 || runningStateStockBasis === null
-        ? scorpIn.stock_basis_beginning
-        : runningStateStockBasis;
-    const aaaBeginning: number =
-      i === 0 || runningAaa === null ? scorpIn.aaa_balance_beginning : runningAaa;
+    const stockBasisBeginning: number = !setup.has_scorp
+      ? 0
+      : i === 0 || runningStockBasis === null
+      ? scorpIn.stock_basis_beginning
+      : runningStockBasis;
+    const stateStockBasisBeginning: number = !setup.has_scorp
+      ? 0
+      : i === 0 || runningStateStockBasis === null
+      ? scorpIn.stock_basis_beginning
+      : runningStateStockBasis;
+    const aaaBeginning: number = !setup.has_scorp
+      ? 0
+      : i === 0 || runningAaa === null
+      ? scorpIn.aaa_balance_beginning
+      : runningAaa;
     let stockBasisAdditions = 0;
     let stockBasisReductions = 0;
     let stockBasisEnding: number = stockBasisBeginning;
@@ -1026,14 +1031,29 @@ export function calculateSixYearPlan(
       resolvedSetupSplit.activeStates.length > 0 &&
       !hasExternalScenarioStateApportionment;
 
+    const rawTotalRevenue = rawPrimaryRevenue + rawSecondaryRevenue;
+    const rawMatchesSetupSplit =
+      hasSplitRev &&
+      resolvedSetupSplit.hasSecondary &&
+      rawTotalRevenue > 0 &&
+      resolvedSetupSplit.primaryPct + resolvedSetupSplit.secondaryPct >= 99.95 &&
+      Math.abs(
+        Math.round((rawPrimaryRevenue / rawTotalRevenue) * 1000) / 10 -
+          resolvedSetupSplit.primaryPct
+      ) <= 0.05;
+
     const caRevenue = useSetupApportionment
       ? resolvedSetupSplit.hasSecondary
-        ? round0(effectiveGrossRevenue * resolvedSetupSplit.primaryRatio)
+        ? rawMatchesSetupSplit
+          ? rawPrimaryRevenue
+          : round0(effectiveGrossRevenue * resolvedSetupSplit.primaryRatio)
         : effectiveGrossRevenue
       : rawPrimaryRevenue;
     const azRevenue = useSetupApportionment
       ? resolvedSetupSplit.hasSecondary
-        ? Math.max(0, effectiveGrossRevenue - caRevenue)
+        ? rawMatchesSetupSplit
+          ? rawSecondaryRevenue
+          : Math.max(0, effectiveGrossRevenue - caRevenue)
         : 0
       : rawSecondaryRevenue;
 
@@ -1045,6 +1065,17 @@ export function calculateSixYearPlan(
     const getEffectiveApportionment = (stateCode: string, fallback: number): number => {
       if (hasExternalScenarioStateApportionment) return fallback;
       if (useSetupApportionment) {
+        if (rawMatchesSetupSplit) {
+          if (stateCode === resolvedSetupSplit.primaryCode && livePrimaryApportionment !== null) {
+            return livePrimaryApportionment;
+          }
+          if (
+            stateCode === resolvedSetupSplit.secondaryCode &&
+            liveSecondaryApportionment !== null
+          ) {
+            return liveSecondaryApportionment;
+          }
+        }
         if (Object.prototype.hasOwnProperty.call(resolvedSetupSplit.split, stateCode)) {
           return (resolvedSetupSplit.split[stateCode] ?? 0) / 100;
         }
@@ -1945,7 +1976,9 @@ export function calculateSixYearPlan(
     const syncedBreakdown = useSetupApportionment
       ? resolvedSetupSplit.activeStates.map((code) => ({
           state_code: code,
-          apportionment_percent: resolvedSetupSplit.split[code] ?? 0,
+          apportionment_percent: rawMatchesSetupSplit
+            ? Number((getEffectiveApportionment(code, 0) * 100).toFixed(2))
+            : resolvedSetupSplit.split[code] ?? 0,
         }))
       : scorpIn.state_sourcing_breakdown.map((b) => {
           const eff = getEffectiveApportionment(b.state_code, b.apportionment_percent / 100);

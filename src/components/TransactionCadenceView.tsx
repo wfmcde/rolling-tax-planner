@@ -56,6 +56,7 @@ import {
 import { getSetupBusinessIdentity, getSetupStates } from '../utils/setupHelpers';
 import {
   DEFAULT_EXP_SMOOTH_ALPHA,
+  aggregateCadenceStateRevenue,
   buildStateFromImportedTransactions,
   clampExpSmoothAlpha,
   computeCadenceForecast,
@@ -435,6 +436,37 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
   const pnlState = forecast.synthesizedPnlState;
   const bs = pnlState.balance_sheet;
 
+  const hasSecondaryRevenue = Boolean(
+    setup.multi_state_active || secondaryStateCode || computed.lines.az_revenue.projected > 0
+  );
+  const cadenceRevenue = useMemo(
+    () => aggregateCadenceStateRevenue(forecast, hasSecondaryRevenue),
+    [forecast, hasSecondaryRevenue]
+  );
+  const horizonRevenueDrift = useMemo(() => {
+    if (!year2026Computed || !setup.has_scorp) return null;
+    if (cadenceState.transactions.length === 0 && cadenceRevenue.horizonTotal === 0) return null;
+    const hTotal = Math.round(year2026Computed.scorp_in.gross_receipts_revenue);
+    const hCa = Math.round(year2026Computed.scorp_in.ca_revenue);
+    const hAz = Math.round(year2026Computed.scorp_in.az_revenue);
+    const hasDrift =
+      Math.abs(cadenceRevenue.horizonTotal - hTotal) >= 1 ||
+      Math.abs(cadenceRevenue.horizonCa - hCa) >= 1 ||
+      (hasSecondaryRevenue && Math.abs(cadenceRevenue.horizonAz - hAz) >= 1);
+    if (!hasDrift) return null;
+    return {
+      horizonTotal: hTotal,
+      horizonCa: hCa,
+      horizonAz: hAz,
+    };
+  }, [
+    year2026Computed,
+    setup.has_scorp,
+    cadenceState.transactions.length,
+    cadenceRevenue,
+    hasSecondaryRevenue,
+  ]);
+
   const lineLabelMap = useMemo(() => {
     const map = new Map<PnlLineId, string>();
     for (const item of PNL_OPERATING_ITEMS) {
@@ -590,6 +622,31 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     });
   };
 
+  const clearPnlOverridesForStreamKeys = (
+    prevOverrides: CadenceForecasterState['pnl_line_overrides'],
+    streamKeys: string[]
+  ): CadenceForecasterState['pnl_line_overrides'] => {
+    if (!prevOverrides || Object.keys(prevOverrides).length === 0) return prevOverrides;
+    const affectedLines = new Set<PnlLineId>();
+    for (const key of streamKeys) {
+      const match =
+        forecast.streams.find((s) => s.streamKey === key) ??
+        forecast.categoryStreams.find((s) => s.streamKey === key) ??
+        forecast.granularStreams.find((s) => s.streamKey === key);
+      if (match) affectedLines.add(match.targetLineId);
+    }
+    if (affectedLines.size === 0) return prevOverrides;
+    let changed = false;
+    const next = { ...prevOverrides };
+    for (const lineId of affectedLines) {
+      if (next[lineId] !== undefined) {
+        delete next[lineId];
+        changed = true;
+      }
+    }
+    return changed ? next : prevOverrides;
+  };
+
   // Stream mode / manual override handlers
   const handleStreamModeChange = (
     streamKey: string,
@@ -605,6 +662,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
             ? { mode: 'manual', manual_remaining: round2(currentRemaining) }
             : { mode },
       },
+      pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, [streamKey]),
     }));
     if (mode === 'manual') {
       setActiveEdit({ key: `stream:${streamKey}`, draft: String(round2(currentRemaining)) });
@@ -621,6 +679,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
         ...prev.stream_overrides,
         [streamKey]: { mode: 'manual', manual_remaining: parsed },
       },
+      pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, [streamKey]),
     }));
   };
 
@@ -628,30 +687,46 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
     onUpdateCadenceState((prev) => {
       const next = { ...prev.stream_overrides };
       delete next[streamKey];
-      return { ...prev, stream_overrides: next };
+      return {
+        ...prev,
+        stream_overrides: next,
+        pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, [streamKey]),
+      };
     });
   };
 
   // Monthly Exponential Smoothing controls
   const handleAlphaChange = (rawAlpha: number) => {
     const clamped = clampExpSmoothAlpha(rawAlpha);
+    const affectedKeys = forecast.streams
+      .filter((s) => s.activeMode === 'exp_smooth')
+      .map((s) => s.streamKey);
     onUpdateCadenceState((prev) => ({
       ...prev,
       exp_smooth_alpha: clamped,
+      pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, affectedKeys),
     }));
   };
 
   const handleResetAlpha = () => {
+    const affectedKeys = forecast.streams
+      .filter((s) => s.activeMode === 'exp_smooth')
+      .map((s) => s.streamKey);
     onUpdateCadenceState((prev) => ({
       ...prev,
       exp_smooth_alpha: DEFAULT_EXP_SMOOTH_ALPHA,
+      pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, affectedKeys),
     }));
   };
 
   const handleToggleDayFraction = (checked: boolean) => {
+    const affectedKeys = forecast.streams
+      .filter((s) => s.activeMode === 'exp_smooth')
+      .map((s) => s.streamKey);
     onUpdateCadenceState((prev) => ({
       ...prev,
       exp_smooth_day_fraction: checked,
+      pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, affectedKeys),
     }));
   };
 
@@ -688,6 +763,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
       return {
         ...prev,
         stream_overrides: nextOverrides,
+        pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, [streamKey]),
       };
     });
   };
@@ -709,30 +785,36 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
 
   const handleApplyExpSmoothToVariable = () => {
     if (variableEligibleStreams.length === 0) return;
+    const affectedKeys: string[] = [];
     onUpdateCadenceState((prev) => {
       const nextOverrides = { ...prev.stream_overrides };
       for (const s of variableEligibleStreams) {
         if (nextOverrides[s.streamKey]?.mode === 'manual') continue;
         nextOverrides[s.streamKey] = { mode: 'exp_smooth' };
+        affectedKeys.push(s.streamKey);
       }
       return {
         ...prev,
         stream_overrides: nextOverrides,
+        pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, affectedKeys),
       };
     });
   };
 
   const handleRevertVariableToRunRate = () => {
+    const affectedKeys: string[] = [];
     onUpdateCadenceState((prev) => {
       const nextOverrides = { ...prev.stream_overrides };
       for (const s of variableEligibleStreams) {
         if (nextOverrides[s.streamKey]?.mode === 'exp_smooth') {
           delete nextOverrides[s.streamKey];
+          affectedKeys.push(s.streamKey);
         }
       }
       return {
         ...prev,
         stream_overrides: nextOverrides,
+        pnl_line_overrides: clearPnlOverridesForStreamKeys(prev.pnl_line_overrides, affectedKeys),
       };
     });
   };
@@ -1199,6 +1281,44 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Unpushed Forecast vs. Six-Year Horizon Revenue Sync Notice */}
+      {horizonRevenueDrift && (
+        <div className="no-print bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 text-xs text-amber-950 min-w-0 flex-1">
+            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+            <span className="leading-snug">
+              <strong className="font-semibold">
+                Unpushed {pnlState.projection_year} Revenue Variance vs. Six-Year Horizon:
+              </strong>{' '}
+              Cadence Forecast projects{' '}
+              <span className="font-mono font-semibold tabular-nums">
+                {formatCurrencyExact(cadenceRevenue.totalProjected)}
+              </span>
+              {hasSecondaryRevenue
+                ? ` (${pCode} ${formatCurrencyExact(cadenceRevenue.caProjected)} · ${sCode} ${formatCurrencyExact(cadenceRevenue.azProjected)})`
+                : ''}{' '}
+              while Six-Year Horizon currently holds{' '}
+              <span className="font-mono font-semibold tabular-nums">
+                {formatCurrency(horizonRevenueDrift.horizonTotal)}
+              </span>
+              {hasSecondaryRevenue
+                ? ` (${pCode} ${formatCurrency(horizonRevenueDrift.horizonCa)} · ${sCode} ${formatCurrency(horizonRevenueDrift.horizonAz)})`
+                : ''}
+              .
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={handlePush}
+            disabled={!canPushForecast}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-teal-800 rounded-md hover:bg-teal-900 disabled:opacity-45 transition-colors whitespace-nowrap shrink-0"
+          >
+            <Send className="w-3.5 h-3.5 shrink-0" />
+            <span>Push Forecast to 6-Year Horizon</span>
+          </button>
+        </div>
+      )}
 
       {/* Feedback Banner */}
       {bannerMessage && (
@@ -2919,8 +3039,14 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
               <span>
                 Proj. {pnlState.projection_year} Revenue:{' '}
                 <strong className="font-mono tabular-nums text-slate-900">
-                  {formatCurrencyExact(computed.totalRevenue.projected)}
+                  {formatCurrencyExact(cadenceRevenue.totalProjected)}
                 </strong>
+                {hasSecondaryRevenue && (
+                  <span className="ml-1.5 font-mono tabular-nums text-slate-500">
+                    ({pCode} {formatCurrencyExact(cadenceRevenue.caProjected)} · {sCode}{' '}
+                    {formatCurrencyExact(cadenceRevenue.azProjected)})
+                  </span>
+                )}
               </span>
               <span aria-hidden="true" className="text-slate-300">
                 ·
@@ -3804,6 +3930,7 @@ export const TransactionCadenceView: React.FC<TransactionCadenceViewProps> = ({
           onDownloadCsv={handleDownloadCsv}
           onExportShadowReturn={onExportShadowReturn}
           exportingShadowReturn={exportingShadowReturn}
+          onSyncHorizon={horizonRevenueDrift ? handlePush : undefined}
           onClose={() => setShowPrintModal(false)}
         />
       )}

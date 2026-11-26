@@ -563,20 +563,23 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
                 }
                 onChange={(e) => {
                   const checked = e.target.checked;
-                  onUpdateYear(yr.tax_year, (prev) => ({
-                    ...prev,
-                    scorp_1120s: {
-                      ...prev.scorp_1120s,
-                      pte_election_active: checked,
-                    },
-                    state_filings: prev.state_filings.map((sf) => {
+                  onUpdateYear(yr.tax_year, (prev) => {
+                    const nextFilings = prev.state_filings.map((sf) => {
                       const eligible = Boolean(STATE_TAX_RULES[sf.state_code]?.pteAvailable);
                       return {
                         ...sf,
                         state_pte_elected: checked ? eligible : false,
                       };
-                    }),
-                  }));
+                    });
+                    return {
+                      ...prev,
+                      scorp_1120s: {
+                        ...prev.scorp_1120s,
+                        pte_election_active: nextFilings.some((sf) => Boolean(sf.state_pte_elected)),
+                      },
+                      state_filings: nextFilings,
+                    };
+                  });
                 }}
                 className="h-4 w-4 rounded border-slate-300 text-teal-700"
               />

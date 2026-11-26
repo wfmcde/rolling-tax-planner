@@ -445,22 +445,36 @@ export function buildStandalonePrintHtml({
     pnlRecon && setup.has_scorp
       ? pnlRecon.isReconciled
         ? `<div class="recon-box recon-ok">
-      <strong>${e(pnlRecon.projectionYear)} Working P&amp;L &harr; ${e(pnlRecon.projectionYear)} Horizon Reconciled ($0 Variance):</strong>
-      Gross Receipts, OpEx, Officer W-2, SEHI, Payroll Taxes, DBP, 401(k), K-1 OBI, Capital Contributions, Draws &amp; Ending Stock Basis tie identically &middot; Reasonable Comp ${e(
-        pnlRecon.rcHorizonPct.toFixed(1)
-      )}%.
+      <strong>${e(pnlRecon.projectionYear)} Working P&amp;L &harr; ${e(pnlRecon.projectionYear)} Horizon Reconciled ($0 Operating Variance):</strong>
+      Gross Receipts, OpEx, Officer W-2, SEHI, Payroll Taxes, DBP, 401(k), Capital Contributions &amp; Draws tie identically${
+        pnlRecon.pteEntityTaxDeduction > 0
+          ? ` &middot; Pre-PTE Working P&amp;L OBI ${e(
+              formatCurrency(pnlRecon.pnlObi)
+            )} &minus; Entity PTE Deduction ${e(
+              formatCurrency(pnlRecon.pteEntityTaxDeduction)
+            )} = ${e(formatCurrency(pnlRecon.horizonObi))} Form 1120-S K-1 OBI`
+          : ' &middot; K-1 OBI &amp; Ending Stock Basis tie to $0'
+      } &middot; Reasonable Comp ${e(pnlRecon.rcHorizonPct.toFixed(1))}%.
     </div>`
         : `<div class="recon-box recon-delta">
       <strong>${e(pnlRecon.projectionYear)} Working P&amp;L vs. ${e(pnlRecon.projectionYear)} Horizon Variance Notice:</strong>
       Working P&amp;L reflects live bookkeeping/cadence projections not yet pushed to the ${e(
         pnlRecon.projectionYear
-      )} Horizon schedule (K-1 OBI delta ${e(
-            pnlRecon.obiVariance >= 0 ? '+' : ''
-          )}${e(formatCurrency(pnlRecon.obiVariance))}, Basis delta ${e(
-            pnlRecon.basisVariance >= 0 ? '+' : ''
-          )}${e(formatCurrency(pnlRecon.basisVariance))}, RC ${e(
-            pnlRecon.rcPnlPct.toFixed(1)
-          )}% vs. ${e(pnlRecon.rcHorizonPct.toFixed(1))}%). Section ${horizonSectionNum} below shows the authoritative ${e(
+      )} Horizon schedule (${
+            pnlRecon.pteEntityTaxDeduction > 0
+              ? `Pre-PTE OBI ${e(formatCurrency(pnlRecon.pnlObi))} &minus; Entity PTE ${e(
+                  formatCurrency(pnlRecon.pteEntityTaxDeduction)
+                )} vs. Horizon K-1 ${e(formatCurrency(pnlRecon.horizonObi))}, net delta ${e(
+                  pnlRecon.obiAfterPteVariance >= 0 ? '+' : ''
+                )}${e(formatCurrency(pnlRecon.obiAfterPteVariance))}`
+              : `K-1 OBI delta ${e(pnlRecon.obiVariance >= 0 ? '+' : '')}${e(
+                  formatCurrency(pnlRecon.obiVariance)
+                )}`
+          }, Basis delta ${e(pnlRecon.basisVariance >= 0 ? '+' : '')}${e(
+            formatCurrency(pnlRecon.basisVariance)
+          )}, RC ${e(pnlRecon.rcPnlPct.toFixed(1))}% vs. ${e(
+            pnlRecon.rcHorizonPct.toFixed(1)
+          )}%). Section ${horizonSectionNum} below shows the authoritative ${e(
             horizonSummary?.years[0] ?? 2025
           )}&ndash;${e(
             horizonSummary?.years[horizonSummary.years.length - 1] ?? 2030
@@ -1350,6 +1364,7 @@ interface CpaPrintPackageModalProps {
   onDownloadCsv: () => void;
   onExportShadowReturn?: () => void;
   exportingShadowReturn?: boolean;
+  onSyncHorizon?: () => void;
   onClose: () => void;
 }
 
@@ -1368,6 +1383,7 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
   onDownloadCsv,
   onExportShadowReturn,
   exportingShadowReturn,
+  onSyncHorizon,
   onClose,
 }) => {
   const { primaryName, spouseName } = getPersonNames(setup);
@@ -1845,11 +1861,18 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                   <>
                     <strong className="font-semibold">
                       {pnlRecon.projectionYear} Working P&amp;L ↔ {pnlRecon.projectionYear} Horizon
-                      Reconciled ($0 Variance):
+                      Reconciled ($0 Operating Variance):
                     </strong>{' '}
-                    Gross Receipts, OpEx, Officer W-2, SEHI, Payroll Taxes, DBP, 401(k), K-1 OBI,
-                    Capital Contributions, Draws &amp; Ending Stock Basis tie identically ·
-                    Reasonable Comp {pnlRecon.rcHorizonPct.toFixed(1)}%.
+                    Gross Receipts, OpEx, Officer W-2, SEHI, Payroll Taxes, DBP, 401(k), Capital
+                    Contributions &amp; Draws tie identically
+                    {pnlRecon.pteEntityTaxDeduction > 0
+                      ? ` · Pre-PTE Working P&L OBI ${formatCurrency(
+                          pnlRecon.pnlObi
+                        )} − Entity PTE Deduction ${formatCurrency(
+                          pnlRecon.pteEntityTaxDeduction
+                        )} = ${formatCurrency(pnlRecon.horizonObi)} Form 1120-S K-1 OBI`
+                      : ' · K-1 OBI & Ending Stock Basis tie to $0'}{' '}
+                    · Reasonable Comp {pnlRecon.rcHorizonPct.toFixed(1)}%.
                   </>
                 ) : (
                   <>
@@ -1858,15 +1881,33 @@ export const CpaPrintPackageModal: React.FC<CpaPrintPackageModalProps> = ({
                       Horizon Variance Notice:
                     </strong>{' '}
                     Working P&amp;L reflects live bookkeeping/cadence projections not yet pushed to
-                    the {pnlRecon.projectionYear} Horizon schedule (K-1 OBI delta{' '}
-                    {pnlRecon.obiVariance >= 0 ? '+' : ''}
-                    {formatCurrency(pnlRecon.obiVariance)}, Basis delta{' '}
-                    {pnlRecon.basisVariance >= 0 ? '+' : ''}
+                    the {pnlRecon.projectionYear} Horizon schedule (
+                    {pnlRecon.pteEntityTaxDeduction > 0
+                      ? `Pre-PTE OBI ${formatCurrency(
+                          pnlRecon.pnlObi
+                        )} − Entity PTE ${formatCurrency(
+                          pnlRecon.pteEntityTaxDeduction
+                        )} vs. Horizon K-1 ${formatCurrency(pnlRecon.horizonObi)}, net delta ${
+                          pnlRecon.obiAfterPteVariance >= 0 ? '+' : ''
+                        }${formatCurrency(pnlRecon.obiAfterPteVariance)}`
+                      : `K-1 OBI delta ${pnlRecon.obiVariance >= 0 ? '+' : ''}${formatCurrency(
+                          pnlRecon.obiVariance
+                        )}`}
+                    , Basis delta {pnlRecon.basisVariance >= 0 ? '+' : ''}
                     {formatCurrency(pnlRecon.basisVariance)}, RC {pnlRecon.rcPnlPct.toFixed(1)}% vs.{' '}
                     {pnlRecon.rcHorizonPct.toFixed(1)}%). Section {horizonSectionNum} below shows
                     the authoritative {horizonSummary?.years[0] ?? 2025}–
                     {horizonSummary?.years[horizonSummary.years.length - 1] ?? 2030} Horizon Tax
                     Plan.
+                    {onSyncHorizon && (
+                      <button
+                        type="button"
+                        onClick={onSyncHorizon}
+                        className="no-print ml-2 inline-flex items-center px-2.5 py-0.5 text-[11px] font-semibold text-white bg-teal-800 rounded hover:bg-teal-900 transition-colors"
+                      >
+                        Push &amp; Sync {pnlRecon.projectionYear} Horizon
+                      </button>
+                    )}
                   </>
                 )}
               </div>

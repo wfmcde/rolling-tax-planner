@@ -102,6 +102,16 @@ interface HorizonViewProps {
   onOpenCpaPackage?: () => void;
   onExportShadowReturn?: () => void;
   exportingShadowReturn?: boolean;
+  cadenceRevenueDrift?: {
+    taxYear: number;
+    cadenceTotal: number;
+    cadenceCa: number;
+    cadenceAz: number;
+    horizonTotal: number;
+    horizonCa: number;
+    horizonAz: number;
+  } | null;
+  onSyncFromCadence?: () => void;
 }
 
 const SUB_TONE_CLASS: Record<CellTone, string> = {
@@ -208,6 +218,8 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
   onOpenCpaPackage,
   onExportShadowReturn,
   exportingShadowReturn,
+  cadenceRevenueDrift,
+  onSyncFromCadence,
 }) => {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
@@ -1549,6 +1561,54 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
         onUpdateYear={onUpdateYear}
         onSelectYear={onSelectYear}
       />
+
+      {/* 2c. Conditional Unpushed Cadence Forecast Revenue Sync Notice */}
+      {cadenceRevenueDrift && onSyncFromCadence && (() => {
+        const { primaryStateCode: bannerPCode, secondaryStateCode: bannerSCode } = getSetupStates(setup);
+        return (
+          <div className="bg-amber-50/90 border border-amber-200 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-amber-950">
+            <div className="flex items-start gap-2.5 min-w-0 flex-1">
+              <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <div className="leading-snug">
+                <strong className="font-semibold">
+                  {cadenceRevenueDrift.taxYear} Transaction Cadence Forecast differs from Six-Year Horizon:
+                </strong>{' '}
+                Cadence projects{' '}
+                <span className="font-mono font-semibold tabular-nums">
+                  {formatCurrency(cadenceRevenueDrift.cadenceTotal)}
+                </span>
+                {setup.multi_state_active && bannerPCode && bannerSCode
+                  ? ` (${bannerPCode} ${formatCurrency(cadenceRevenueDrift.cadenceCa)} / ${bannerSCode} ${formatCurrency(cadenceRevenueDrift.cadenceAz)})`
+                  : ''}{' '}
+                vs. Horizon{' '}
+                <span className="font-mono font-semibold tabular-nums">
+                  {formatCurrency(cadenceRevenueDrift.horizonTotal)}
+                </span>
+                {setup.multi_state_active && bannerPCode && bannerSCode
+                  ? ` (${bannerPCode} ${formatCurrency(cadenceRevenueDrift.horizonCa)} / ${bannerSCode} ${formatCurrency(cadenceRevenueDrift.horizonAz)})`
+                  : ''}
+                .
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={onSyncFromCadence}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-teal-800 rounded-md hover:bg-teal-900 transition-colors whitespace-nowrap"
+              >
+                Sync {cadenceRevenueDrift.taxYear} from Cadence Forecast
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigate('cadence_forecaster')}
+                className="inline-flex items-center px-2.5 py-1.5 text-xs font-medium text-amber-900 bg-white border border-amber-300 rounded-md hover:bg-amber-100/60 transition-colors whitespace-nowrap"
+              >
+                Review Cadence
+              </button>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* 3. Six-Year Financial Schedule (interactive 2025–2030 grid) */}
       <div className="bg-white border border-slate-200 rounded-lg">

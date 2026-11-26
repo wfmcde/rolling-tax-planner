@@ -36,6 +36,7 @@ import type {
 import {
   createInitialBaselineState,
   projectNextYear,
+  reconcileDerivedPlannerState,
   rollWindowForward,
 } from './engine/baseline';
 import { calculateSixYearPlan } from './engine/taxEngine';
@@ -47,7 +48,12 @@ import {
   createInitialPnlBalanceSheetState,
   type ComputedPnlBalanceSheet,
 } from './engine/pnlBalanceSheet';
-import { createInitialCadenceForecasterState } from './engine/cadenceEngine';
+import {
+  aggregateCadenceStateRevenue,
+  computeCadenceForecast,
+  createInitialCadenceForecasterState,
+} from './engine/cadenceEngine';
+import { reconcilePnlStateToHorizonRevenue } from './engine/cpaHorizonSummary';
 import { evaluateAllPlanningGoals, resolvePlanningGoals } from './engine/planningGoals';
 import {
   addProfileToStore,
@@ -474,11 +480,38 @@ export function App() {
         };
       });
 
-      return {
+      let nextPnlBalanceSheet = prev.pnl_balance_sheet;
+      if ((statesChanged || apportionmentChanged) && nextPnlBalanceSheet) {
+        const syncedProjYr = updatedYears.find(
+          (y) => y.tax_year === nextPnlBalanceSheet!.projection_year && !y.is_locked_actuals
+        );
+        if (syncedProjYr) {
+          const r2 = (n: number) => Math.round(n * 100) / 100;
+          const caLine = nextPnlBalanceSheet.pnl.ca_revenue ?? { ytd: 0, remaining: 0 };
+          const azLine = nextPnlBalanceSheet.pnl.az_revenue ?? { ytd: 0, remaining: 0 };
+          nextPnlBalanceSheet = {
+            ...nextPnlBalanceSheet,
+            pnl: {
+              ...nextPnlBalanceSheet.pnl,
+              ca_revenue: {
+                ytd: caLine.ytd,
+                remaining: r2(Math.max(0, syncedProjYr.scorp_1120s.ca_revenue) - caLine.ytd),
+              },
+              az_revenue: {
+                ytd: azLine.ytd,
+                remaining: r2(Math.max(0, syncedProjYr.scorp_1120s.az_revenue) - azLine.ytd),
+              },
+            },
+          };
+        }
+      }
+
+      return reconcileDerivedPlannerState({
         ...prev,
         setup: effectiveNextSetup,
         years: updatedYears,
-      };
+        ...(nextPnlBalanceSheet ? { pnl_balance_sheet: nextPnlBalanceSheet } : {}),
+      });
     });
   };
 
@@ -541,19 +574,48 @@ export function App() {
             });
 
           if (revChanged && prevActiveStates.length >= 2) {
-            const totalRev =
-              Math.max(0, updatedYr.scorp_1120s.ca_revenue) +
-              Math.max(0, updatedYr.scorp_1120s.az_revenue);
+            const exactCaRev = Math.round(Math.max(0, updatedYr.scorp_1120s.ca_revenue));
+            const exactAzRev = Math.round(Math.max(0, updatedYr.scorp_1120s.az_revenue));
+            const totalRev = exactCaRev + exactAzRev;
             if (totalRev > 0) {
-              const nextPrimaryPct =
-                Math.round((Math.max(0, updatedYr.scorp_1120s.ca_revenue) / totalRev) * 1000) /
-                10;
+              const nextPrimaryPct = Math.round((exactCaRev / totalRev) * 1000) / 10;
               nextSetup = setYearStateApportionmentOverride(
                 prev.setup,
                 taxYear,
                 nextPrimaryPct
               );
-              return applySetupApportionmentToYear(updatedYr, nextSetup);
+              const resolvedAfter = resolveStateApportionmentForYear(nextSetup, taxYear);
+              const pCode = resolvedAfter.primaryCode;
+              const sCode = resolvedAfter.secondaryCode;
+              const caFactor = exactCaRev / totalRev;
+              const azFactor = exactAzRev / totalRev;
+              return {
+                ...updatedYr,
+                scorp_1120s: {
+                  ...updatedYr.scorp_1120s,
+                  ca_revenue: exactCaRev,
+                  az_revenue: exactAzRev,
+                  gross_receipts_revenue: totalRev,
+                  state_sourcing_breakdown: resolvedAfter.activeStates.map((code) => ({
+                    state_code: code,
+                    apportionment_percent:
+                      code === pCode
+                        ? Number((caFactor * 100).toFixed(2))
+                        : code === sCode
+                        ? Number((azFactor * 100).toFixed(2))
+                        : 0,
+                  })),
+                },
+                state_filings: updatedYr.state_filings.map((sf) =>
+                  sf.state_code === pCode
+                    ? { ...sf, state_apportionment_factor: caFactor }
+                    : sf.state_code === sCode
+                    ? { ...sf, state_apportionment_factor: azFactor }
+                    : resolvedAfter.activeStates.includes(sf.state_code)
+                    ? { ...sf, state_apportionment_factor: 0 }
+                    : sf
+                ),
+              };
             }
           } else if (filingsFactorsChanged && updatedYr.state_filings.length > 0) {
             let workingSetup = prev.setup;
@@ -585,11 +647,69 @@ export function App() {
         return updatedYr;
       });
 
-      return {
+      let nextPnlBalanceSheet = prev.pnl_balance_sheet;
+      if (nextPnlBalanceSheet && taxYear === nextPnlBalanceSheet.projection_year) {
+        const prevTargetYr = prev.years.find((y) => y.tax_year === taxYear);
+        const nextTargetYr = nextYears.find((y) => y.tax_year === taxYear);
+        if (prevTargetYr && nextTargetYr && !nextTargetYr.is_locked_actuals) {
+          const r2 = (n: number) => Math.round(n * 100) / 100;
+          const revUpdated =
+            nextTargetYr.scorp_1120s.ca_revenue !== prevTargetYr.scorp_1120s.ca_revenue ||
+            nextTargetYr.scorp_1120s.az_revenue !== prevTargetYr.scorp_1120s.az_revenue;
+          const dbpUpdated =
+            nextTargetYr.dbp_and_retirement.dbp_actual_contribution !==
+            prevTargetYr.dbp_and_retirement.dbp_actual_contribution;
+
+          if (revUpdated || dbpUpdated) {
+            const caLine = nextPnlBalanceSheet.pnl.ca_revenue ?? { ytd: 0, remaining: 0 };
+            const azLine = nextPnlBalanceSheet.pnl.az_revenue ?? { ytd: 0, remaining: 0 };
+            const dbpLine = nextPnlBalanceSheet.pnl.dbp_contribution ?? { ytd: 0, remaining: 0 };
+            const nextManualRet = dbpUpdated && nextPnlBalanceSheet.retirement_line17_manual_overrides
+              ? {
+                  ...nextPnlBalanceSheet.retirement_line17_manual_overrides,
+                  dbp_contribution: false,
+                }
+              : nextPnlBalanceSheet.retirement_line17_manual_overrides;
+            nextPnlBalanceSheet = {
+              ...nextPnlBalanceSheet,
+              ...(nextManualRet ? { retirement_line17_manual_overrides: nextManualRet } : {}),
+              pnl: {
+                ...nextPnlBalanceSheet.pnl,
+                ...(revUpdated
+                  ? {
+                      ca_revenue: {
+                        ytd: caLine.ytd,
+                        remaining: r2(Math.max(0, nextTargetYr.scorp_1120s.ca_revenue) - caLine.ytd),
+                      },
+                      az_revenue: {
+                        ytd: azLine.ytd,
+                        remaining: r2(Math.max(0, nextTargetYr.scorp_1120s.az_revenue) - azLine.ytd),
+                      },
+                    }
+                  : {}),
+                ...(dbpUpdated
+                  ? {
+                      dbp_contribution: {
+                        ytd: dbpLine.ytd,
+                        remaining: r2(
+                          Math.max(0, nextTargetYr.dbp_and_retirement.dbp_actual_contribution) -
+                            dbpLine.ytd
+                        ),
+                      },
+                    }
+                  : {}),
+              },
+            };
+          }
+        }
+      }
+
+      return reconcileDerivedPlannerState({
         ...prev,
         setup: nextSetup,
         years: nextYears,
-      };
+        ...(nextPnlBalanceSheet ? { pnl_balance_sheet: nextPnlBalanceSheet } : {}),
+      });
     });
   };
 
@@ -931,14 +1051,37 @@ export function App() {
     pnlComp: ComputedPnlBalanceSheet
   ): SetupConfig => {
     const targetYear = pnlSnapshot.projection_year || 2026;
-    const caRev = Math.round(Math.max(0, pnlComp.lines.ca_revenue.projected));
-    const azRev = Math.round(Math.max(0, pnlComp.lines.az_revenue.projected));
-    const totalRev = caRev + azRev;
-    if (totalRev <= 0 || !prevSetup.multi_state_active) return prevSetup;
+    const { primaryStateCode, secondaryStateCode, hasSecondaryState } = getSetupStates(prevSetup);
     const resolved = resolveStateApportionmentForYear(prevSetup, targetYear);
-    if (!resolved.hasSecondary) return prevSetup;
+    const activeCodes =
+      resolved.activeStates.length > 0
+        ? resolved.activeStates
+        : primaryStateCode
+        ? hasSecondaryState && secondaryStateCode
+          ? [primaryStateCode, secondaryStateCode]
+          : [primaryStateCode]
+        : [];
+    const hasSecond = Boolean(
+      prevSetup.multi_state_active || hasSecondaryState || activeCodes.length >= 2
+    );
+    const targetTotalRev = Math.round(Math.max(0, pnlComp.totalRevenue.projected));
+    const caRev = hasSecond
+      ? Math.min(targetTotalRev, Math.round(Math.max(0, pnlComp.lines.ca_revenue.projected)))
+      : targetTotalRev;
+    const azRev = hasSecond ? Math.max(0, targetTotalRev - caRev) : 0;
+    const totalRev = caRev + azRev;
+    if (totalRev <= 0 || !hasSecond || activeCodes.length < 2) return prevSetup;
+    const pCode = activeCodes[0];
+    const sCode = activeCodes[1];
     const nextPrimaryPct = Math.round((caRev / totalRev) * 1000) / 10;
-    return setYearStateApportionmentOverride(prevSetup, targetYear, nextPrimaryPct);
+    const nextSecondaryPct = Math.round((100 - nextPrimaryPct) * 10) / 10;
+    const splitMap: Record<string, number> = {};
+    for (const code of activeCodes) {
+      if (code === pCode) splitMap[code] = nextPrimaryPct;
+      else if (code === sCode) splitMap[code] = nextSecondaryPct;
+      else splitMap[code] = 0;
+    }
+    return updateYearStateApportionmentSplit(prevSetup, targetYear, splitMap);
   };
 
   const computePushImpact = (
@@ -1005,7 +1148,7 @@ export function App() {
         );
       const updatedSetup = syncSetupSplitFromPnlPush(prev.setup, pnlSnapshot, pnlComp);
       const pushedAt = new Date().toISOString();
-      return {
+      return reconcileDerivedPlannerState({
         ...prev,
         setup: updatedSetup,
         years: applyProjected2026Years({ ...prev, setup: updatedSetup }, pnlSnapshot, pnlComp),
@@ -1023,10 +1166,48 @@ export function App() {
           },
           last_pushed_at: pushedAt,
         },
-      };
+      });
     });
     return impact;
   };
+
+  const cadenceHorizonSync = useMemo(() => {
+    const cad = state.cadence_forecaster;
+    if (!cad || cad.transactions.length === 0 || !state.setup.has_scorp) return null;
+    const projYear = cad.projection_year || state.setup.current_tax_year || 2026;
+    const y25 = computed.find((c) => c.tax_year === 2025) ?? computed[0];
+    const yProj = computed.find((c) => c.tax_year === projYear);
+    if (!yProj || yProj.is_locked_actuals) return null;
+    const fc = computeCadenceForecast(cad, y25, yProj, state.setup);
+    const { hasSecondaryState } = getSetupStates(state.setup);
+    const hasSecond = Boolean(
+      state.setup.multi_state_active ||
+        hasSecondaryState ||
+        fc.pnlComputed.lines.az_revenue.projected > 0
+    );
+    const rev = aggregateCadenceStateRevenue(fc, hasSecond);
+    const horizonTotal = Math.round(yProj.scorp_in.gross_receipts_revenue);
+    const horizonCa = Math.round(yProj.scorp_in.ca_revenue);
+    const horizonAz = Math.round(yProj.scorp_in.az_revenue);
+    const hasDrift =
+      Math.abs(rev.horizonTotal - horizonTotal) >= 1 ||
+      Math.abs(rev.horizonCa - horizonCa) >= 1 ||
+      (hasSecond && Math.abs(rev.horizonAz - horizonAz) >= 1);
+    if (!hasDrift) return null;
+    return {
+      drift: {
+        taxYear: projYear,
+        cadenceTotal: rev.horizonTotal,
+        cadenceCa: rev.horizonCa,
+        cadenceAz: rev.horizonAz,
+        horizonTotal,
+        horizonCa,
+        horizonAz,
+      },
+      pnlSnapshot: fc.synthesizedPnlState,
+      pnlComp: fc.pnlComputed,
+    };
+  }, [state.cadence_forecaster, state.setup, computed]);
 
   const triggerJsonDownload = (jsonText: string, filename: string) => {
     const blob = new Blob([jsonText], { type: 'application/json' });
@@ -1616,6 +1797,17 @@ export function App() {
               onOpenCpaPackage={() => setShowHorizonCpaModal(true)}
               onExportShadowReturn={handleExportShadowReturn}
               exportingShadowReturn={exportingShadowReturn}
+              cadenceRevenueDrift={cadenceHorizonSync?.drift ?? null}
+              onSyncFromCadence={
+                cadenceHorizonSync
+                  ? () => {
+                      handlePushCadenceTo2026Schedule(
+                        cadenceHorizonSync.pnlSnapshot,
+                        cadenceHorizonSync.pnlComp
+                      );
+                    }
+                  : undefined
+              }
             />
           )}
 
@@ -1737,8 +1929,22 @@ export function App() {
       {/* Horizon Direct CPA Print Package Modal */}
       {showHorizonCpaModal && (() => {
         const y25 = computed.find((c) => c.tax_year === 2025) ?? computed[0];
-        const y26 = computed.find((c) => c.tax_year === state.setup.current_tax_year) ?? computed[1];
-        const horizonPnlComp = calculatePnlBalanceSheet(activePnlState, y25, y26, state.setup);
+        const y26 =
+          computed.find((c) => c.tax_year === activePnlState.projection_year) ??
+          computed.find((c) => c.tax_year === state.setup.current_tax_year) ??
+          computed[1];
+        const syncedHorizonPnlState = reconcilePnlStateToHorizonRevenue(
+          activePnlState,
+          y26,
+          state.setup
+        );
+        const horizonPnlComp = calculatePnlBalanceSheet(
+          syncedHorizonPnlState,
+          y25,
+          y26,
+          state.setup,
+          { respectStateRetirementRemaining: Boolean(syncedHorizonPnlState.last_pushed_at) }
+        );
         const entityName =
           state.setup.business_name?.trim() ||
           y26?.scorp_in.entity_name ||
@@ -1752,7 +1958,7 @@ export function App() {
         const evaluatedGoals = evaluateAllPlanningGoals(
           activePlanningGoals,
           horizonPnlComp,
-          activePnlState,
+          syncedHorizonPnlState,
           state.setup,
           y26
         );
@@ -1764,7 +1970,7 @@ export function App() {
         const handleDownloadHorizonCsv = () => {
           const csv = buildCpaProjectionCsv(
             state.setup,
-            activePnlState,
+            syncedHorizonPnlState,
             horizonPnlComp,
             entityName,
             entityEin,
@@ -1777,14 +1983,14 @@ export function App() {
           a.href = url;
           const safeEntity =
             entityName.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '') || 'CPA_Report';
-          a.download = `${safeEntity}_${activePnlState.projection_year}_CPA_Horizon_Package.csv`;
+          a.download = `${safeEntity}_${syncedHorizonPnlState.projection_year}_CPA_Horizon_Package.csv`;
           a.click();
           URL.revokeObjectURL(url);
         };
         return (
           <CpaPrintPackageModal
             setup={state.setup}
-            pnlState={activePnlState}
+            pnlState={syncedHorizonPnlState}
             computed={horizonPnlComp}
             computedYears={computed}
             entityName={entityName}
