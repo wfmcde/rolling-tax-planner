@@ -19,6 +19,7 @@ interface MultiStateViewProps {
   selectedYear: number;
   onSelectYear: (year: number) => void;
   onUpdateYear: (taxYear: number, updater: (yr: TaxYearRecord) => TaxYearRecord) => void;
+  onUpdateSetup?: (next: SetupConfig) => void;
 }
 
 const AVAILABLE_STATES = ALL_US_STATE_OPTIONS.map((st) => st.code);
@@ -30,6 +31,7 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
   selectedYear,
   onSelectYear,
   onUpdateYear,
+  onUpdateSetup,
 }) => {
   const yr = years.find((y) => y.tax_year === selectedYear) ?? years[0];
   const comp = computed.find((c) => c.tax_year === yr.tax_year) ?? computed[0];
@@ -37,6 +39,9 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
 
   const updateStateAt = (index: number, patch: Partial<StateFilingInputs>) => {
     if (isLocked) return;
+    if (patch.state_pte_elected === true && !setup.has_pte && onUpdateSetup) {
+      onUpdateSetup({ ...setup, has_pte: true });
+    }
     onUpdateYear(yr.tax_year, (prev) => {
       const nextFilings = prev.state_filings.map((sf, idx) =>
         idx === index ? { ...sf, ...patch } : sf
@@ -45,12 +50,18 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
         state_code: sf.state_code,
         apportionment_percent: Math.round(sf.state_apportionment_factor * 100),
       }));
+      const anyStatePteElected = nextFilings.some(
+        (sf) => sf.state_pte_elected && Boolean(STATE_TAX_RULES[sf.state_code]?.pteAvailable)
+      );
       return {
         ...prev,
         state_filings: nextFilings,
         scorp_1120s: {
           ...prev.scorp_1120s,
           state_sourcing_breakdown: nextSourcing,
+          ...(patch.state_pte_elected !== undefined
+            ? { pte_election_active: anyStatePteElected }
+            : {}),
         },
       };
     });
@@ -299,11 +310,16 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
                 />
               </div>
 
-              <label className="flex items-center gap-2 text-xs text-slate-700 pt-1">
+              <label className="flex items-center gap-2 text-xs text-slate-700 pt-1 cursor-pointer">
                 <input
                   type="checkbox"
-                  disabled={isLocked || !setup.has_pte || !rule?.pteAvailable}
-                  checked={setup.has_pte && sf.state_pte_elected && Boolean(rule?.pteAvailable)}
+                  disabled={isLocked || !setup.has_scorp || !rule?.pteAvailable}
+                  checked={
+                    Boolean(rule?.pteAvailable) &&
+                    setup.has_scorp &&
+                    sf.state_pte_elected &&
+                    (!isLocked || (setup.has_pte && yr.scorp_1120s.pte_election_active))
+                  }
                   onChange={(e) => updateStateAt(idx, { state_pte_elected: e.target.checked })}
                   className="h-4 w-4 rounded border-slate-300 text-teal-700"
                 />
@@ -341,8 +357,21 @@ export const MultiStateView: React.FC<MultiStateViewProps> = ({
                   <div className="text-right font-mono tabular-nums text-slate-900">
                     {formatCurrency(out.state_entity_tax_liability)}
                   </div>
-                  <div className="text-slate-500">Personal State Tax</div>
-                  <div className="text-right font-mono tabular-nums text-slate-900">
+                  <div className="text-slate-500">
+                    Net Personal State Tax
+                    {out.state_personal_tax_liability < 0 && (
+                      <span className="ml-1 text-[10px] text-emerald-700">
+                        ({sf.state_code === 'AZ' ? 'PTE Refund' : 'PTE Credit/Carryfwd'})
+                      </span>
+                    )}
+                  </div>
+                  <div
+                    className={`text-right font-mono tabular-nums ${
+                      out.state_personal_tax_liability < 0
+                        ? 'text-emerald-700 font-medium'
+                        : 'text-slate-900'
+                    }`}
+                  >
                     {formatCurrency(out.state_personal_tax_liability)}
                   </div>
                   <div className="font-semibold text-slate-900">Total State Tax Liability</div>

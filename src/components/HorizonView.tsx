@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bar,
   CartesianGrid,
@@ -24,6 +24,7 @@ import {
   Printer,
   RotateCcw,
   ShieldAlert,
+  X,
 } from 'lucide-react';
 import type {
   ArchivedActualsRecord,
@@ -53,6 +54,7 @@ import {
   syncReasonableCompNoteText,
 } from '../engine/validator';
 import { setIrmaaThresholdOverride } from '../engine/irmaa';
+import { STATE_TAX_RULES } from '../engine/taxEngine';
 import {
   formatCompactCurrency,
   formatCurrency,
@@ -72,6 +74,11 @@ import {
   applyStatePaymentByCode,
   applyStateTaxesPaidTotal,
 } from '../utils/taxPayments';
+import {
+  calculateMarginalTaxSavings,
+  formatCentsPerDollar,
+  type MarginalTaxSavingsBreakdown,
+} from '../utils/marginalSavings';
 import { ScheduleRowPickerDrawer } from './ScheduleRowPickerDrawer';
 import { TaxReductionLeversDrawer } from './TaxReductionLeversDrawer';
 import { VerificationCheckpointsCard } from './VerificationCheckpointsCard';
@@ -222,16 +229,106 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
   const [acknowledgedAccordionOpen, setAcknowledgedAccordionOpen] = useState(false);
   const [allAckCardExpanded, setAllAckCardExpanded] = useState(false);
 
+  // Marginal Tax Savings per $1 Deduction popover state (Group 5 forecast columns only)
+  const [marginalPopover, setMarginalPopover] = useState<{
+    taxYear: number;
+    left: number;
+    top: number;
+    placement: 'top' | 'bottom';
+  } | null>(null);
+  const marginalPopoverRef = useRef<HTMLDivElement | null>(null);
+
+  const marginalSavingsByYear = useMemo(() => {
+    const map: Record<number, MarginalTaxSavingsBreakdown> = {};
+    for (const c of computed) {
+      if (c.is_locked_actuals || c.tax_year <= setup.anchor_actuals_year) continue;
+      const breakdown = calculateMarginalTaxSavings({ setup, years }, c.tax_year, 1000, computed);
+      if (breakdown) {
+        map[c.tax_year] = breakdown;
+      }
+    }
+    return map;
+  }, [setup, years, computed]);
+
+  const activePteStates = useMemo(() => {
+    const codes: string[] = [];
+    for (const c of computed) {
+      if (c.is_locked_actuals || c.tax_year <= setup.anchor_actuals_year) continue;
+      for (const sf of c.state_filings_out) {
+        if (
+          sf.state_pte_elected &&
+          Boolean(STATE_TAX_RULES[sf.state_code]?.pteAvailable) &&
+          !codes.includes(sf.state_code)
+        ) {
+          codes.push(sf.state_code);
+        }
+      }
+    }
+    return codes;
+  }, [computed, setup.anchor_actuals_year]);
+
+  useEffect(() => {
+    if (!marginalPopover) return;
+    const handleMouseDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (marginalPopoverRef.current?.contains(target)) return;
+      if (target?.closest('[data-marginal-badge-trigger="true"]')) return;
+      setMarginalPopover(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMarginalPopover(null);
+      }
+    };
+    const handleViewportChange = () => {
+      setMarginalPopover(null);
+    };
+    document.addEventListener('mousedown', handleMouseDown);
+    document.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', handleViewportChange);
+    window.addEventListener('scroll', handleViewportChange, true);
+    return () => {
+      document.removeEventListener('mousedown', handleMouseDown);
+      document.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('resize', handleViewportChange);
+      window.removeEventListener('scroll', handleViewportChange, true);
+    };
+  }, [marginalPopover]);
+
+  const handleToggleMarginalPopover = (taxYear: number, triggerEl: HTMLElement) => {
+    if (marginalPopover?.taxYear === taxYear) {
+      setMarginalPopover(null);
+      return;
+    }
+    const rect = triggerEl.getBoundingClientRect();
+    const popoverWidth = 320;
+    const margin = 12;
+    const alignedLeft = rect.right - popoverWidth;
+    const clampedLeft = Math.max(
+      margin,
+      Math.min(window.innerWidth - popoverWidth - margin, alignedLeft)
+    );
+    const showAbove = rect.top > 310;
+    setMarginalPopover({
+      taxYear,
+      left: clampedLeft,
+      top: showAbove ? rect.top - 8 : rect.bottom + 8,
+      placement: showAbove ? 'top' : 'bottom',
+    });
+  };
+
+  const activeMarginalBreakdown = marginalPopover
+    ? marginalSavingsByYear[marginalPopover.taxYear] ?? null
+    : null;
+
   const year1 = computed[0];
   const cumulativeAllInTax = computed.reduce((s, c) => s + c.total_all_in_tax, 0);
   const cumulativeFederal = computed.reduce((s, c) => s + c.form_1040_out.federal_income_tax, 0);
-  const cumulativePte = computed.reduce((s, c) => s + c.scorp_out.pte_tax_paid_total, 0);
-  const cumulativeStateExclPte = computed.reduce(
-    (s, c) => s + Math.max(0, c.total_state_tax - c.scorp_out.pte_tax_paid_total),
+  const cumulativeState = computed.reduce((s, c) => s + c.total_state_tax, 0);
+  const cumulativeEmployerPayroll = computed.reduce(
+    (s, c) => s + c.total_entity_and_payroll_tax,
     0
   );
-  const cumulativePayrollAndPte =
-    computed.reduce((s, c) => s + c.total_entity_and_payroll_tax, 0) + cumulativePte;
   const cumulativePersonalFica = computed.reduce(
     (s, c) => s + c.form_1040_out.personal_fica_tax,
     0
@@ -334,8 +431,8 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
     year: c.is_locked_actuals ? `${c.tax_year} (Act)` : String(c.tax_year),
     taxYear: c.tax_year,
     Federal: c.form_1040_out.federal_income_tax,
-    State: Math.max(0, c.total_state_tax - c.scorp_out.pte_tax_paid_total),
-    'Payroll & PTE': c.total_entity_and_payroll_tax + c.scorp_out.pte_tax_paid_total,
+    'State (incl. PTE)': c.total_state_tax,
+    'ER Payroll': c.total_entity_and_payroll_tax,
     'All-In Eff. Rate': c.all_in_effective_rate,
   }));
 
@@ -1337,7 +1434,7 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                 role="tooltip"
                 className="pointer-events-none opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-1.5 z-30 w-72 rounded-md bg-slate-900 px-3 py-2 text-[11px] font-normal leading-relaxed text-slate-100 shadow-lg"
               >
-                Sums 6-year Federal Income Tax ({formatCurrency(cumulativeFederal)}), State Tax ({formatCurrency(cumulativeStateExclPte)}), and Employer Payroll / PTE Tax ({formatCurrency(cumulativePayrollAndPte)}) to equal {formatCurrency(cumulativeAllInTax)}. Employee FICA ({formatCurrency(cumulativePersonalFica)}) is tracked separately in household cash flow.
+                Sums 6-year Federal Income Tax ({formatCurrency(cumulativeFederal)}), State Tax incl. PTE ({formatCurrency(cumulativeState)}), and Employer Payroll Tax ({formatCurrency(cumulativeEmployerPayroll)}) to equal {formatCurrency(cumulativeAllInTax)}. Employee FICA ({formatCurrency(cumulativePersonalFica)}) is tracked separately in household cash flow.
               </span>
             </span>
           </div>
@@ -1347,9 +1444,9 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
           <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-snug text-slate-500 font-mono tabular-nums">
             <span>Fed {formatCurrency(cumulativeFederal)}</span>
             <span aria-hidden="true">·</span>
-            <span>State {formatCurrency(cumulativeStateExclPte)}</span>
+            <span>State {formatCurrency(cumulativeState)}</span>
             <span aria-hidden="true">·</span>
-            <span>ER Payroll/PTE {formatCurrency(cumulativePayrollAndPte)}</span>
+            <span>ER Payroll {formatCurrency(cumulativeEmployerPayroll)}</span>
           </div>
         </div>
 
@@ -1715,6 +1812,31 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                       <Info className="w-3.5 h-3.5 shrink-0" />
                                     </span>
                                   </IrmaaHoverTooltip>
+                                )}
+                                {row.id === 'total_state_taxes' && setup.has_scorp && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      onNavigate('multistate');
+                                    }}
+                                    title={
+                                      activePteStates.length > 0
+                                        ? `Pass-Through Entity (PTE) election active for ${activePteStates.join(
+                                            ' & '
+                                          )} — click to manage in Multi-State & PTE`
+                                        : 'Pass-Through Entity (PTE) election is off — click to configure in Multi-State & PTE'
+                                    }
+                                    className={`inline-flex items-center rounded-full border px-1.5 py-[1px] font-mono text-[9.5px] font-medium leading-tight whitespace-nowrap transition-colors focus:outline-none focus:ring-1 focus:ring-teal-600 ${
+                                      activePteStates.length > 0
+                                        ? 'bg-teal-50 text-teal-800 border-teal-200 hover:bg-teal-100 hover:border-teal-300'
+                                        : 'bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200/70 hover:text-slate-700'
+                                    }`}
+                                  >
+                                    {activePteStates.length > 0
+                                      ? `PTE: ${activePteStates.join(' + ')}`
+                                      : 'PTE: Off'}
+                                  </button>
                                 )}
                                 {row.editField && (
                                   <Pencil
@@ -2086,6 +2208,41 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
                                     {cell.filedRef}
                                   </div>
                                 )}
+
+                                {/* Dynamic Marginal Tax Savings per $1 Deduction Badge (2026-2030 Forecast Columns Only) */}
+                                {row.id === 'effective_marginal_rate' &&
+                                  !c.is_locked_actuals &&
+                                  c.tax_year > setup.anchor_actuals_year &&
+                                  marginalSavingsByYear[c.tax_year] &&
+                                  (() => {
+                                    const ms = marginalSavingsByYear[c.tax_year];
+                                    const roundedCents = Math.round(ms.totalSavedPerDollar * 100);
+                                    const isOpen = marginalPopover?.taxYear === c.tax_year;
+                                    return (
+                                      <div className="mt-1 flex justify-end">
+                                        <button
+                                          type="button"
+                                          data-marginal-badge-trigger="true"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleToggleMarginalPopover(c.tax_year, e.currentTarget);
+                                          }}
+                                          aria-expanded={isOpen}
+                                          aria-haspopup="dialog"
+                                          title={`Click for ${c.tax_year} per-$1 deduction savings breakdown`}
+                                          className={`inline-flex items-center rounded-full border px-1.5 py-[1px] font-mono text-[9.5px] font-medium leading-tight tabular-nums whitespace-nowrap transition-colors focus:outline-none focus:ring-1 focus:ring-teal-600 ${
+                                            isOpen
+                                              ? 'bg-teal-800 text-white border-teal-800'
+                                              : ms.irmaaCliffBonus.triggered
+                                              ? 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100'
+                                              : 'bg-teal-50/90 text-teal-800 border-teal-200 hover:bg-teal-100 hover:border-teal-300'
+                                          }`}
+                                        >
+                                          Save ~{roundedCents}¢ / $1
+                                        </button>
+                                      </div>
+                                    );
+                                  })()}
                               </td>
                             );
                           })}
@@ -2158,8 +2315,8 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
               />
               <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '8px' }} />
               <Bar yAxisId="left" dataKey="Federal" stackId="tax" fill="#0f172a" radius={[0, 0, 0, 0]} />
-              <Bar yAxisId="left" dataKey="State" stackId="tax" fill="#0f766e" radius={[0, 0, 0, 0]} />
-              <Bar yAxisId="left" dataKey="Payroll & PTE" stackId="tax" fill="#94a3b8" radius={[3, 3, 0, 0]} />
+              <Bar yAxisId="left" dataKey="State (incl. PTE)" stackId="tax" fill="#0f766e" radius={[0, 0, 0, 0]} />
+              <Bar yAxisId="left" dataKey="ER Payroll" stackId="tax" fill="#94a3b8" radius={[3, 3, 0, 0]} />
               <Line
                 yAxisId="right"
                 type="monotone"
@@ -2218,6 +2375,137 @@ export const HorizonView: React.FC<HorizonViewProps> = ({
           year2025={year1}
           onSet2025Ss={handleSet2025Ss}
         />
+      )}
+
+      {/* Marginal Tax Savings per $1 Deduction Breakdown Popover */}
+      {marginalPopover && activeMarginalBreakdown && (
+        <div
+          ref={marginalPopoverRef}
+          role="dialog"
+          aria-label={`${activeMarginalBreakdown.taxYear} Marginal Tax Savings Breakdown`}
+          style={{
+            left: `${marginalPopover.left}px`,
+            top: `${marginalPopover.top}px`,
+            transform: marginalPopover.placement === 'top' ? 'translateY(-100%)' : undefined,
+          }}
+          className="fixed z-50 w-80 rounded-lg border border-slate-200 bg-white shadow-xl text-left"
+        >
+          <div className="flex items-center justify-between gap-2 border-b border-slate-200 bg-slate-50/90 px-3.5 py-2.5 rounded-t-lg">
+            <div>
+              <div className="text-xs font-semibold text-slate-900">
+                {activeMarginalBreakdown.taxYear} Marginal Savings per $1 Expense
+              </div>
+              <div className="text-[10px] text-slate-500">
+                Live engine delta (+{formatCurrency(activeMarginalBreakdown.perturbationAmount)}{' '}
+                {setup.has_scorp ? 'S-Corp OpEx' : 'deduction'})
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setMarginalPopover(null)}
+              aria-label="Close marginal tax savings breakdown"
+              className="rounded p-1 text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 transition-colors"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="p-3.5 space-y-2 text-xs">
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-600">Federal Ordinary Tax Saved</span>
+                <span className="font-mono font-medium tabular-nums text-emerald-700">
+                  +{formatCentsPerDollar(activeMarginalBreakdown.federalOrdinaryTaxSaved)}
+                </span>
+              </div>
+
+              {activeMarginalBreakdown.qbiApplies && activeMarginalBreakdown.qbiHaircutImpact > 0 && (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-600">20% QBI Deduction Offset</span>
+                  <span className="font-mono font-medium tabular-nums text-amber-700">
+                    -{formatCentsPerDollar(activeMarginalBreakdown.qbiHaircutImpact)}
+                  </span>
+                </div>
+              )}
+
+              {activeMarginalBreakdown.seniorDeductionRecovery > 0 && (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-600">Senior Deduction Phase-Out Recovered</span>
+                  <span className="font-mono font-medium tabular-nums text-emerald-700">
+                    +{formatCentsPerDollar(activeMarginalBreakdown.seniorDeductionRecovery)}
+                  </span>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-600">
+                  Blended State Tax Saved
+                  {activeMarginalBreakdown.activeStateCodes.length > 0
+                    ? ` (${activeMarginalBreakdown.activeStateCodes.join('/')})`
+                    : ''}
+                </span>
+                <span className="font-mono font-medium tabular-nums text-emerald-700">
+                  +{formatCentsPerDollar(activeMarginalBreakdown.stateTaxSaved)}
+                </span>
+              </div>
+            </div>
+
+            {activeMarginalBreakdown.irmaaProximity.showNote && (
+              <div className="rounded-md border border-amber-200 bg-amber-50/90 px-2.5 py-2 text-[11px] leading-snug text-amber-900">
+                <div className="font-semibold text-amber-950 mb-0.5">
+                  IRMAA Threshold Proximity Note
+                </div>
+                {activeMarginalBreakdown.irmaaCliffBonus.triggered ? (
+                  <p>
+                    Adding +{formatCurrency(activeMarginalBreakdown.perturbationAmount)} expense
+                    drops {activeMarginalBreakdown.taxYear} MAGI below the{' '}
+                    <span className="font-mono font-semibold">
+                      {formatCurrency(activeMarginalBreakdown.irmaaCliffBonus.threshold)}
+                    </span>{' '}
+                    ({activeMarginalBreakdown.irmaaCliffBonus.coverageYear} coverage) cliff —{' '}
+                    <span className="font-semibold">
+                      saving +{formatCurrency(activeMarginalBreakdown.irmaaCliffBonus.dollarValue)}{' '}
+                      in {activeMarginalBreakdown.irmaaCliffBonus.coverageYear} Medicare IRMAA
+                    </span>
+                    .
+                  </p>
+                ) : (
+                  <p>
+                    {activeMarginalBreakdown.taxYear} MAGI (
+                    <span className="font-mono">
+                      {formatCurrency(activeMarginalBreakdown.irmaaProximity.baselineMagi)}
+                    </span>
+                    ) is{' '}
+                    <span className="font-mono font-semibold">
+                      {formatCurrency(activeMarginalBreakdown.irmaaProximity.distanceDollars)}
+                    </span>{' '}
+                    {activeMarginalBreakdown.irmaaProximity.isBelow ? 'below' : 'above'} the{' '}
+                    <span className="font-mono font-semibold">
+                      {formatCurrency(activeMarginalBreakdown.irmaaProximity.threshold)}
+                    </span>{' '}
+                    threshold ({activeMarginalBreakdown.irmaaProximity.coverageYear} Medicare
+                    coverage).
+                  </p>
+                )}
+              </div>
+            )}
+
+            <div className="border-t border-slate-200 pt-2 space-y-1">
+              <div className="flex items-center justify-between gap-2 font-semibold">
+                <span className="text-slate-900">Total Saved per $1 Expense</span>
+                <span className="font-mono tabular-nums text-teal-800">
+                  Save ~{formatCentsPerDollar(activeMarginalBreakdown.totalSavedPerDollar)} / $1
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2 text-[11px]">
+                <span className="text-slate-600">Net After-Tax Cost per $1</span>
+                <span className="font-mono font-semibold tabular-nums text-slate-900">
+                  {formatCentsPerDollar(activeMarginalBreakdown.netAfterTaxCost)} / $1
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

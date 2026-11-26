@@ -437,7 +437,7 @@ export function sanitizeDemoBaselineState(
     filing_status: options.filing_status,
     primary_name: primaryName,
     spouse_name: spouseName,
-    business_name: options.modules.has_scorp ? cleanEntityName : options.entity_name.trim(),
+    business_name: cleanEntityName,
     business_website: cleanWebsite,
     business_ein: cleanEntityEin,
     has_scorp: options.modules.has_scorp,
@@ -494,6 +494,7 @@ export function sanitizeDemoBaselineState(
     },
   };
 
+  const neutralEntityId = `entity-demo-${Date.now().toString(36)}`;
   return {
     ...base,
     setup: sanitizedSetup,
@@ -501,8 +502,13 @@ export function sanitizeDemoBaselineState(
       ...yr,
       scorp_1120s: {
         ...yr.scorp_1120s,
+        entity_id: neutralEntityId,
         entity_name: cleanEntityName,
         entity_ein: cleanEntityEin,
+      },
+      dbp_and_retirement: {
+        ...yr.dbp_and_retirement,
+        dbp_plan_id: `dbp-${neutralEntityId}`,
       },
     })),
     cadence_forecaster: sanitizedCadence,

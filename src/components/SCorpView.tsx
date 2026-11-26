@@ -8,6 +8,7 @@ import type {
   TaxYearRecord,
 } from '../types/tax';
 import { getPersonNames } from '../engine/scheduleCatalog';
+import { STATE_TAX_RULES } from '../engine/taxEngine';
 import { getSetupStates } from '../utils/setupHelpers';
 import { formatCurrency, formatPercent } from '../utils/format';
 import { NumericField } from './NumericField';
@@ -552,14 +553,35 @@ export const SCorpView: React.FC<SCorpViewProps> = ({
             <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
               <input
                 type="checkbox"
-                disabled={isLocked || !setup.has_pte}
-                checked={setup.has_pte && yr.scorp_1120s.pte_election_active}
-                onChange={(e) => updateScorp({ pte_election_active: e.target.checked })}
+                disabled={isLocked || !setup.has_scorp}
+                checked={
+                  !isLocked
+                    ? yr.state_filings.some(
+                        (sf) => sf.state_pte_elected && Boolean(STATE_TAX_RULES[sf.state_code]?.pteAvailable)
+                      )
+                    : setup.has_pte && yr.scorp_1120s.pte_election_active
+                }
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  onUpdateYear(yr.tax_year, (prev) => ({
+                    ...prev,
+                    scorp_1120s: {
+                      ...prev.scorp_1120s,
+                      pte_election_active: checked,
+                    },
+                    state_filings: prev.state_filings.map((sf) => {
+                      const eligible = Boolean(STATE_TAX_RULES[sf.state_code]?.pteAvailable);
+                      return {
+                        ...sf,
+                        state_pte_elected: checked ? eligible : false,
+                      };
+                    }),
+                  }));
+                }}
                 className="h-4 w-4 rounded border-slate-300 text-teal-700"
               />
               <span>
                 Entity-level Pass-Through Entity (PTE) Tax Election active in {yr.tax_year}
-                {!setup.has_pte && ' (enable has_pte in Setup)'}
               </span>
             </label>
           </div>

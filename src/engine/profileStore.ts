@@ -236,8 +236,8 @@ function buildBlankTaxYearRecord(
   entityId: string
 ): TaxYearRecord {
   const isJoint = options.filing_status === 'married_filing_jointly';
-  const entityName = options.entity_name.trim() || options.name.trim() || 'Business Entity';
-  const entityEin = options.entity_ein.trim() || '00-0000000';
+  const entityName = options.entity_name.trim();
+  const entityEin = options.entity_ein.trim();
 
   return {
     tax_year: taxYear,
@@ -400,10 +400,8 @@ export function createBlankProfilePlannerState(options: NewProfileOptions): Plan
 export function createProfileRecord(options: NewProfileOptions): TaxProfileRecord {
   const now = new Date().toISOString();
   const cleanName = options.name.trim() || 'Untitled Tax Profile';
-  const cleanEntityName =
-    options.entity_name.trim() ||
-    (options.modules.has_scorp ? cleanName : `${options.primary_name.trim() || 'Household'} Personal`);
-  const cleanEntityEin = options.entity_ein.trim() || (options.modules.has_scorp ? '00-0000000' : '');
+  const cleanEntityName = options.entity_name.trim();
+  const cleanEntityEin = options.entity_ein.trim();
 
   let state: PlannerState;
   if (options.template === 'sample_oss') {
@@ -487,18 +485,21 @@ function normalizeProfileRecord(raw: TaxProfileRecord): TaxProfileRecord {
   }
 
   const entityName =
-    (typeof raw.entity_name === 'string' && raw.entity_name.trim()) ||
-    normalizedState.years[0]?.scorp_1120s.entity_name ||
-    raw.name ||
-    'Tax Profile';
+    typeof raw.entity_name === 'string'
+      ? raw.entity_name.trim()
+      : (normalizedState.setup.business_name?.trim() ??
+          normalizedState.years[0]?.scorp_1120s.entity_name?.trim() ??
+          '');
   const entityEin =
-    (typeof raw.entity_ein === 'string' && raw.entity_ein.trim()) ||
-    normalizedState.years[0]?.scorp_1120s.entity_ein ||
-    '';
+    typeof raw.entity_ein === 'string'
+      ? raw.entity_ein.trim()
+      : (normalizedState.setup.business_ein?.trim() ??
+          normalizedState.years[0]?.scorp_1120s.entity_ein?.trim() ??
+          '');
 
   return {
     id: typeof raw.id === 'string' && raw.id.trim() ? raw.id : generateProfileId(),
-    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name : entityName,
+    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name : entityName || 'Tax Profile',
     entity_name: entityName,
     entity_ein: entityEin,
     notes: typeof raw.notes === 'string' ? raw.notes : '',
@@ -709,9 +710,13 @@ export function updateActiveProfileStateInStore(
       if (profile.id !== store.active_profile_id) return profile;
       const nextState = updater(profile.state);
       const nextEntityName =
-        nextState.years[0]?.scorp_1120s.entity_name?.trim() || profile.entity_name;
+        typeof nextState.setup.business_name === 'string'
+          ? nextState.setup.business_name.trim()
+          : (nextState.years[0]?.scorp_1120s.entity_name?.trim() ?? profile.entity_name);
       const nextEntityEin =
-        nextState.years[0]?.scorp_1120s.entity_ein?.trim() ?? profile.entity_ein;
+        typeof nextState.setup.business_ein === 'string'
+          ? nextState.setup.business_ein.trim()
+          : (nextState.years[0]?.scorp_1120s.entity_ein?.trim() ?? profile.entity_ein);
       return {
         ...profile,
         entity_name: nextEntityName,
@@ -737,9 +742,7 @@ export function renameProfileInStore(
     profiles: store.profiles.map((profile) => {
       if (profile.id !== profileId) return profile;
       const nextEntityName =
-        updates.entity_name !== undefined
-          ? updates.entity_name.trim() || cleanName
-          : profile.entity_name;
+        updates.entity_name !== undefined ? updates.entity_name.trim() : profile.entity_name;
       const nextEntityEin =
         updates.entity_ein !== undefined ? updates.entity_ein.trim() : profile.entity_ein;
       const nextNotes = updates.notes !== undefined ? updates.notes.trim() : profile.notes;
@@ -748,7 +751,7 @@ export function renameProfileInStore(
         ...yr,
         scorp_1120s: {
           ...yr.scorp_1120s,
-          entity_name: nextEntityName || yr.scorp_1120s.entity_name,
+          entity_name: nextEntityName,
           entity_ein: nextEntityEin,
         },
       }));
@@ -762,6 +765,11 @@ export function renameProfileInStore(
         updated_at: now,
         state: {
           ...profile.state,
+          setup: {
+            ...profile.state.setup,
+            business_name: nextEntityName,
+            business_ein: nextEntityEin,
+          },
           years: syncedYears,
         },
       };

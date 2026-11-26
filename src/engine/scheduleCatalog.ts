@@ -1274,6 +1274,9 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
     computeCell: (c, _i, _all, setup) => {
       const states = getSetupStates(setup);
       const filings = c.state_filings_out;
+      const pteTotal = c.scorp_out.pte_tax_paid_total;
+      const hasPteActive =
+        !c.is_locked_actuals && c.tax_year > setup.anchor_actuals_year && pteTotal > 0;
       let subLabel: string | undefined;
 
       if (filings.length >= 2) {
@@ -1286,9 +1289,10 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
             : filings[1],
         ].filter((sf): sf is NonNullable<typeof sf> => Boolean(sf));
         const shown = ordered.length >= 2 ? ordered.slice(0, 2) : filings.slice(0, 2);
-        subLabel = shown
+        const baseSplit = shown
           .map((sf) => `${sf.state_code} ${formatCompactCurrency(sf.state_income_tax_liability)}`)
           .join(' · ');
+        subLabel = hasPteActive ? `${baseSplit} (PTE)` : baseSplit;
       } else if (filings.length === 1) {
         const sf = filings[0];
         const resTag =
@@ -1297,7 +1301,7 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
             : sf.residency_status === 'part_year_resident'
             ? 'Part-Yr'
             : 'Non-Res';
-        subLabel = `${sf.state_code} ${resTag}`;
+        subLabel = hasPteActive ? `${sf.state_code} ${resTag} (PTE)` : `${sf.state_code} ${resTag}`;
       } else if (states.hasPrimaryState) {
         subLabel = `${states.primaryStateCode} Active`;
       }
@@ -1306,7 +1310,8 @@ export const MASTER_SCHEDULE_CATALOG: ScheduleLineItem[] = [
         display: formatCurrency(c.total_state_tax),
         numericValue: c.total_state_tax,
         subLabel,
-        subTone: 'neutral',
+        subTone: hasPteActive ? 'accent' : 'neutral',
+        filedRef: hasPteActive ? `PTE ${formatCompactCurrency(pteTotal)}` : undefined,
       };
     },
   },

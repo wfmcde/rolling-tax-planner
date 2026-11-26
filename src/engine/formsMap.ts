@@ -190,7 +190,7 @@ export function buildFilingFormsMap(
       };
       existing.years.push(c.tax_year);
       existing.statuses.add(sf.residency_status.replace(/_/g, ' '));
-      if (setup.has_pte && sf.state_pte_elected && sf.state_pte_payment_amount > 0) {
+      if (sf.state_pte_elected && sf.state_pte_payment_amount > 0) {
         existing.pteYears.push(c.tax_year);
       }
       uniqueStates.set(sf.state_code, existing);

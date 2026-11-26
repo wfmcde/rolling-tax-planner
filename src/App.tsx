@@ -369,6 +369,20 @@ export function App() {
           nextYr = applySetupApportionmentToYear(nextYr, effectiveNextSetup);
         }
 
+        if (prev.setup.has_pte && !nextSetup.has_pte && !nextYr.is_locked_actuals) {
+          nextYr = {
+            ...nextYr,
+            scorp_1120s: {
+              ...nextYr.scorp_1120s,
+              pte_election_active: false,
+            },
+            state_filings: nextYr.state_filings.map((sf) => ({
+              ...sf,
+              state_pte_elected: false,
+            })),
+          };
+        }
+
         if (!termChanged || nextYr.is_locked_actuals) return nextYr;
 
         if (termYear === null) {
@@ -1606,6 +1620,7 @@ export function App() {
               selectedYear={selectedYear}
               onSelectYear={setSelectedYear}
               onUpdateYear={handleUpdateYear}
+              onUpdateSetup={handleUpdateSetup}
             />
           )}
 

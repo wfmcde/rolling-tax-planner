@@ -204,7 +204,7 @@ export const ProfilesManagerModal: React.FC<ProfilesManagerModalProps> = ({
           ? 'scorp_llc'
           : newEntityType
         : newEntityType,
-      entity_name: newEntityName.trim() || resolvedName,
+      entity_name: newEntityName.trim(),
       entity_ein: newEntityEin.trim(),
       entity_website: newEntityWebsite.trim(),
       notes: newNotes.trim(),

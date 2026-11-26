@@ -551,9 +551,11 @@ function extractYearInputs(
   const nondeductibleMeals = setup.has_scorp ? r0(scIn.schedule_k_nondeductible_expenses ?? 0) : 0;
 
   // PTE toggles driven strictly by active app state
-  const pteGlobal = Boolean(setup.has_pte && scIn.pte_election_active);
-  const caPteActive: 0 | 1 = pteGlobal && caFiling?.state_pte_elected ? 1 : 0;
-  const azPteActive: 0 | 1 = pteGlobal && azFiling?.state_pte_elected ? 1 : 0;
+  const pteAllowed = rec.is_locked_actuals
+    ? Boolean(setup.has_pte && scIn.pte_election_active)
+    : Boolean(setup.has_scorp);
+  const caPteActive: 0 | 1 = pteAllowed && caFiling?.state_pte_elected ? 1 : 0;
+  const azPteActive: 0 | 1 = pteAllowed && azFiling?.state_pte_elected ? 1 : 0;
 
   // Default 2026 overrides (strictly isolated to DEFAULT_PROFILE_SEED)
   const isDefault2026 = isDefault && rec.tax_year === 2026;

@@ -507,7 +507,7 @@ function computeSocialSecurityTaxable(
   return round0(Math.min(0.85 * ssGross, tier2));
 }
 
-function computeIrmaaPerEnrollee(
+export function computeIrmaaPerEnrollee(
   lookbackMagi: number,
   coverageYear: number,
   setup: SetupConfig,
@@ -1151,9 +1151,20 @@ export function calculateSixYearPlan(
         );
       }
 
-      // State PTE entity-level taxes (deductible on 1120-S when enabled)
-      if (setup.has_pte && scorpIn.pte_election_active && prePteOrdinaryIncome > 0) {
-        for (const sf of yr.state_filings) {
+      // Active state filings evaluated consistently across Layer 1 (entity PTE) and Layer 4 (state tax/credits)
+      const activeStateFilingsForPte =
+        setup.multi_state_active || resolvedSetupSplit.activeStates.length > 1
+          ? yr.state_filings
+          : yr.state_filings.slice(0, 1);
+
+      // State PTE entity-level taxes (deductible on federal Form 1120-S when elected):
+      // - Locked actuals (e.g., 2025 filed return): strictly require setup.has_pte, pte_election_active, and state_pte_elected.
+      // - Unlocked projection years (2026-2030): compute whenever a jurisdiction's PTE election checkbox is enabled.
+      const allowYearPte = yr.is_locked_actuals
+        ? Boolean(setup.has_pte && scorpIn.pte_election_active)
+        : true;
+      if (allowYearPte && prePteOrdinaryIncome > 0) {
+        for (const sf of activeStateFilingsForPte) {
           const rule = STATE_TAX_RULES[sf.state_code];
           if (sf.state_pte_elected && rule?.pteAvailable) {
             const effApp = getEffectiveApportionment(
@@ -1611,9 +1622,15 @@ export function calculateSixYearPlan(
       };
 
       const conformityAdj = sf.state_conformity_adjustment ?? 0;
+      // Add back entity-level state PTE taxes deducted on federal Form 1120-S when computing
+      // state taxable income (state income taxes are not deductible against state tax).
+      const stateAgiBaseForTax = agi + pteTaxPaidTotal;
+      const stateK1ForTax = effectiveK1Ordinary + pteTaxPaidTotal;
       const stateBaseAgi = Math.max(
         0,
-        (rule.exemptsSocialSecurity ? Math.max(0, agi - ssTaxable) : agi) + conformityAdj
+        (rule.exemptsSocialSecurity
+          ? Math.max(0, stateAgiBaseForTax - ssTaxable)
+          : stateAgiBaseForTax) + conformityAdj
       );
 
       let stateAllocatedIncome = 0;
@@ -1631,8 +1648,8 @@ export function calculateSixYearPlan(
             : 0.5;
         const residentPeriodIncome = stateBaseAgi * dayRatio;
         const nonresidentPeriodSourcedK1 =
-          setup.has_scorp && effectiveK1Ordinary > 0
-            ? effectiveK1Ordinary * (1 - dayRatio) * effApportionment
+          setup.has_scorp && stateK1ForTax > 0
+            ? stateK1ForTax * (1 - dayRatio) * effApportionment
             : 0;
         stateAllocatedIncome = round0(
           Math.min(stateBaseAgi, residentPeriodIncome + nonresidentPeriodSourcedK1)
@@ -1641,7 +1658,7 @@ export function calculateSixYearPlan(
         // Non-resident: applies ONLY to state-sourced S-Corp K-1 income (apportioned by state revenue %),
         // NOT worldwide income or W-2 wages earned while living in another state.
         stateAllocatedIncome = setup.has_scorp
-          ? round0(Math.max(0, effectiveK1Ordinary) * effApportionment)
+          ? round0(Math.max(0, stateK1ForTax) * effApportionment)
           : 0;
       }
 
@@ -1678,10 +1695,6 @@ export function calculateSixYearPlan(
       const personalTaxAfterExemption = Math.max(0, rawPersonalTax - exemptionCredits);
 
       const ptePaid = pteTaxPaidByState[sf.state_code] ?? 0;
-      const pteCredit =
-        setup.has_pte && sf.state_pte_elected
-          ? Math.min(personalTaxAfterExemption, ptePaid)
-          : 0;
 
       // S-Corp Entity Business Tax:
       // CA Form 100S = max($800, 1.5% * CA-apportioned S-Corp net income)
@@ -1707,7 +1720,6 @@ export function calculateSixYearPlan(
         stateTaxable,
         rawPersonalTax: personalTaxAfterExemption,
         ptePaid,
-        pteCredit,
         entityStateTax,
       };
     });
@@ -1770,15 +1782,21 @@ export function calculateSixYearPlan(
         ostcClaimed = Math.min(standardNonResidentTaxTotal, ostcLimitation);
       }
 
-      const finalPersonalStateTax = Math.max(
+      // Statutory credit ordering (prevents OSTC + PTE credit double-counting):
+      // 1) Apply Other-State Tax Credit (OSTC) and other state credits against pre-credit personal tax
+      // 2) Apply full entity PTE tax credit against personal state tax — allowing Net Personal State Tax
+      //    to go negative (refundable excess credit for AZ / tracked carryforward credit for CA) so
+      //    Total State Tax (Net Personal + Entity PTE Paid + Non-PTE Entity Tax) remains state-tax neutral
+      //    while capturing the federal Form 1120-S SALT-cap workaround savings.
+      const taxAfterOstc = Math.max(
         0,
-        item.rawPersonalTax -
-          item.pteCredit -
-          ostcClaimed -
-          item.sf.other_state_credits_claimed
+        item.rawPersonalTax - ostcClaimed - item.sf.other_state_credits_claimed
       );
+      const effectivePteCredit = item.ptePaid;
+      const finalPersonalStateTax = round0(taxAfterOstc - effectivePteCredit);
 
-      // Total jurisdiction state tax = Personal (540/540NR or 140NR) + Entity Business Tax (CA 100S) + Entity PTE (if elected)
+      // Total jurisdiction state tax = Net Personal State Tax (after OSTC & full PTE credit)
+      //   + Non-PTE Business Entity Tax (e.g., CA Form 100S) + Entity PTE Paid
       const totalStateLiability = round0(
         finalPersonalStateTax + item.entityStateTax + item.ptePaid
       );
@@ -1794,7 +1812,7 @@ export function calculateSixYearPlan(
         state_entity_tax_liability: item.entityStateTax,
         state_income_tax_liability: totalStateLiability,
         state_pte_payment_amount: item.ptePaid,
-        state_pte_credit_or_exclusion_amount: item.pteCredit,
+        state_pte_credit_or_exclusion_amount: effectivePteCredit,
         credit_for_taxes_paid_to_other_states: ostcClaimed,
         other_state_tax_credit_limitation: ostcLimitation,
         state_net_tax_due_or_refund: netDueOrRefund,
