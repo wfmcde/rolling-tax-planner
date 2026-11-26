@@ -16,9 +16,16 @@ import { computeDbpActuarialWaterfall } from '../engine/dbpActuarial';
 import { computeIrmaaBracketThresholds } from '../engine/irmaa';
 import { DEFAULT_PROFILE_SEED, isDefaultSeedSetup } from '../data/profiles';
 import {
+  PROFILE_SNAPSHOT_APP_ID,
+  PROFILE_SNAPSHOT_SCHEMA_VERSION,
+  applyImportedSnapshotToStore,
   buildFreshBlankUserRecord,
   buildFreshTestPersonaRecord,
+  buildProfileSnapshotFilename,
   createProfileRecord,
+  loadMultiProfileStore,
+  parseAndValidateProfileSnapshot,
+  serializeSingleProfileBackup,
 } from '../engine/profileStore';
 import { calculateMarginalTaxSavings } from '../utils/marginalSavings';
 import { createDefaultPersonProfile } from '../utils/personTax';
@@ -1442,6 +1449,180 @@ function runPhase1BoundaryMatrix(failures: StressTestFailure[]): number {
       created.state.setup.business_ein !== ''
     ) {
       push('Boundary B20', 'ALL', 'Omitted modal business fields must stay empty');
+    }
+
+    // V3 #4 Snapshot Export -> Mutate -> Re-Import Round-Trip Parity & Validation
+    const store0 = loadMultiProfileStore();
+    const myProfile = store0.profiles[0];
+    const origComputed = calculateSixYearPlan(myProfile.state.setup, myProfile.state.years);
+    const origCpa = buildCpaHorizonSummary(myProfile.state.setup, origComputed);
+
+    // 1. Export V3 JSON envelope & check filename formatting (zero hardcoded fallbacks)
+    const snapshotJson = serializeSingleProfileBackup(myProfile, '2026-11-26T08:30:00.000Z');
+    const envelope = JSON.parse(snapshotJson) as Record<string, unknown>;
+    if (
+      envelope.schemaVersion !== PROFILE_SNAPSHOT_SCHEMA_VERSION ||
+      envelope.app !== PROFILE_SNAPSHOT_APP_ID ||
+      envelope.exportedAt !== '2026-11-26T08:30:00.000Z' ||
+      !envelope.profile
+    ) {
+      push('Boundary B20', 'ALL', 'V3 snapshot envelope missing required schemaVersion/app/exportedAt/profile fields');
+    }
+    const neutralFile = buildProfileSnapshotFilename({ name: '', entity_name: '' }, new Date(2026, 10, 26));
+    if (neutralFile !== 'tax-profile-snapshot-2026-11-26.json') {
+      push('Boundary B20', 'ALL', `Unexpected neutral snapshot filename: ${neutralFile}`);
+    }
+    const namedFile = buildProfileSnapshotFilename(
+      { name: 'Operating Support Services, LLC', entity_name: '' },
+      new Date(2026, 10, 26)
+    );
+    if (namedFile !== 'operating-support-services-llc-snapshot-2026-11-26.json') {
+      push('Boundary B20', 'ALL', `Unexpected named snapshot filename: ${namedFile}`);
+    }
+
+    // 2. Mutate My Profile on the Six-Year Horizon (2026 OpEx + PTE + Group 6 payment) and verify numbers change
+    const mutatedStore = {
+      ...store0,
+      profiles: store0.profiles.map((p, idx) =>
+        idx !== 0
+          ? p
+          : {
+              ...p,
+              state: {
+                ...p.state,
+                years: p.state.years.map((y) =>
+                  y.tax_year !== 2026
+                    ? y
+                    : {
+                        ...y,
+                        scorp_1120s: {
+                          ...y.scorp_1120s,
+                          operating_expenses: y.scorp_1120s.operating_expenses + 25000,
+                          operating_expenses_override: y.scorp_1120s.operating_expenses + 25000,
+                          pte_election_active: true,
+                        },
+                        form_1040: {
+                          ...y.form_1040,
+                          federal_estimated_tax_payments:
+                            (y.form_1040.federal_estimated_tax_payments ?? 0) + 12345,
+                        },
+                        state_filings: y.state_filings.map((sf) => ({
+                          ...sf,
+                          state_pte_elected: true,
+                        })),
+                      }
+                ),
+              },
+            }
+      ),
+    };
+    const mutatedComputed = calculateSixYearPlan(
+      mutatedStore.profiles[0].state.setup,
+      mutatedStore.profiles[0].state.years
+    );
+    if (mutatedComputed[1].total_all_in_tax === origComputed[1].total_all_in_tax) {
+      push('Boundary B20', 2026, 'Expected mutated 2026 horizon to diverge from original snapshot');
+    }
+
+    // 3. Re-import as New Profile (must mint unique ID, leave mutated original untouched, and restore $0 variance)
+    const parsedSnap = parseAndValidateProfileSnapshot(snapshotJson);
+    const asNew = applyImportedSnapshotToStore(parsedSnap, mutatedStore, 'new_profile');
+    if (asNew.nextStore.profiles.length !== mutatedStore.profiles.length + 1) {
+      push('Boundary B20', 'ALL', 'Import as New Profile did not append a new profile cleanly');
+    }
+    const newImported = asNew.nextStore.profiles.find((p) => p.id === asNew.nextStore.active_profile_id)!;
+    if (newImported.id === myProfile.id) {
+      push('Boundary B20', 'ALL', 'Import as New Profile reused existing profile ID instead of minting unique ID');
+    }
+
+    // 4. Re-import via Overwrite Active Profile and assert exact $0 variance across all 6 years & CPA export
+    const asOverwrite = applyImportedSnapshotToStore(
+      parsedSnap,
+      mutatedStore,
+      'overwrite_active',
+      mutatedStore.profiles[0].id
+    );
+    const restored = asOverwrite.nextStore.profiles[0];
+    if (restored.id !== myProfile.id) {
+      push('Boundary B20', 'ALL', 'Overwrite Active Profile did not preserve target profile ID');
+    }
+    const restoredComputed = calculateSixYearPlan(restored.state.setup, restored.state.years);
+    const restoredCpa = buildCpaHorizonSummary(restored.state.setup, restoredComputed);
+    for (let i = 0; i < origComputed.length; i++) {
+      if (
+        restoredComputed[i].form_1040_out.adjusted_gross_income !==
+          origComputed[i].form_1040_out.adjusted_gross_income ||
+        restoredComputed[i].form_1040_out.federal_income_tax !==
+          origComputed[i].form_1040_out.federal_income_tax ||
+        restoredComputed[i].total_state_tax !== origComputed[i].total_state_tax ||
+        restoredComputed[i].total_all_in_tax !== origComputed[i].total_all_in_tax ||
+        restoredComputed[i].scorp_out.ordinary_business_income_1120s !==
+          origComputed[i].scorp_out.ordinary_business_income_1120s
+      ) {
+        push(
+          'Boundary B20',
+          origComputed[i].tax_year,
+          `Snapshot round-trip variance detected: restored allIn=${restoredComputed[i].total_all_in_tax} vs orig=${origComputed[i].total_all_in_tax}`
+        );
+      }
+    }
+    if (restoredCpa.sixYearAllInTax !== origCpa.sixYearAllInTax) {
+      push('Boundary B20', 'ALL', 'Snapshot round-trip CPA summary 6-yr tax mismatch');
+    }
+
+    // 5. Validation checks (malformed JSON, incompatible app, partial V3 keys migration with zero NaNs)
+    let threwMalformed = false;
+    try {
+      parseAndValidateProfileSnapshot('{bad json');
+    } catch {
+      threwMalformed = true;
+    }
+    if (!threwMalformed) {
+      push('Boundary B20', 'ALL', 'Malformed JSON snapshot failed to throw validation error');
+    }
+
+    let threwWrongApp = false;
+    try {
+      parseAndValidateProfileSnapshot(
+        JSON.stringify({ schemaVersion: '3.0', app: 'other-app', profile: myProfile })
+      );
+    } catch {
+      threwWrongApp = true;
+    }
+    if (!threwWrongApp) {
+      push('Boundary B20', 'ALL', 'Wrong app ID snapshot failed to throw validation error');
+    }
+
+    // Partial legacy snapshot missing optional V3 keys (PTE flags, Group 6 split fields, cadence_forecaster)
+    const partialProfile = JSON.parse(JSON.stringify(created)) as Record<string, unknown>;
+    const partialState = partialProfile.state as Record<string, unknown>;
+    delete partialState.cadence_forecaster;
+    delete partialState.guardrail_acknowledgments;
+    const partialYears = partialState.years as Array<Record<string, Record<string, unknown>>>;
+    for (const y of partialYears) {
+      delete y.scorp_1120s.pte_election_active;
+      delete y.form_1040.federal_estimated_tax_payments;
+      const sfs = y.state_filings as unknown as Array<Record<string, unknown>>;
+      for (const sf of sfs) {
+        delete sf.state_pte_elected;
+        sf.other_state_credits_claimed = null;
+      }
+    }
+    const migratedParsed = parseAndValidateProfileSnapshot(
+      JSON.stringify({
+        schemaVersion: '2.0',
+        app: 'rolling-tax-planner',
+        profile: partialProfile,
+      })
+    );
+    const migratedComp = calculateSixYearPlan(
+      migratedParsed.profiles[0].state.setup,
+      migratedParsed.profiles[0].state.years
+    );
+    const corruptPartial: string[] = [];
+    scanForCorruptNumbers(migratedComp, 'migratedPartial', corruptPartial);
+    if (corruptPartial.length > 0) {
+      push('Boundary B20', 'ALL', `Partial V3 migration produced corrupt numbers: ${corruptPartial[0]}`);
     }
   });
 

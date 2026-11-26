@@ -51,17 +51,18 @@ import { createInitialCadenceForecasterState } from './engine/cadenceEngine';
 import { evaluateAllPlanningGoals, resolvePlanningGoals } from './engine/planningGoals';
 import {
   addProfileToStore,
+  applyImportedSnapshotToStore,
   buildFreshBlankUserRecord,
   buildFreshTestPersonaRecord,
+  buildProfileSnapshotFilename,
   deleteProfileFromStore,
   duplicateProfileInStore,
   getActiveProfile,
-  importProfilesFromJson,
   loadIsolatedSandboxProfile,
   loadMultiProfileStore,
   loadWorkspaceProfileMode,
+  parseAndValidateProfileSnapshot,
   renameProfileInStore,
-  sanitizeFilenameSegment,
   saveIsolatedSandboxProfile,
   saveMultiProfileStore,
   saveWorkspaceProfileMode,
@@ -69,6 +70,8 @@ import {
   serializeSingleProfileBackup,
   switchActiveProfileInStore,
   updateActiveProfileStateInStore,
+  type ParsedProfileImport,
+  type SnapshotImportMode,
 } from './engine/profileStore';
 import {
   addApportionmentState,
@@ -94,6 +97,7 @@ import { RollForwardModal } from './components/RollForwardModal';
 import { CpaPrintPackageModal } from './components/CpaPrintPackageModal';
 import { ProfileSwitcher } from './components/ProfileSwitcher';
 import { ProfilesManagerModal } from './components/ProfilesManagerModal';
+import { ImportSnapshotModal } from './components/ImportSnapshotModal';
 import { exportShadowTaxReturnXlsx } from './utils/shadowReturnExport';
 
 const TAB_LABELS: Record<WorkspaceTab, string> = {
@@ -168,6 +172,10 @@ export function App() {
   const [importNotice, setImportNotice] = useState<{ type: 'ok' | 'error'; text: string } | null>(
     null
   );
+  const [pendingSnapshotImport, setPendingSnapshotImport] = useState<{
+    parsed: ParsedProfileImport;
+    filename: string;
+  } | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -1031,22 +1039,55 @@ export function App() {
   };
 
   const handleImportProfilesJsonText = (
-    rawText: string
-  ): { ok: boolean; message: string } => {
+    rawText: string,
+    filename = 'profile-snapshot.json'
+  ): { ok: boolean; message: string; staged?: boolean } => {
     try {
-      const result = importProfilesFromJson(rawText, profileStore);
-      setProfileStore(result.nextStore);
-      const msg =
-        result.importedCount === 1
-          ? `Imported profile "${result.importedNames[0]}" and switched to it.`
-          : `Imported ${result.importedCount} profiles from backup.`;
-      setImportNotice({ type: 'ok', text: msg });
-      return { ok: true, message: msg };
+      const parsed = parseAndValidateProfileSnapshot(rawText);
+      setPendingSnapshotImport({ parsed, filename });
+      setImportNotice(null);
+      return {
+        ok: true,
+        staged: true,
+        message: `Validated snapshot "${parsed.profiles[0]?.name ?? filename}".`,
+      };
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to import JSON file.';
       setImportNotice({ type: 'error', text: msg });
       return { ok: false, message: msg };
     }
+  };
+
+  const handleConfirmSnapshotImport = (mode: SnapshotImportMode) => {
+    if (!pendingSnapshotImport) return;
+    const { parsed } = pendingSnapshotImport;
+    const targetId = workspaceMode === 'my_profile' ? myActiveProfile.id : undefined;
+    const effectiveMode: SnapshotImportMode =
+      workspaceMode === 'my_profile' ? mode : 'new_profile';
+    const result = applyImportedSnapshotToStore(
+      parsed,
+      profileStore,
+      effectiveMode,
+      targetId
+    );
+    // Immediately persist to localStorage and switch active workspace so Horizon + Multi-State recalculate
+    saveMultiProfileStore(result.nextStore);
+    setProfileStore(result.nextStore);
+    if (workspaceMode !== 'my_profile') {
+      saveWorkspaceProfileMode('my_profile');
+      setWorkspaceMode('my_profile');
+    }
+    const importedActive = getActiveProfile(result.nextStore);
+    setSelectedYear(importedActive.state.setup.anchor_actuals_year);
+    setPendingSnapshotImport(null);
+
+    const msg =
+      result.mode === 'overwrite_active'
+        ? `Restored snapshot into "${result.importedNames[0]}" — Six-Year Horizon & Multi-State recalculated.`
+        : result.importedCount === 1
+        ? `Imported "${result.importedNames[0]}" as a new profile and switched to it.`
+        : `Imported ${result.importedCount} profiles as new workspaces.`;
+    setImportNotice({ type: 'ok', text: msg });
   };
 
   const handleImportJson = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1055,7 +1096,7 @@ export function App() {
     if (!file) return;
     try {
       const text = await file.text();
-      handleImportProfilesJsonText(text);
+      handleImportProfilesJsonText(text, file.name);
     } catch (err) {
       setImportNotice({
         type: 'error',
@@ -1074,11 +1115,12 @@ export function App() {
   };
 
   const handleExportSingleProfile = (profile: TaxProfileRecord) => {
-    const safeName = sanitizeFilenameSegment(profile.name, 'tax-profile');
-    triggerJsonDownload(
-      serializeSingleProfileBackup(profile),
-      `${safeName}-${profile.state.setup.forecast_years[0]}-${profile.state.setup.forecast_years[5]}.json`
-    );
+    const filename = buildProfileSnapshotFilename(profile);
+    triggerJsonDownload(serializeSingleProfileBackup(profile), filename);
+    setImportNotice({
+      type: 'ok',
+      text: `Exported snapshot ${filename} (v3.0).`,
+    });
   };
 
   const handleExportAllProfiles = () => {
@@ -1490,14 +1532,56 @@ export function App() {
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => setShowRollModal(true)}
-              className="px-4 py-2 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900 transition-colors whitespace-nowrap shrink-0"
-            >
-              Roll Window Forward
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleExportJson}
+                title="Export active profile as a v3.0 JSON snapshot"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 hover:border-slate-300 transition-colors whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                <span className="hidden sm:inline">Export JSON</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => importInputRef.current?.click()}
+                title="Import a profile JSON snapshot"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 hover:border-slate-300 transition-colors whitespace-nowrap"
+              >
+                <Upload className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                <span className="hidden sm:inline">Import JSON</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowRollModal(true)}
+                className="px-3.5 py-1.5 text-xs font-medium text-white bg-teal-800 rounded-md hover:bg-teal-900 transition-colors whitespace-nowrap"
+              >
+                Roll Window Forward
+              </button>
+            </div>
           </header>
+
+          {/* Inline Snapshot Export / Import Toast Alert */}
+          {importNotice && (
+            <div
+              role={importNotice.type === 'error' ? 'alert' : 'status'}
+              className={`px-4 sm:px-6 py-2 border-b text-xs flex items-center justify-between gap-3 ${
+                importNotice.type === 'error'
+                  ? 'bg-red-50 border-red-200 text-red-900'
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              }`}
+            >
+              <span className="font-medium">{importNotice.text}</span>
+              <button
+                type="button"
+                onClick={() => setImportNotice(null)}
+                aria-label="Dismiss notification"
+                className="text-[11px] font-semibold underline shrink-0"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Active Module Viewport (keyed by workspaceMode + activeProfile.id to guarantee zero state bleed) */}
@@ -1731,6 +1815,18 @@ export function App() {
           onExportSingleProfile={handleExportSingleProfile}
           onExportAllProfiles={handleExportAllProfiles}
           onImportProfilesJson={handleImportProfilesJsonText}
+        />
+      )}
+
+      {/* V3 Profile JSON Snapshot Restore Confirmation Modal */}
+      {pendingSnapshotImport !== null && (
+        <ImportSnapshotModal
+          parsed={pendingSnapshotImport.parsed}
+          filename={pendingSnapshotImport.filename}
+          activeProfile={activeProfile}
+          workspaceMode={workspaceMode}
+          onConfirm={handleConfirmSnapshotImport}
+          onCancel={() => setPendingSnapshotImport(null)}
         />
       )}
     </div>

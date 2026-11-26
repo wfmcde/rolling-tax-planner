@@ -41,7 +41,7 @@ interface ProfilesManagerModalProps {
   onDeleteProfile: (profileId: string) => void;
   onExportSingleProfile: (profile: TaxProfileRecord) => void;
   onExportAllProfiles: () => void;
-  onImportProfilesJson: (rawText: string) => { ok: boolean; message: string };
+  onImportProfilesJson: (rawText: string, filename?: string) => { ok: boolean; message: string; staged?: boolean };
 }
 
 type ProfileFilter = 'all' | 'scorp' | 'core_1040' | 'multistate' | 'retirement';
@@ -221,7 +221,11 @@ export const ProfilesManagerModal: React.FC<ProfilesManagerModalProps> = ({
     const reader = new FileReader();
     reader.onload = () => {
       const text = typeof reader.result === 'string' ? reader.result : '';
-      const result = onImportProfilesJson(text);
+      const result = onImportProfilesJson(text, file.name);
+      if (result.ok && result.staged) {
+        onClose();
+        return;
+      }
       setStatusBanner({
         type: result.ok ? 'success' : 'error',
         text: result.message,
